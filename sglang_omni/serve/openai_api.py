@@ -680,10 +680,21 @@ def _build_speech_generate_request(
     if req.seed is not None:
         tts_params["seed"] = req.seed
 
-    # Sampling params — use S2-Pro-tuned defaults
-    sampling = SamplingParams(
-        temperature=0.8, top_p=0.8, top_k=30, repetition_penalty=1.1
-    )
+    model_name = (req.model or default_model or "").lower()
+    if "higgs" in model_name:
+        # Higgs' reference speech endpoint uses a lower-temperature default;
+        # S2-Pro's defaults make Higgs noticeably unstable for TTS.
+        sampling = SamplingParams(
+            temperature=0.3,
+            top_p=0.95,
+            top_k=50,
+            repetition_penalty=1.0,
+        )
+    else:
+        # Sampling params — use S2-Pro-tuned defaults
+        sampling = SamplingParams(
+            temperature=0.8, top_p=0.8, top_k=30, repetition_penalty=1.1
+        )
     if req.max_new_tokens is not None:
         sampling.max_new_tokens = req.max_new_tokens
     if req.temperature is not None:

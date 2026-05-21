@@ -108,11 +108,13 @@ class HiggsTTSModelRunner(ModelRunner):
             req = data.req
             slot = model._slots.get(sched_req.request_id)
             if req.is_chunked > 0 or slot is None or not slot.output_codes:
+                data.latest_stream_code_chunk = None
                 cb0_per_row.append(0)
                 continue
-            codes_N = slot.output_codes[-1]
-            data.output_codes.append(codes_N.detach().cpu().clone())
+            codes_N = slot.output_codes[-1].detach().cpu().clone()
+            data.output_codes.append(codes_N)
             data.generation_done = bool(slot.sampler.generation_done)
+            data.latest_stream_code_chunk = codes_N.unsqueeze(0)
             cb0_per_row.append(int(codes_N[0].item()))
 
         result.next_token_ids = torch.tensor(

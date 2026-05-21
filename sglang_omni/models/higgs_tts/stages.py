@@ -301,14 +301,37 @@ def create_vocoder_executor(
     dtype: str = "bfloat16",
     max_batch_size: int = 4,
     max_batch_wait_ms: int = 2,
+    streaming: bool = False,
+    audio_chunk_size: int | None = None,
+    audio_chunk_overlap_size: int | None = None,
+    num_codebooks: int = 8,
 ):
     """Decode Higgs delayed codes to a mono 24 kHz waveform.
 
     Codec weights are extracted from the TTS checkpoint itself.
+
+    When ``streaming=True``, return a scheduler that accepts per-step delayed
+    code rows from the AR stage and streams audio chunks before the terminal
+    result. Non-streaming requests still use the full one-shot decode path.
     """
     checkpoint_dir = resolve_checkpoint(model_path)
     codec = get_or_load_codec(checkpoint_dir, device, dtype)
     sample_rate = HiggsAudioCodec.SAMPLE_RATE
+
+    if streaming:
+        from sglang_omni.models.higgs_tts.streaming_vocoder import (
+            HiggsVocoderScheduler,
+        )
+
+        return HiggsVocoderScheduler(
+            codec,
+            device=device,
+            num_codebooks=num_codebooks,
+            audio_chunk_size=audio_chunk_size,
+            audio_chunk_overlap_size=audio_chunk_overlap_size,
+            max_batch_size=max_batch_size,
+            max_batch_wait_ms=max_batch_wait_ms,
+        )
 
     def _vocode(payload: StagePayload) -> StagePayload:
         state = HiggsTtsState.from_dict(payload.data)

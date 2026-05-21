@@ -77,6 +77,23 @@ def _read_wav_chunk_metadata(
     return channels, sample_width, sample_rate, frames, frame_count
 
 
+def _read_pcm_chunk_metadata(
+    audio_bytes: bytes,
+    sample_rate: int | None,
+) -> tuple[int, int, int, bytes, int]:
+    if sample_rate is None:
+        raise ValueError("PCM speech stream chunks must include sample_rate")
+    if sample_rate <= 0:
+        raise ValueError("PCM speech stream chunks must include a positive sample_rate")
+    if len(audio_bytes) % 2:
+        raise ValueError("PCM speech stream chunks must contain complete int16 samples")
+
+    channels = 1
+    sample_width = 2
+    frame_count = len(audio_bytes) // sample_width
+    return channels, sample_width, sample_rate, audio_bytes, frame_count
+
+
 def _write_wav_bytes(
     *,
     channels: int,
@@ -201,6 +218,27 @@ class BufferedWavChunkEmitter:
         return self._emit()
 
 
+class BufferedPcmChunkEmitter(BufferedWavChunkEmitter):
+    """Buffer short streamed PCM chunks into WAV blobs for live playback."""
+
+    def add_pcm_chunk(self, audio_bytes: bytes, sample_rate: int | None) -> bytes | None:
+        channels, sample_width, sample_rate, frames, frame_count = (
+            _read_pcm_chunk_metadata(audio_bytes, sample_rate)
+        )
+        self._validate_format(
+            channels=channels,
+            sample_width=sample_width,
+            sample_rate=sample_rate,
+        )
+        self._frames.append(frames)
+        self._frame_count += frame_count
+        self._chunk_count += 1
+
+        if self._should_emit():
+            return self._emit()
+        return None
+
+
 class WavChunkAccumulator:
     """Collect streamed WAV chunks and write a final WAV artifact."""
 
@@ -236,6 +274,39 @@ class WavChunkAccumulator:
         return _write_wav_bytes(
             channels=self._channels or 1,
             sample_width=self._sample_width or 2,
+            sample_rate=self._sample_rate,
+            frames=self._frames,
+        )
+
+
+class PcmChunkAccumulator:
+    """Collect streamed raw int16 PCM chunks and write a final WAV artifact."""
+
+    def __init__(self) -> None:
+        self._sample_rate: int | None = None
+        self._frames: list[bytes] = []
+
+    def add_pcm_chunk(self, audio_bytes: bytes, sample_rate: int | None) -> bytes:
+        _, _, sample_rate, frames, _ = _read_pcm_chunk_metadata(
+            audio_bytes,
+            sample_rate,
+        )
+
+        if self._sample_rate is None:
+            self._sample_rate = sample_rate
+        elif sample_rate != self._sample_rate:
+            raise ValueError("Inconsistent PCM chunk sample rate in speech stream")
+
+        self._frames.append(frames)
+        return audio_bytes
+
+    def to_wav_bytes(self) -> bytes | None:
+        if self._sample_rate is None or not self._frames:
+            return None
+
+        return _write_wav_bytes(
+            channels=1,
+            sample_width=2,
             sample_rate=self._sample_rate,
             frames=self._frames,
         )

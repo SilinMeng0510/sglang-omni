@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 
 from sglang_omni.client import ClientError, GenerateChunk
 from sglang_omni.serve import create_app
+from sglang_omni.serve.openai_api import _build_speech_generate_request
+from sglang_omni.serve.protocol import CreateSpeechRequest
 
 
 class FailingSpeechClient:
@@ -63,3 +65,50 @@ def test_speech_stream_returns_error_event_after_chunk_failure() -> None:
         "type": "ClientError",
         "message": "stream failed",
     }
+
+
+def test_speech_request_uses_higgs_tts_sampling_defaults() -> None:
+    request = _build_speech_generate_request(
+        CreateSpeechRequest(input="hello", voice="default"),
+        "boson-sglang/higgs-audio-v3-tts-4b-base",
+    )
+
+    assert request.sampling.temperature == 0.3
+    assert request.sampling.top_p == 0.95
+    assert request.sampling.top_k == 50
+    assert request.sampling.repetition_penalty == 1.0
+
+
+def test_speech_request_preserves_stage_params() -> None:
+    request = _build_speech_generate_request(
+        CreateSpeechRequest(
+            input="hello",
+            voice="default",
+            stage_params={
+                "vocoder": {
+                    "audio_chunk_size": 12,
+                    "audio_chunk_overlap_size": 12,
+                }
+            },
+        ),
+        "boson-sglang/higgs-audio-v3-tts-4b-base",
+    )
+
+    assert request.stage_params == {
+        "vocoder": {
+            "audio_chunk_size": 12,
+            "audio_chunk_overlap_size": 12,
+        }
+    }
+
+
+def test_speech_request_keeps_s2_pro_sampling_defaults() -> None:
+    request = _build_speech_generate_request(
+        CreateSpeechRequest(input="hello", voice="default"),
+        "fishaudio-s2-pro",
+    )
+
+    assert request.sampling.temperature == 0.8
+    assert request.sampling.top_p == 0.8
+    assert request.sampling.top_k == 30
+    assert request.sampling.repetition_penalty == 1.1

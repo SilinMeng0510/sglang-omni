@@ -56,7 +56,8 @@ curl -X POST http://localhost:8000/v1/audio/speech \
       "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
       "text": "We asked over twenty different people, and they all said it was his."
     }],
-    "temperature": 0.8,
+    "temperature": 0.3,
+    "top_p": 0.95,
     "top_k": 50,
     "max_new_tokens": 1024
   }' \
@@ -76,7 +77,8 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 ### Streaming
 
-Set `"stream": true` to receive base64-encoded WAV chunks over Server-Sent Events:
+Set `"stream": true` to receive audio chunks over Server-Sent Events (SSE).
+For low-latency playback, request raw PCM chunks with `"response_format": "pcm"`:
 
 ```bash
 curl -N -X POST http://localhost:8000/v1/audio/speech \
@@ -87,9 +89,18 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
       "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
       "text": "We asked over twenty different people, and they all said it was his."
     }],
-    "stream": true
+    "stream": true,
+    "response_format": "pcm"
   }'
 ```
+
+Each SSE event contains an `audio.speech.chunk` object. The audio bytes are
+base64 encoded in `audio.data`; for PCM, `audio.format` is `pcm`,
+`audio.mime_type` is `audio/pcm`, and `audio.sample_rate` is included in the
+event. The stream ends with `data: [DONE]`.
+
+The streaming chunk policy is configured server-side by the Higgs TTS pipeline.
+Clients should not pass model-internal chunk sizing parameters for normal use.
 
 ## Use Python
 
@@ -107,7 +118,8 @@ resp = requests.post(
     json={
         "input": SPEECH_INPUT,
         "references": [{"audio_path": REFERENCE_AUDIO, "text": REFERENCE_TEXT}],
-        "temperature": 0.8,
+        "temperature": 0.3,
+        "top_p": 0.95,
         "top_k": 50,
         "max_new_tokens": 1024,
     },
@@ -132,21 +144,68 @@ resp = requests.post(
 )
 ```
 
+### Streaming Request
+
+```python
+import base64
+import json
+import wave
+
+import requests
+
+payload = {
+    "input": SPEECH_INPUT,
+    "references": [{"audio_path": REFERENCE_AUDIO, "text": REFERENCE_TEXT}],
+    "stream": True,
+    "response_format": "pcm",
+    "max_new_tokens": 1024,
+}
+
+pcm_chunks = []
+sample_rate = 24000
+
+with requests.post(
+    "http://localhost:8000/v1/audio/speech",
+    json=payload,
+    stream=True,
+    timeout=600,
+) as stream:
+    stream.raise_for_status()
+    for line in stream.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: "):
+            continue
+        data = line[len("data:") :].lstrip()
+        if data == "[DONE]":
+            break
+        event = json.loads(data)
+        audio = event.get("audio")
+        if audio is None:
+            continue
+        sample_rate = audio.get("sample_rate", sample_rate)
+        pcm_chunks.append(base64.b64decode(audio["data"]))
+
+with wave.open("output_stream.wav", "wb") as wav:
+    wav.setnchannels(1)
+    wav.setsampwidth(2)  # int16 PCM
+    wav.setframerate(sample_rate)
+    wav.writeframes(b"".join(pcm_chunks))
+```
+
 ## Request Parameters
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `input` | string | (required) | Text to synthesize |
 | `voice` | string | `"default"` | Voice identifier (ignored when `references` is set) |
-| `response_format` | string | `"wav"` | Output audio format |
-| `stream` | bool | `false` | Enable streaming via SSE |
+| `response_format` | string | `"wav"` | Output audio format; use `"pcm"` for low-latency streaming playback |
+| `stream` | bool | `false` | Enable streaming via SSE; set to `true` to receive incremental audio chunks |
 | `references` | list | `null` | Reference audio for voice cloning; each item has `audio_path` (local path or HTTP URL) and `text` (transcript) |
 | `reference_codes` | list[list[int]] | `null` | Pre-encoded discrete codes, shape `[T, 8]` — alternative to `references[0].audio_path` |
 | `reference_text` | string | `null` | Transcript of reference audio when supplying `reference_codes` |
 | `max_new_tokens` | int | `2048` | Maximum number of generated multi-codebook steps |
-| `temperature` | float | `1.0` | Sampling temperature |
-| `top_p` | float | `null` | Top-p sampling |
-| `top_k` | int | `null` | Top-k sampling |
+| `temperature` | float | `0.3` | Sampling temperature |
+| `top_p` | float | `0.95` | Top-p sampling |
+| `top_k` | int | `50` | Top-k sampling |
 | `seed` | int | `null` | Random seed for reproducibility |
 
 ## Benchmark Results

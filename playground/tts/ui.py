@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import gradio as gr
@@ -13,15 +13,19 @@ import gradio as gr
 from playground.tts.api_client import SpeechDemoClient, SpeechDemoClientError
 from playground.tts.artifacts import ArtifactStore
 from playground.tts.audio_stream import (
+    BufferedPcmChunkEmitter,
     BufferedWavChunkEmitter,
+    PcmChunkAccumulator,
+    SpeechStreamEvent,
     WavChunkAccumulator,
     wav_duration_seconds,
 )
 from playground.tts.models import GenerationSettings, SpeechSynthesisRequest
 
 _ARTIFACT_STORE = ArtifactStore()
-_LIVE_AUDIO_MIN_CHUNK_DURATION_S = 1.0
-_LIVE_AUDIO_MAX_BUFFERED_CHUNKS = 3
+_STREAMING_RESPONSE_FORMAT = "pcm"
+_LIVE_AUDIO_MIN_CHUNK_DURATION_S = 0.25
+_LIVE_AUDIO_MAX_BUFFERED_CHUNKS = 1
 _SYNTH_IDLE_LABEL = "Synthesize"
 _SYNTH_BUSY_LABEL = "Synthesizing..."
 _STREAM_IDLE_LABEL = "Start Streaming"
@@ -102,6 +106,12 @@ def _reset_audio_output() -> dict[str, Any]:
 
 def _keep_audio_output():
     return gr.skip()
+
+
+def _is_pcm_stream_event(event: SpeechStreamEvent) -> bool:
+    return (event.audio_format or "").lower() == "pcm" or (
+        event.mime_type or ""
+    ).lower() == "audio/pcm"
 
 
 def _button_update(
@@ -364,22 +374,45 @@ def make_streaming_handler(api_base: str):
         ).to_gradio_outputs()
 
         started_at = time.perf_counter()
-        accumulator = WavChunkAccumulator()
-        live_emitter = BufferedWavChunkEmitter(
+        stream_request = replace(request, response_format=_STREAMING_RESPONSE_FORMAT)
+        pcm_accumulator = PcmChunkAccumulator()
+        wav_accumulator = WavChunkAccumulator()
+        pcm_live_emitter = BufferedPcmChunkEmitter(
             min_emit_duration_s=_LIVE_AUDIO_MIN_CHUNK_DURATION_S,
             max_buffered_chunks=_LIVE_AUDIO_MAX_BUFFERED_CHUNKS,
         )
+        wav_live_emitter = BufferedWavChunkEmitter(
+            min_emit_duration_s=_LIVE_AUDIO_MIN_CHUNK_DURATION_S,
+            max_buffered_chunks=_LIVE_AUDIO_MAX_BUFFERED_CHUNKS,
+        )
+        stream_audio_format: str | None = None
         chunk_count = 0
         first_audio_s: float | None = None
 
         try:
-            for event in client.stream_synthesize(request):
+            for event in client.stream_synthesize(stream_request):
                 if event.audio_bytes is None:
                     continue
 
                 chunk_count += 1
-                accumulator.add_wav_chunk(event.audio_bytes)
-                live_audio = live_emitter.add_wav_chunk(event.audio_bytes)
+                if _is_pcm_stream_event(event):
+                    if stream_audio_format not in (None, "pcm"):
+                        raise ValueError("Speech stream mixed PCM and WAV chunks")
+                    stream_audio_format = "pcm"
+                    pcm_accumulator.add_pcm_chunk(
+                        event.audio_bytes,
+                        event.sample_rate,
+                    )
+                    live_audio = pcm_live_emitter.add_pcm_chunk(
+                        event.audio_bytes,
+                        event.sample_rate,
+                    )
+                else:
+                    if stream_audio_format not in (None, "wav"):
+                        raise ValueError("Speech stream mixed PCM and WAV chunks")
+                    stream_audio_format = "wav"
+                    wav_accumulator.add_wav_chunk(event.audio_bytes)
+                    live_audio = wav_live_emitter.add_wav_chunk(event.audio_bytes)
                 if live_audio is None:
                     yield StreamingUiUpdate(
                         history=in_progress_history,
@@ -443,7 +476,13 @@ def make_streaming_handler(api_base: str):
             ).to_gradio_outputs()
             return
 
-        final_audio_bytes = accumulator.to_wav_bytes()
+        if stream_audio_format == "pcm":
+            final_audio_bytes = pcm_accumulator.to_wav_bytes()
+            live_tail = pcm_live_emitter.flush()
+        else:
+            final_audio_bytes = wav_accumulator.to_wav_bytes()
+            live_tail = wav_live_emitter.flush()
+
         if final_audio_bytes is None:
             failed_history = _append_history(
                 history, user_content, "Error: No audio was returned."
@@ -462,7 +501,6 @@ def make_streaming_handler(api_base: str):
             ).to_gradio_outputs()
             return
 
-        live_tail = live_emitter.flush()
         if live_tail is not None:
             if first_audio_s is None:
                 first_audio_s = time.perf_counter() - started_at
@@ -559,21 +597,21 @@ def create_demo(api_base: str):
                         label="Temperature",
                         minimum=0.1,
                         maximum=1.5,
-                        value=0.8,
+                        value=0.3,
                         step=0.05,
                     )
                     top_p = gr.Slider(
                         label="Top P",
                         minimum=0.1,
                         maximum=1.0,
-                        value=0.8,
+                        value=0.95,
                         step=0.05,
                     )
                     top_k = gr.Slider(
                         label="Top K",
                         minimum=1,
                         maximum=100,
-                        value=30,
+                        value=50,
                         step=1,
                     )
                     max_new_tokens = gr.Slider(
