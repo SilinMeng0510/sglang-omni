@@ -24,6 +24,7 @@ from sglang_omni.models.higgs_tts.modeling import (
     HiggsFusedMultiTextHead,
 )
 from sglang_omni.models.higgs_tts.sampler import STOP_CODE, HiggsSamplerState
+from sglang_omni.models.higgs_tts.sampler import batched_step as sampler_batched_step
 from sglang_omni.models.higgs_tts.sampler import step as sampler_step
 from sglang_omni.models.higgs_tts.weight_loader import DiscreteWeightMapper
 
@@ -136,6 +137,8 @@ class HiggsTTSModel(nn.Module):
             )
 
         self._slots: dict[str, _RequestSlot] = {}
+        self._graph_decode_ready = False
+        self._graph_max_batch_size = 0
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.backbone.get_input_embeddings()
@@ -175,6 +178,70 @@ class HiggsTTSModel(nn.Module):
                 device=self.multimodal_embedding.modality_embedding_0.weight.device,
             )
         return torch.stack(slot.output_codes, dim=0).to(torch.long)
+
+    def enable_cuda_graph_decoder(self, max_batch_size: int) -> None:
+        """Allocate persistent decode buffers used by CUDA graph replay."""
+        if max_batch_size <= 0:
+            raise ValueError(f"max_batch_size must be positive, got {max_batch_size}")
+
+        device = self.multimodal_embedding.modality_embedding_0.weight.device
+        self.register_buffer(
+            "_graph_last_codes",
+            torch.zeros(
+                max_batch_size,
+                self._num_codebooks,
+                dtype=torch.long,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_graph_has_last_codes",
+            torch.zeros(max_batch_size, dtype=torch.bool, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_graph_delay_count",
+            torch.zeros(max_batch_size, dtype=torch.long, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_graph_eoc_countdown",
+            torch.full((max_batch_size,), -1, dtype=torch.long, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_graph_generation_done",
+            torch.zeros(max_batch_size, dtype=torch.bool, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_graph_temperature",
+            torch.ones(max_batch_size, dtype=torch.float32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_graph_top_p",
+            torch.ones(max_batch_size, dtype=torch.float32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_graph_top_k",
+            torch.zeros(max_batch_size, dtype=torch.long, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_graph_output_codes",
+            torch.full(
+                (max_batch_size, self._num_codebooks),
+                STOP_CODE,
+                dtype=torch.long,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self._graph_max_batch_size = int(max_batch_size)
+        self._graph_decode_ready = True
 
     @torch.no_grad()
     def decode_codebooks_batch(
@@ -222,6 +289,39 @@ class HiggsTTSModel(nn.Module):
             dtype=torch.float32,
         )
 
+    @torch.no_grad()
+    def decode_codebooks_batch_graph(
+        self, hidden_states_BD: torch.Tensor
+    ) -> torch.Tensor:
+        """Graph-safe multi-codebook sampling into persistent output buffers."""
+        batch_size = int(hidden_states_BD.shape[0])
+        if batch_size > self._graph_max_batch_size:
+            raise RuntimeError(
+                f"Higgs CUDA graph decoder batch size {batch_size} exceeds "
+                f"allocated graph buffer size {self._graph_max_batch_size}"
+            )
+
+        logits_BNV = self.modality_head.generate(hidden_states_BD).to(torch.float32)
+        codes_BN = sampler_batched_step(
+            logits_BNV,
+            delay_count=self._graph_delay_count,
+            eoc_countdown=self._graph_eoc_countdown,
+            generation_done=self._graph_generation_done,
+            last_codes=self._graph_last_codes,
+            has_last_codes=self._graph_has_last_codes,
+            temperature=self._graph_temperature,
+            top_p=self._graph_top_p,
+            top_k=self._graph_top_k,
+        )
+        self._graph_output_codes[:batch_size].copy_(codes_BN)
+
+        text_vocab_size = self.backbone.config.vocab_size
+        return torch.zeros(
+            (batch_size, text_vocab_size),
+            device=hidden_states_BD.device,
+            dtype=torch.float32,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -237,10 +337,16 @@ class HiggsTTSModel(nn.Module):
         :class:`HiggsTTSModelRunner._build_prefill_input_embeds`).
         Decode: input_embeds is rebuilt here from each slot's ``last_codes``.
         """
-        req_ids, gen_params = self._extract_batch_metadata(forward_batch)
+        is_decode = self._is_decode_step(forward_batch)
+        req_ids: list[str] | None = None
+        gen_params: list[HiggsGenParams] | None = None
 
-        if input_embeds is None and self._is_decode_step(forward_batch):
-            input_embeds = self._decode_step_embeds(req_ids, input_ids)
+        if input_embeds is None and is_decode:
+            if self._graph_decode_ready:
+                input_embeds = self._graph_decode_step_embeds(input_ids)
+            else:
+                req_ids, gen_params = self._extract_batch_metadata(forward_batch)
+                input_embeds = self._decode_step_embeds(req_ids, input_ids)
 
         hidden_states = self.backbone.model(
             input_ids,
@@ -261,9 +367,14 @@ class HiggsTTSModel(nn.Module):
             if hidden_states_last.ndim == 3:
                 hidden_states_last = hidden_states_last[:, -1, :]
 
-        text_logits_BV = self.decode_codebooks_batch(
-            hidden_states_last, req_ids, gen_params
-        )
+        if is_decode and self._graph_decode_ready:
+            text_logits_BV = self.decode_codebooks_batch_graph(hidden_states_last)
+        else:
+            if req_ids is None or gen_params is None:
+                req_ids, gen_params = self._extract_batch_metadata(forward_batch)
+            text_logits_BV = self.decode_codebooks_batch(
+                hidden_states_last, req_ids, gen_params
+            )
 
         return LogitsProcessorOutput(
             next_token_logits=text_logits_BV,
@@ -348,6 +459,24 @@ class HiggsTTSModel(nn.Module):
 
         mask_t = torch.tensor(mask, device=device).unsqueeze(-1)
         return torch.where(mask_t, fused_embeds.to(text_embeds.dtype), text_embeds)
+
+    def _graph_decode_step_embeds(self, input_ids: torch.Tensor) -> torch.Tensor:
+        batch_size = int(input_ids.shape[0])
+        if batch_size > self._graph_max_batch_size:
+            raise RuntimeError(
+                f"Higgs CUDA graph decoder batch size {batch_size} exceeds "
+                f"allocated graph buffer size {self._graph_max_batch_size}"
+            )
+
+        codes_BN = self._graph_last_codes[:batch_size]
+        fused_embeds = self.multimodal_embedding.modality_embedding_0(codes_BN)
+
+        text_embeds = self.backbone.model.embed_tokens(input_ids)
+        if text_embeds.ndim == 3:
+            text_embeds = text_embeds[:, -1, :]
+
+        mask = self._graph_has_last_codes[:batch_size].unsqueeze(-1)
+        return torch.where(mask, fused_embeds.to(text_embeds.dtype), text_embeds)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
         """Remap Higgs ckpt names then split between backbone and own modules.

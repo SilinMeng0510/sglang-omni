@@ -53,6 +53,7 @@ from sglang_omni.serve.protocol import (
 
 logger = logging.getLogger(__name__)
 MIME_TO_FORMAT = {mime: fmt for fmt, mime in FORMAT_MIME_TYPES.items()}
+STREAM_DONE_SENTINEL = "[DONE]"
 
 _BAD_REQUEST_MARKERS = (
     "longer than the model's context length",
@@ -368,7 +369,7 @@ async def _chat_stream(
         choice.setdefault("finish_reason", None)
     yield f"data: {json.dumps(data)}\n\n"
 
-    yield "data: [DONE]\n\n"
+    yield f"data: {STREAM_DONE_SENTINEL}\n\n"
 
 
 def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
@@ -493,7 +494,7 @@ def _register_speech(app: FastAPI) -> None:
 
         request_id = f"speech-{uuid.uuid4()}"
 
-        gen_req = _build_speech_generate_request(req, default_model)
+        gen_req = build_speech_generate_request(req, default_model)
         if req.stream:
             return StreamingResponse(
                 _speech_stream(
@@ -593,13 +594,13 @@ async def _speech_stream(
     except ClientError as exc:
         payload = _speech_stream_error_payload(request_id, chunk_index, exc)
         yield f"data: {json.dumps(payload)}\n\n"
-        yield "data: [DONE]\n\n"
+        yield f"data: {STREAM_DONE_SENTINEL}\n\n"
         return
     except Exception as exc:
         logger.exception("Error streaming speech for request %s", request_id)
         payload = _speech_stream_error_payload(request_id, chunk_index, exc)
         yield f"data: {json.dumps(payload)}\n\n"
-        yield "data: [DONE]\n\n"
+        yield f"data: {STREAM_DONE_SENTINEL}\n\n"
         return
 
     final_payload = {
@@ -611,7 +612,7 @@ async def _speech_stream(
         "usage": usage,
     }
     yield f"data: {json.dumps(final_payload)}\n\n"
-    yield "data: [DONE]\n\n"
+    yield f"data: {STREAM_DONE_SENTINEL}\n\n"
 
 
 def _speech_stream_error_payload(
@@ -655,11 +656,23 @@ def _select_speech_audio_delta(
     return audio[emitted_samples:], total_samples
 
 
-def _build_speech_generate_request(
+def build_speech_generate_request(
     req: CreateSpeechRequest,
     default_model: str,
 ) -> GenerateRequest:
     """Convert a CreateSpeechRequest into a client GenerateRequest."""
+
+    generation_fields = (
+        "max_new_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "repetition_penalty",
+        "seed",
+    )
+    explicit_generation_params = sorted(
+        field for field in generation_fields if field in req.model_fields_set
+    )
 
     # Build TTS-specific parameters to pass through the pipeline
     tts_params: dict[str, Any] = {
@@ -667,6 +680,8 @@ def _build_speech_generate_request(
         "response_format": req.response_format,
         "speed": req.speed,
     }
+    if explicit_generation_params:
+        tts_params["explicit_generation_params"] = explicit_generation_params
     if req.task_type is not None:
         tts_params["task_type"] = req.task_type
     if req.language is not None:
@@ -682,10 +697,8 @@ def _build_speech_generate_request(
 
     model_name = (req.model or default_model or "").lower()
     if "higgs" in model_name:
-        # Higgs' reference speech endpoint uses a lower-temperature default;
-        # S2-Pro's defaults make Higgs noticeably unstable for TTS.
         sampling = SamplingParams(
-            temperature=0.3,
+            temperature=0.8,
             top_p=0.95,
             top_k=50,
             repetition_penalty=1.0,
@@ -705,6 +718,8 @@ def _build_speech_generate_request(
         sampling.top_k = req.top_k
     if req.repetition_penalty is not None:
         sampling.repetition_penalty = req.repetition_penalty
+    if req.seed is not None:
+        sampling.seed = req.seed
 
     # Build prompt: plain string if no references, dict otherwise
     prompt: Any = req.input
@@ -736,3 +751,6 @@ def _build_speech_generate_request(
             "tts_params": tts_params,
         },
     )
+
+
+_build_speech_generate_request = build_speech_generate_request

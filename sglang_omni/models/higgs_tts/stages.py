@@ -14,7 +14,7 @@ Pipeline shape::
 - ``create_sglang_tts_engine_executor``: runs :class:`HiggsTTSModel` under
   sglang's worker; the model runner computes the fused multi-codebook
   embedding inline in prefill from ``reference_codes_delayed`` and overlays
-  it at ``-100`` placeholder positions. Returns a :class:`HiggsScheduler`.
+  it at ``-100`` placeholder positions. Returns a :class:`OmniScheduler`.
 - ``create_vocoder_executor``: reverses the delay pattern, decodes via
   :class:`HiggsAudioCodec` into a mono 24 kHz waveform. Returns a
   :class:`SimpleScheduler`.
@@ -32,7 +32,6 @@ from tokenizers import Tokenizer
 from transformers import PreTrainedTokenizerFast
 
 from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
-from sglang_omni.models.higgs_tts.higgs_scheduler import HiggsScheduler
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.request_builders import make_higgs_scheduler_adapters
@@ -48,6 +47,8 @@ from sglang_omni.models.higgs_tts.utils import (
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
+from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.sglang_backend import (
     SGLangOutputProcessor,
     build_sglang_server_args,
@@ -61,6 +62,34 @@ logger = logging.getLogger(__name__)
 # Codec runs at 75 Hz; chunked prefill of the multi-codebook prompt is unsafe
 # (sampler state machine has no rollback) so reject inputs past chunked_prefill_size.
 _MAX_REF_AUDIO_SEC = 100
+
+
+def _build_higgs_audio_code_stream_outputs(
+    request_id: str,
+    data: Any,
+    _req_output: Any,
+):
+    payload = getattr(data, "stage_payload", None)
+    request_params = dict(payload.request.params or {}) if payload is not None else {}
+    if not request_params.get("stream"):
+        data.latest_stream_code_chunk = None
+        return
+
+    codes = getattr(data, "latest_stream_code_chunk", None)
+    if codes is None:
+        return
+
+    yield OutgoingMessage(
+        request_id=request_id,
+        type="stream",
+        data=codes,
+        target="vocoder",
+        metadata={
+            "modality": "audio_codes",
+            "request_params": request_params,
+        },
+    )
+    data.latest_stream_code_chunk = None
 
 
 def create_preprocessing_executor(
@@ -232,7 +261,7 @@ def create_sglang_tts_engine_executor(
     model_path: str,
     *,
     device: str = "cuda:0",
-    max_new_tokens: int = 2048,
+    max_new_tokens: int | None = 2048,
     server_args_overrides: dict[str, Any] | None = None,
 ):
     """sglang-backed AR engine for Higgs TTS."""
@@ -240,8 +269,8 @@ def create_sglang_tts_engine_executor(
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
     overrides: dict[str, Any] = {
-        # Per-request slot state + Python decode loop are not graph-capturable.
-        "disable_cuda_graph": True,
+        "disable_cuda_graph": False,
+        "cuda_graph_max_bs": 32,
         "mem_fraction_static": 0.85,
         "max_running_requests": 16,
         "chunked_prefill_size": 8192,
@@ -260,6 +289,10 @@ def create_sglang_tts_engine_executor(
     )
     server_args.disable_overlap_schedule = True
 
+    want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))
+    if want_cuda_graph:
+        server_args.disable_cuda_graph = True
+
     (
         model_worker,
         tree_cache,
@@ -267,10 +300,18 @@ def create_sglang_tts_engine_executor(
         token_to_kv_pool_allocator,
         prefill_mgr,
         decode_mgr,
-        _model_config,
+        model_config,
     ) = create_sglang_infrastructure(server_args, gpu_id)
 
+    if want_cuda_graph:
+        server_args.disable_cuda_graph = False
+
     truncate_rope_to_bf16(model_worker.model_runner.model)
+    if want_cuda_graph:
+        model_worker.model_runner.model.enable_cuda_graph_decoder(
+            max_batch_size=server_args.max_running_requests,
+        )
+        model_worker.model_runner.init_device_graphs()
 
     output_proc = SGLangOutputProcessor(
         capture_hidden=False,
@@ -278,19 +319,26 @@ def create_sglang_tts_engine_executor(
         model=model_worker.model_runner.model,
     )
     model_runner = HiggsTTSModelRunner(model_worker, output_proc)
-    request_builder, result_adapter = make_higgs_scheduler_adapters()
+    model = model_worker.model_runner.model
+    request_builder, result_adapter = make_higgs_scheduler_adapters(
+        model,
+        max_new_tokens_cap=max_new_tokens,
+    )
 
-    return HiggsScheduler(
+    return OmniScheduler(
+        tp_worker=model_worker,
         tree_cache=tree_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        server_args=server_args,
+        model_config=model_config,
         prefill_manager=prefill_mgr,
         decode_manager=decode_mgr,
-        server_args=server_args,
         model_runner=model_runner,
         request_builder=request_builder,
         result_adapter=result_adapter,
-        max_new_tokens=max_new_tokens,
+        stream_output_builder=_build_higgs_audio_code_stream_outputs,
+        abort_callback=model.reset_request,
     )
 
 
@@ -319,9 +367,7 @@ def create_vocoder_executor(
     sample_rate = HiggsAudioCodec.SAMPLE_RATE
 
     if streaming:
-        from sglang_omni.models.higgs_tts.streaming_vocoder import (
-            HiggsVocoderScheduler,
-        )
+        from sglang_omni.models.higgs_tts.streaming_vocoder import HiggsVocoderScheduler
 
         return HiggsVocoderScheduler(
             codec,

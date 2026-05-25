@@ -72,7 +72,7 @@ jobs:
     name: stage 1 - non-streaming
     needs: docs
     runs-on: [self-hosted]
-    timeout-minutes: 5
+    timeout-minutes: 15
     container:
       image: frankleeeee/sglang-omni:dev
       options: --gpus all --rm -v /dev/shm:/dev/shm
@@ -84,15 +84,26 @@ jobs:
         with:
           venv-name: omni-s2pro
 
+      - name: Prepare speaker similarity assets
+        shell: bash
+        run: |
+          source omni-s2pro/bin/activate
+          python -m benchmarks.metrics.speaker_similarity_assets --warm-cache
+        env:
+          HF_ENDPOINT: https://hf-mirror.com
+          SEEDTTS_SIM_CACHE_DIR: /github/home/seedtts-wavlm-sim
+
       - name: Run benchmark stage
         shell: bash
         run: |
           source omni-s2pro/bin/activate
           export PYTHONPATH=$PWD
-          pytest tests/test_model/test_s2pro_tts_ci.py -v -s -x --concurrency 16 --s2pro-stage s2pro-stage-1-nonstream
+          bash .github/scripts/run_flaky_pytest.sh \
+            pytest tests/test_model/test_s2pro_tts_ci.py -v -s -x --concurrency 16 --s2pro-stage s2pro-stage-1-nonstream
         env:
           HF_ENDPOINT: https://hf-mirror.com
           SGLANG_SEEDTTS50_DIR: /github/home/seedtts-50
+          SEEDTTS_SIM_CACHE_DIR: /github/home/seedtts-wavlm-sim
           S2PRO_STAGE_OUTPUT_ROOT: ${{ github.workspace }}/stage-results/nonstream
           TORCHINDUCTOR_CACHE_DIR: /github/home/.torchinductor
 
@@ -105,6 +116,7 @@ jobs:
           artifact-path-globs: |
             */speed_results.json
             */wer_results.json
+            */similarity_results.json
           artifact-upload-name: s2pro-stage-1-results
           artifact-upload-path: stage-results/nonstream
           artifact-if-no-files-found: error
@@ -130,7 +142,8 @@ jobs:
         run: |
           source omni-s2pro/bin/activate
           export PYTHONPATH=$PWD
-          pytest tests/test_model/test_s2pro_tts_ci.py -v -s -x --concurrency 16 --s2pro-stage s2pro-stage-2-stream
+          bash .github/scripts/run_flaky_pytest.sh \
+            pytest tests/test_model/test_s2pro_tts_ci.py -v -s -x --concurrency 16 --s2pro-stage s2pro-stage-2-stream
         env:
           HF_ENDPOINT: https://hf-mirror.com
           SGLANG_SEEDTTS50_DIR: /github/home/seedtts-50

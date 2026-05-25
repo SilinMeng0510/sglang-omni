@@ -56,7 +56,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
       "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
       "text": "We asked over twenty different people, and they all said it was his."
     }],
-    "temperature": 0.3,
+    "temperature": 0.8,
     "top_p": 0.95,
     "top_k": 50,
     "max_new_tokens": 1024
@@ -78,7 +78,8 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 ### Streaming
 
 Set `"stream": true` to receive audio chunks over Server-Sent Events (SSE).
-For low-latency playback, request raw PCM chunks with `"response_format": "pcm"`:
+For low-latency playback, request raw 16-bit PCM chunks with
+`"response_format": "pcm"`:
 
 ```bash
 curl -N -X POST http://localhost:8000/v1/audio/speech \
@@ -89,8 +90,8 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
       "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
       "text": "We asked over twenty different people, and they all said it was his."
     }],
-    "stream": true,
-    "response_format": "pcm"
+    "response_format": "pcm",
+    "stream": true
   }'
 ```
 
@@ -118,7 +119,7 @@ resp = requests.post(
     json={
         "input": SPEECH_INPUT,
         "references": [{"audio_path": REFERENCE_AUDIO, "text": REFERENCE_TEXT}],
-        "temperature": 0.3,
+        "temperature": 0.8,
         "top_p": 0.95,
         "top_k": 50,
         "max_new_tokens": 1024,
@@ -203,7 +204,7 @@ with wave.open("output_stream.wav", "wb") as wav:
 | `reference_codes` | list[list[int]] | `null` | Pre-encoded discrete codes, shape `[T, 8]` — alternative to `references[0].audio_path` |
 | `reference_text` | string | `null` | Transcript of reference audio when supplying `reference_codes` |
 | `max_new_tokens` | int | `2048` | Maximum number of generated multi-codebook steps |
-| `temperature` | float | `0.3` | Sampling temperature |
+| `temperature` | float | `0.8` | Sampling temperature |
 | `top_p` | float | `0.95` | Top-p sampling |
 | `top_k` | int | `50` | Top-k sampling |
 | `seed` | int | `null` | Random seed for reproducibility |

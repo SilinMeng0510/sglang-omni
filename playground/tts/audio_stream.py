@@ -221,7 +221,9 @@ class BufferedWavChunkEmitter:
 class BufferedPcmChunkEmitter(BufferedWavChunkEmitter):
     """Buffer short streamed PCM chunks into WAV blobs for live playback."""
 
-    def add_pcm_chunk(self, audio_bytes: bytes, sample_rate: int | None) -> bytes | None:
+    def add_pcm_chunk(
+        self, audio_bytes: bytes, sample_rate: int | None
+    ) -> bytes | None:
         channels, sample_width, sample_rate, frames, frame_count = (
             _read_pcm_chunk_metadata(audio_bytes, sample_rate)
         )

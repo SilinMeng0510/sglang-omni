@@ -29,6 +29,7 @@ from sglang_omni.preprocessing import (
     ensure_video_list_async,
     normalize_messages,
 )
+from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,7 @@ def _contextualize_cache_key(base_key: str | None, **context: Any) -> str | None
 
 
 DEFAULT_THINKER_MAX_NEW_TOKENS = 2048
+QWEN3_OMNI_CHAT_TEMPLATE_FALLBACK_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
 
 def validate_prompt_seq_len(
@@ -153,7 +155,15 @@ class Qwen3OmniPreprocessor:
             )
             self.model_dir = str(resolve_model_path(model_path, local_files_only=False))
         self.tokenizer = self.processor.tokenizer
-        ensure_chat_template(self.tokenizer, model_path=self.model_dir)
+        ensure_chat_template(
+            self.tokenizer,
+            model_path=self.model_dir,
+            fallback_model_paths=(QWEN3_OMNI_CHAT_TEMPLATE_FALLBACK_MODEL,),
+        )
+        if not getattr(self.processor, "chat_template", None) and getattr(
+            self.tokenizer, "chat_template", None
+        ):
+            self.processor.chat_template = self.tokenizer.chat_template
 
     def _build_multimodal_messages(
         self,
@@ -190,6 +200,22 @@ class Qwen3OmniPreprocessor:
         return result
 
     async def __call__(self, payload: StagePayload) -> StagePayload:
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="preprocess_start",
+        )
+        try:
+            result = await self._call_impl(payload)
+        finally:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="preprocess_end",
+            )
+        return result
+
+    async def _call_impl(self, payload: StagePayload) -> StagePayload:
         inputs = payload.request.inputs
         if isinstance(inputs, dict):
             messages = inputs.get("messages", [])
