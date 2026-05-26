@@ -3,9 +3,15 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from sglang_omni.utils.streaming_text import (
+        StreamingTextOptions,
+        StreamingTextSplitter,
+    )
 
 
 class RelayConfig(BaseModel):
@@ -238,6 +244,20 @@ class PipelineConfig(BaseModel):
     def mem_fraction_role_to_stage(cls) -> dict[str, str]:
         """Class-level public role map for SGLang mem_fraction_static overrides."""
         return {}
+
+    def create_streaming_text_splitter(
+        self, options: "StreamingTextOptions"
+    ) -> "StreamingTextSplitter":
+        """Strategy for ``/v1/audio/speech/stream`` incremental text input.
+
+        Override per model to batch text into TTS-ready units. The default
+        emits each fragment immediately (token-in → straight to the engine).
+        The serve layer receives this via injection, so it never branches on the
+        model name.
+        """
+        from sglang_omni.utils.streaming_text import PassthroughTextSplitter
+
+        return PassthroughTextSplitter()
 
     @property
     def gpu_placement(self) -> dict[str, int | list[int]]:

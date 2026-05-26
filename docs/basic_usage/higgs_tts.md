@@ -152,9 +152,20 @@ Protocol:
 
 Set `stream_audio` to `true` for progressive raw PCM binary frames. In that mode
 `response_format` must be `pcm` and `speed` must be `1.0`.
-Sentence splitting follows vLLM-Omni's streaming TTS rule: English `.`, `?`,
-and `!` split only when followed by whitespace; CJK `。！？` split immediately.
-With `split_granularity="clause"`, CJK `，；` are also split points.
+
+Sentence splitting is language-agnostic (Unicode `Sentence_Terminal`, covering
+Latin, CJK, Arabic `؟`, Devanagari `।`, etc.). It follows vLLM-Omni's streaming
+TTS rule for incremental safety: ASCII `.`, `?`, and `!` split only when
+followed by whitespace (so `3.14` / `U.S.A` are not premature cuts), while
+unambiguous non-ASCII terminators split immediately. With
+`split_granularity="clause"`, non-ASCII clause terminators (`，；、` …) are also
+split points. A sentence longer than the per-chunk time budget is further
+sub-split at clause / bracket / word / character boundaries; the budget's
+chars-per-second rate is estimated from the reference audio when one is
+supplied. Markup tags are handled too: state tags (`<|emotion:…|>`,
+`<|style:…|>`, `<|prosody:…|>`) force a boundary and prefix each following
+chunk, `<|clear|>` resets that state, and transient tags (`<|prosody:pause|>`,
+`<|sfx:…|>`) stay inline.
 
 ## Use Python
 

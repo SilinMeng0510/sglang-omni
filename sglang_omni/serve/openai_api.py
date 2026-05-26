@@ -17,11 +17,10 @@ import asyncio
 import base64
 import json
 import logging
-import re
 import time
 import uuid
 from contextlib import suppress
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -55,6 +54,11 @@ from sglang_omni.serve.protocol import (
     StreamingSpeechSessionConfig,
     UsageResponse,
 )
+from sglang_omni.utils.streaming_text import (
+    PassthroughTextSplitter,
+    StreamingTextOptions,
+    StreamingTextSplitter,
+)
 
 logger = logging.getLogger(__name__)
 MIME_TO_FORMAT = {mime: fmt for fmt, mime in FORMAT_MIME_TYPES.items()}
@@ -64,8 +68,6 @@ _SPEECH_STREAM_IDLE_TIMEOUT = 30.0
 _SPEECH_STREAM_MAX_CONFIG_BYTES = 4 * 1024 * 1024
 _SPEECH_STREAM_MAX_INPUT_BYTES = 128 * 1024
 _SPEECH_STREAM_MAX_BUFFER_CHARS = 100_000
-_SPEECH_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])")
-_SPEECH_CLAUSE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|(?<=[。！？，；])")
 
 _BAD_REQUEST_MARKERS = (
     "longer than the model's context length",
@@ -78,11 +80,21 @@ def _is_bad_request_error(exc: Exception) -> bool:
     return any(marker in message for marker in _BAD_REQUEST_MARKERS)
 
 
+def _default_streaming_text_splitter_factory(
+    options: StreamingTextOptions,
+) -> StreamingTextSplitter:
+    return PassthroughTextSplitter()
+
+
 def create_app(
     client: Client,
     *,
     model_name: str | None = None,
     enable_realtime: bool = False,
+    streaming_text_splitter_factory: Callable[
+        [StreamingTextOptions], StreamingTextSplitter
+    ]
+    | None = None,
 ) -> FastAPI:
     """Create a FastAPI application with OpenAI-compatible endpoints.
 
@@ -91,6 +103,10 @@ def create_app(
         model_name: Default model name to report in responses and /v1/models.
         enable_realtime: If True, mount the WebSocket ``/v1/realtime``
             endpoint (OpenAI Realtime API).
+        streaming_text_splitter_factory: Builds the per-session strategy for
+            ``/v1/audio/speech/stream`` text input. Injected by the launcher
+            from the loaded model's ``PipelineConfig`` so serve never branches
+            on the model name; defaults to immediate pass-through.
 
     Returns:
         Configured FastAPI application.
@@ -109,6 +125,9 @@ def create_app(
     app.state.client = client
     app.state.model_name = model_name or "sglang-omni"
     app.state.realtime_enabled = enable_realtime
+    app.state.streaming_text_splitter_factory = (
+        streaming_text_splitter_factory or _default_streaming_text_splitter_factory
+    )
 
     # Register all routes
     _register_health(app)
@@ -557,51 +576,8 @@ def _register_speech(app: FastAPI) -> None:
             websocket=websocket,
             client=client,
             default_model=default_model,
+            splitter_factory=app.state.streaming_text_splitter_factory,
         )
-
-
-class _SpeechTextSplitter:
-    def __init__(self, split_granularity: str, min_sentence_length: int = 2) -> None:
-        self._buffer = ""
-        self._min_sentence_length = min_sentence_length
-        self._boundary_re = (
-            _SPEECH_CLAUSE_BOUNDARY_RE
-            if split_granularity == "clause"
-            else _SPEECH_SENTENCE_BOUNDARY_RE
-        )
-
-    def add_text(self, text: str) -> list[str]:
-        if not text:
-            return []
-        self._buffer += text
-        if len(self._buffer) > _SPEECH_STREAM_MAX_BUFFER_CHARS:
-            raise ValueError(
-                "Text buffer exceeded maximum size "
-                f"({_SPEECH_STREAM_MAX_BUFFER_CHARS} chars). "
-                "Consider adding sentence-ending punctuation to your input."
-            )
-
-        parts = self._boundary_re.split(self._buffer)
-        if len(parts) <= 1:
-            return []
-
-        segments: list[str] = []
-        carry = ""
-        for part in parts[:-1]:
-            text_part = carry + part
-            carry = ""
-            segment = text_part.strip()
-            if len(segment) >= self._min_sentence_length:
-                segments.append(segment)
-            elif segment:
-                carry = text_part
-        self._buffer = carry + parts[-1]
-        return segments
-
-    def flush(self) -> str | None:
-        segment = self._buffer.strip()
-        self._buffer = ""
-        return segment or None
 
 
 async def _handle_streaming_speech_ws(
@@ -609,6 +585,7 @@ async def _handle_streaming_speech_ws(
     websocket: WebSocket,
     client: Client,
     default_model: str,
+    splitter_factory: Callable[[StreamingTextOptions], StreamingTextSplitter],
     config_timeout: float = _SPEECH_STREAM_CONFIG_TIMEOUT,
     idle_timeout: float = _SPEECH_STREAM_IDLE_TIMEOUT,
 ) -> None:
@@ -622,7 +599,12 @@ async def _handle_streaming_speech_ws(
         if config is None:
             return
 
-        splitter = _SpeechTextSplitter(config.split_granularity)
+        splitter = splitter_factory(
+            StreamingTextOptions(
+                split_granularity=config.split_granularity,
+                max_buffer_chars=_SPEECH_STREAM_MAX_BUFFER_CHARS,
+            )
+        )
         sentence_index = 0
 
         while True:
@@ -681,14 +663,13 @@ async def _handle_streaming_speech_ws(
                     )
                     sentence_index += 1
             elif msg_type == "input.done":
-                remaining = splitter.flush()
-                if remaining:
+                for sentence in splitter.flush():
                     await _generate_streaming_speech_sentence(
                         websocket=websocket,
                         client=client,
                         default_model=default_model,
                         config=config,
-                        sentence_text=remaining,
+                        sentence_text=sentence,
                         sentence_index=sentence_index,
                     )
                     sentence_index += 1

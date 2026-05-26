@@ -334,6 +334,9 @@ async def _run_server(
             client,
             model_name=model_name or pipeline_config.name,
             enable_realtime=enable_realtime,
+            streaming_text_splitter_factory=(
+                pipeline_config.create_streaming_text_splitter
+            ),
         )
         profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
         profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)

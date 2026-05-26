@@ -8,12 +8,20 @@ from fastapi.testclient import TestClient
 
 from sglang_omni.client import GenerateChunk, SpeechResult
 from sglang_omni.client.types import GenerateRequest
+from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
 from sglang_omni.serve import create_app
 from sglang_omni.serve.openai_api import (
     _build_streaming_speech_request,
     build_speech_generate_request,
 )
 from sglang_omni.serve.protocol import StreamingSpeechSessionConfig
+
+# The streaming text splitter is model-owned: serve receives it via injection
+# from the loaded model's PipelineConfig. Mirror that here so these tests
+# exercise Higgs's sentence-chunking strategy.
+_HIGGS_SPLITTER_FACTORY = HiggsTtsPipelineConfig(
+    model_path="dummy/path"
+).create_streaming_text_splitter
 
 
 class StreamingSpeechWsClient:
@@ -65,7 +73,13 @@ class StreamingSpeechWsClient:
 
 def test_streaming_speech_ws_splits_text_and_returns_audio_frames() -> None:
     speech_client = StreamingSpeechWsClient()
-    client = TestClient(create_app(speech_client, model_name="higgs"))
+    client = TestClient(
+        create_app(
+            speech_client,
+            model_name="higgs",
+            streaming_text_splitter_factory=_HIGGS_SPLITTER_FACTORY,
+        )
+    )
 
     with client.websocket_connect("/v1/audio/speech/stream") as ws:
         ws.send_json(
@@ -116,7 +130,13 @@ def test_streaming_speech_ws_splits_text_and_returns_audio_frames() -> None:
 
 def test_streaming_speech_ws_matches_vllm_english_sentence_boundary() -> None:
     speech_client = StreamingSpeechWsClient()
-    client = TestClient(create_app(speech_client, model_name="higgs"))
+    client = TestClient(
+        create_app(
+            speech_client,
+            model_name="higgs",
+            streaming_text_splitter_factory=_HIGGS_SPLITTER_FACTORY,
+        )
+    )
 
     with client.websocket_connect("/v1/audio/speech/stream") as ws:
         ws.send_json({"type": "session.config"})
@@ -136,7 +156,13 @@ def test_streaming_speech_ws_matches_vllm_english_sentence_boundary() -> None:
 
 def test_streaming_speech_ws_clause_mode_matches_vllm_boundaries() -> None:
     speech_client = StreamingSpeechWsClient()
-    client = TestClient(create_app(speech_client, model_name="higgs"))
+    client = TestClient(
+        create_app(
+            speech_client,
+            model_name="higgs",
+            streaming_text_splitter_factory=_HIGGS_SPLITTER_FACTORY,
+        )
+    )
 
     with client.websocket_connect("/v1/audio/speech/stream") as ws:
         ws.send_json({"type": "session.config", "split_granularity": "clause"})
@@ -158,7 +184,13 @@ def test_streaming_speech_ws_clause_mode_matches_vllm_boundaries() -> None:
 
 
 def test_streaming_speech_ws_requires_config_first() -> None:
-    client = TestClient(create_app(StreamingSpeechWsClient(), model_name="higgs"))
+    client = TestClient(
+        create_app(
+            StreamingSpeechWsClient(),
+            model_name="higgs",
+            streaming_text_splitter_factory=_HIGGS_SPLITTER_FACTORY,
+        )
+    )
 
     with client.websocket_connect("/v1/audio/speech/stream") as ws:
         ws.send_json({"type": "input.text", "text": "hello"})
@@ -169,7 +201,13 @@ def test_streaming_speech_ws_requires_config_first() -> None:
 
 
 def test_streaming_speech_ws_validates_stream_audio_pcm() -> None:
-    client = TestClient(create_app(StreamingSpeechWsClient(), model_name="higgs"))
+    client = TestClient(
+        create_app(
+            StreamingSpeechWsClient(),
+            model_name="higgs",
+            streaming_text_splitter_factory=_HIGGS_SPLITTER_FACTORY,
+        )
+    )
 
     with client.websocket_connect("/v1/audio/speech/stream") as ws:
         ws.send_json(
@@ -187,7 +225,13 @@ def test_streaming_speech_ws_validates_stream_audio_pcm() -> None:
 
 def test_streaming_speech_ws_stream_audio_sends_pcm_chunks() -> None:
     speech_client = StreamingSpeechWsClient()
-    client = TestClient(create_app(speech_client, model_name="higgs"))
+    client = TestClient(
+        create_app(
+            speech_client,
+            model_name="higgs",
+            streaming_text_splitter_factory=_HIGGS_SPLITTER_FACTORY,
+        )
+    )
 
     with client.websocket_connect("/v1/audio/speech/stream") as ws:
         ws.send_json(

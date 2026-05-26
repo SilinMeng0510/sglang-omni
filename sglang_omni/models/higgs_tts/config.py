@@ -3,9 +3,15 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from sglang_omni.config import PipelineConfig, StageConfig
+
+if TYPE_CHECKING:
+    from sglang_omni.utils.streaming_text import (
+        StreamingTextOptions,
+        StreamingTextSplitter,
+    )
 
 _PKG = "sglang_omni.models.higgs_tts"
 
@@ -63,6 +69,22 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             can_accept_stream_before_payload=True,
         ),
     ]
+
+    def create_streaming_text_splitter(
+        self, options: "StreamingTextOptions"
+    ) -> "StreamingTextSplitter":
+        """Batch streaming text into TTS-ready sentences for Higgs.
+
+        Uses a fixed conservative time budget (no per-session audio I/O): the
+        chars-per-second rate only gates oversized-sentence sub-splitting, so
+        precise per-speaker pacing is not worth loading the reference audio.
+        """
+        from sglang_omni.models.higgs_tts.text_chunker import StreamingTextChunker
+
+        return StreamingTextChunker(
+            options.split_granularity,
+            max_buffer_chars=options.max_buffer_chars,
+        )
 
 
 EntryClass = HiggsTtsPipelineConfig
