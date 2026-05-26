@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 # ---------------------------------------------------------------------------
 # Shared / Common
@@ -194,6 +194,9 @@ class CreateSpeechRequest(BaseModel):
     ref_audio: str | None = None  # path or URL to reference audio
     ref_text: str | None = None  # transcript of reference audio
     references: list[SpeechReference] | None = None  # S2-Pro-style refs
+    x_vector_only_mode: bool | None = None
+    speaker_embedding: list[float] | None = Field(default=None, max_length=8192)
+    initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
 
     # Generation parameters
     max_new_tokens: int | None = None
@@ -205,6 +208,50 @@ class CreateSpeechRequest(BaseModel):
 
     # Per-stage overrides (sglang-omni specific)
     stage_params: dict[str, dict[str, Any]] | None = None
+
+
+class StreamingSpeechSessionConfig(BaseModel):
+    """Configuration sent first on /v1/audio/speech/stream."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    model: str | None = None
+    voice: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("voice", "speaker"),
+    )
+    task_type: str | None = None
+    language: str | None = None
+    instructions: str | None = None
+    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
+    max_new_tokens: int | None = Field(default=None, ge=1)
+    initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    x_vector_only_mode: bool | None = None
+    speaker_embedding: list[float] | None = Field(default=None, max_length=8192)
+    stream_audio: bool = False
+    split_granularity: Literal["sentence", "clause"] = "sentence"
+    stage_params: dict[str, dict[str, Any]] | None = None
+
+    @model_validator(mode="after")
+    def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
+        if self.stream_audio:
+            if self.response_format != "pcm":
+                raise ValueError(
+                    "WebSocket streaming audio (stream_audio=true) requires "
+                    "response_format='pcm'. Got "
+                    f"response_format='{self.response_format}'."
+                )
+            if self.speed is None:
+                self.speed = 1.0
+            elif self.speed != 1.0:
+                raise ValueError(
+                    "Speed adjustment is not supported when stream_audio=true. "
+                    "Set speed=1.0 or omit it."
+                )
+        return self
 
 
 # ---------------------------------------------------------------------------

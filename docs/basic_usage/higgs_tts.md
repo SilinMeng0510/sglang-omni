@@ -103,6 +103,59 @@ event. The stream ends with `data: [DONE]`.
 The streaming chunk policy is configured server-side by the Higgs TTS pipeline.
 Clients should not pass model-internal chunk sizing parameters for normal use.
 
+### Streaming Text Input
+
+Use the WebSocket endpoint when text arrives incrementally and the server should
+start synthesizing completed sentences before the full text is available:
+
+```python
+import asyncio
+import json
+import websockets
+
+
+async def main():
+    async with websockets.connect(
+        "ws://localhost:8000/v1/audio/speech/stream"
+    ) as ws:
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "session.config",
+                    "response_format": "pcm",
+                    "stream_audio": True,
+                    "split_granularity": "sentence",
+                }
+            )
+        )
+        await ws.send(json.dumps({"type": "input.text", "text": "Hello world. "}))
+        await ws.send(json.dumps({"type": "input.text", "text": "How are you?"}))
+        await ws.send(json.dumps({"type": "input.done"}))
+
+        async for message in ws:
+            if isinstance(message, bytes):
+                # Raw int16 PCM bytes when stream_audio=true.
+                continue
+            print(message)
+
+
+asyncio.run(main())
+```
+
+Protocol:
+
+- First message: `{"type": "session.config", ...}`
+- Text chunks: `{"type": "input.text", "text": "..."}`
+- End of text: `{"type": "input.done"}`
+- Server sends `audio.start`, binary audio frame(s), `audio.done`, then
+  `session.done`.
+
+Set `stream_audio` to `true` for progressive raw PCM binary frames. In that mode
+`response_format` must be `pcm` and `speed` must be `1.0`.
+Sentence splitting follows vLLM-Omni's streaming TTS rule: English `.`, `?`,
+and `!` split only when followed by whitespace; CJK `。！？` split immediately.
+With `split_granularity="clause"`, CJK `，；` are also split points.
+
 ## Use Python
 
 ### Voice Cloning
