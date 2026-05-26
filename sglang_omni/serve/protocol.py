@@ -3,9 +3,34 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+# Remote/local-file URL schemes are rejected for reference audio: a
+# client-supplied URL would make the server fetch it (SSRF for http/ftp, local
+# file read for file://). Reference audio must be inline base64 (a ``data:``
+# URI) or a server-local path.
+_REFERENCE_URL_SCHEME_RE = re.compile(r"^\s*(?:https?|ftp|file)://", re.IGNORECASE)
+
+
+def _reject_remote_reference_url(value: str | None) -> str | None:
+    if value is not None and _REFERENCE_URL_SCHEME_RE.match(value):
+        raise ValueError(
+            "Remote URL reference audio is not accepted (SSRF risk). Pass inline "
+            "base64 as a data: URI (e.g. 'data:audio/wav;base64,<...>') or a "
+            "server-local path."
+        )
+    return value
+
 
 # ---------------------------------------------------------------------------
 # Shared / Common
@@ -161,11 +186,20 @@ class ChatCompletionStreamResponse(BaseModel):
 
 
 class SpeechReference(BaseModel):
-    """Reference item for voice cloning in /v1/audio/speech."""
+    """Reference item for voice cloning in /v1/audio/speech.
+
+    ``audio_path`` is a server-local path or an inline ``data:`` URI carrying
+    base64 audio; remote URLs are rejected (SSRF risk).
+    """
 
     audio_path: str | None = None
     text: str | None = None
     vq_codes: list[list[int]] | list[int] | None = None
+
+    @field_validator("audio_path")
+    @classmethod
+    def _validate_audio_path(cls, v: str | None) -> str | None:
+        return _reject_remote_reference_url(v)
 
 
 class CreateSpeechRequest(BaseModel):
@@ -191,7 +225,8 @@ class CreateSpeechRequest(BaseModel):
     instructions: str | None = None  # style/emotion instructions
 
     # Voice cloning parameters
-    ref_audio: str | None = None  # path or URL to reference audio
+    # Local path or inline base64 data: URI (remote URLs rejected, SSRF risk).
+    ref_audio: str | None = None
     ref_text: str | None = None  # transcript of reference audio
     references: list[SpeechReference] | None = None  # S2-Pro-style refs
     x_vector_only_mode: bool | None = None
@@ -208,6 +243,11 @@ class CreateSpeechRequest(BaseModel):
 
     # Per-stage overrides (sglang-omni specific)
     stage_params: dict[str, dict[str, Any]] | None = None
+
+    @field_validator("ref_audio")
+    @classmethod
+    def _validate_ref_audio(cls, v: str | None) -> str | None:
+        return _reject_remote_reference_url(v)
 
 
 class StreamingSpeechSessionConfig(BaseModel):
@@ -227,6 +267,7 @@ class StreamingSpeechSessionConfig(BaseModel):
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
     max_new_tokens: int | None = Field(default=None, ge=1)
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    # Local path or inline base64 data: URI (remote URLs rejected, SSRF risk).
     ref_audio: str | None = None
     ref_text: str | None = None
     x_vector_only_mode: bool | None = None
@@ -234,6 +275,11 @@ class StreamingSpeechSessionConfig(BaseModel):
     stream_audio: bool = False
     split_granularity: Literal["sentence", "clause"] = "sentence"
     stage_params: dict[str, dict[str, Any]] | None = None
+
+    @field_validator("ref_audio")
+    @classmethod
+    def _validate_ref_audio(cls, v: str | None) -> str | None:
+        return _reject_remote_reference_url(v)
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":

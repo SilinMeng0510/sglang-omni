@@ -45,7 +45,17 @@ sgl-omni serve \
 
 ### Voice Cloning
 
-Higgs TTS conditions on both reference audio **and** its transcript (`<|ref_text|>` segment); supplying the transcript materially improves quality versus audio-only cloning. The `references` field accepts `audio_path` (local path or HTTP URL) and `text` (transcript of that audio).
+Higgs TTS conditions on both reference audio **and** its transcript (`<|ref_text|>` segment); supplying the transcript materially improves quality versus audio-only cloning. The `references` field accepts `audio_path` (a server-local path or an inline base64 `data:` URI — remote URLs are rejected) and `text` (transcript of that audio).
+
+> **Reference audio input.** Remote URLs are rejected (the server would otherwise fetch arbitrary URLs — an SSRF risk). Pass either a server-local path or inline base64 as a `data:` URI. The examples below use a local `reference.wav`; fetch one first, e.g.
+> `curl -sL https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav -o reference.wav`.
+> When the server is remote, send inline base64 instead:
+> ```python
+> import base64
+> with open("reference.wav", "rb") as f:
+>     audio_path = "data:audio/wav;base64," + base64.b64encode(f.read()).decode()
+> # then: "references": [{"audio_path": audio_path, "text": ...}]
+> ```
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech \
@@ -53,7 +63,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   -d '{
     "input": "Get the trust fund to the bank early.",
     "references": [{
-      "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
+      "audio_path": "reference.wav",
       "text": "We asked over twenty different people, and they all said it was his."
     }],
     "temperature": 0.8,
@@ -87,7 +97,7 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
   -d '{
     "input": "Get the trust fund to the bank early.",
     "references": [{
-      "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
+      "audio_path": "reference.wav",
       "text": "We asked over twenty different people, and they all said it was his."
     }],
     "response_format": "pcm",
@@ -160,9 +170,9 @@ followed by whitespace (so `3.14` / `U.S.A` are not premature cuts), while
 unambiguous non-ASCII terminators split immediately. With
 `split_granularity="clause"`, non-ASCII clause terminators (`，；、` …) are also
 split points. A sentence longer than the per-chunk time budget is further
-sub-split at clause / bracket / word / character boundaries; the budget's
-chars-per-second rate is estimated from the reference audio when one is
-supplied. Markup tags are handled too: state tags (`<|emotion:…|>`,
+sub-split at clause / bracket / word / character boundaries using a fixed
+conservative budget (no per-session audio I/O). Markup tags are handled too:
+state tags (`<|emotion:…|>`,
 `<|style:…|>`, `<|prosody:…|>`) force a boundary and prefix each following
 chunk, `<|clear|>` resets that state, and transient tags (`<|prosody:pause|>`,
 `<|sfx:…|>`) stay inline.
@@ -174,7 +184,7 @@ chunk, `<|clear|>` resets that state, and transient tags (`<|prosody:pause|>`,
 ```python
 import requests
 
-REFERENCE_AUDIO = "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav"
+REFERENCE_AUDIO = "reference.wav"  # local path; see download note above
 REFERENCE_TEXT = "We asked over twenty different people, and they all said it was his."
 SPEECH_INPUT = "Get the trust fund to the bank early."
 
@@ -264,7 +274,7 @@ with wave.open("output_stream.wav", "wb") as wav:
 | `voice` | string | `"default"` | Voice identifier (ignored when `references` is set) |
 | `response_format` | string | `"wav"` | Output audio format; use `"pcm"` for low-latency streaming playback |
 | `stream` | bool | `false` | Enable streaming via SSE; set to `true` to receive incremental audio chunks |
-| `references` | list | `null` | Reference audio for voice cloning; each item has `audio_path` (local path or HTTP URL) and `text` (transcript) |
+| `references` | list | `null` | Reference audio for voice cloning; each item has `audio_path` (server-local path or base64 `data:` URI; remote URLs rejected) and `text` (transcript) |
 | `reference_codes` | list[list[int]] | `null` | Pre-encoded discrete codes, shape `[T, 8]` — alternative to `references[0].audio_path` |
 | `reference_text` | string | `null` | Transcript of reference audio when supplying `reference_codes` |
 | `max_new_tokens` | int | `2048` | Maximum number of generated multi-codebook steps |

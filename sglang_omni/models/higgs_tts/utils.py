@@ -7,11 +7,12 @@
 - :func:`truncate_rope_to_bf16` matches sglang's fp32 RoPE cache to Higgs's
   bf16 training-time RoPE.
 - Stage helpers: checkpoint snapshot, codec cache, ref-codes coercion,
-  ref-audio loading from path / URL / bytes / base64.
+  ref-audio loading from local path / data: URI / bytes / base64.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,9 @@ from huggingface_hub import snapshot_download
 from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
 from sglang_omni.preprocessing.audio import AudioMediaIO
 from sglang_omni.preprocessing.base import _is_url
-from sglang_omni.preprocessing.resource_connector import global_http_connection
+
+# data:[<media-type>][;base64],<payload>
+_DATA_URI_RE = re.compile(r"^data:([^;,]*)(;base64)?,(.*)$", re.DOTALL)
 
 # Codec-vocab specials (inside the [N*V] codebook space, NOT the text vocab).
 BOC_ID = 1024
@@ -116,24 +119,32 @@ def to_codes_TN(raw: Any, num_codebooks: int) -> torch.Tensor | None:
 def load_audio_to_24k(reference_audio: Any) -> tuple[np.ndarray, int]:
     """Load ``inputs["reference_audio"]`` as 24 kHz mono float32.
 
-    Accepts local path, HTTP/HTTPS URL, or ``{audio_path|path|bytes|base64|data}`` dict.
+    Accepts a server-local path, an inline ``data:`` URI (base64), or a
+    ``{audio_path|path|bytes|base64|data}`` dict. Remote URLs are rejected
+    (SSRF risk) — pass inline base64 instead.
     """
     io = AudioMediaIO(target_sr=HiggsAudioCodec.SAMPLE_RATE)
 
-    def _load_path_or_url(src: str | Path) -> tuple[np.ndarray, int]:
-        if isinstance(src, str) and _is_url(src):
-            response = global_http_connection.get_sync_client().get(src)
-            response.raise_for_status()
-            audio, sr = io.load_bytes(response.content)
-        else:
-            audio, sr = io.load_file(Path(src))
+    def _load_path_or_uri(src: str | Path) -> tuple[np.ndarray, int]:
+        if isinstance(src, str):
+            data_uri = _DATA_URI_RE.match(src)
+            if data_uri:
+                media_type = data_uri.group(1) or "audio/wav"
+                audio, sr = io.load_base64(media_type, data_uri.group(3))
+                return np.asarray(audio, dtype=np.float32), int(sr)
+            if _is_url(src):
+                raise ValueError(
+                    "Remote URL reference audio is not supported (SSRF risk); "
+                    "pass inline base64 as a data: URI or a server-local path."
+                )
+        audio, sr = io.load_file(Path(src))
         return np.asarray(audio, dtype=np.float32), int(sr)
 
     if isinstance(reference_audio, (str, Path)):
-        return _load_path_or_url(reference_audio)
+        return _load_path_or_uri(reference_audio)
 
     if "audio_path" in reference_audio or "path" in reference_audio:
-        return _load_path_or_url(
+        return _load_path_or_uri(
             reference_audio.get("audio_path") or reference_audio["path"]
         )
     if "bytes" in reference_audio:

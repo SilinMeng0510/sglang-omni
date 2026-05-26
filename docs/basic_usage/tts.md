@@ -75,7 +75,10 @@ Note that without reference audio, the generated voice will sound robotic. For n
 
 ### Voice Cloning
 
-The examples below use a sample clip from [`seed-tts-eval-mini`](https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini). The `references` field accepts `audio_path` (a local path or HTTP URL) and `text` (transcript of that audio).
+The examples below use a sample clip from [`seed-tts-eval-mini`](https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini). The `references` field accepts `audio_path` (a server-local path or an inline base64 `data:` URI — remote URLs are rejected) and `text` (transcript of that audio).
+
+> Remote URLs are rejected (SSRF risk). The examples use a local `reference.wav`; fetch one first, e.g.
+> `curl -sL https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav -o reference.wav`.
 
 1. Non-streaming request
 
@@ -85,7 +88,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   -d '{
     "input": "Get the trust fund to the bank early.",
     "references": [{
-      "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
+      "audio_path": "reference.wav",
       "text": "We asked over twenty different people, and they all said it was his."
     }]
   }' \
@@ -102,7 +105,7 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
   -d '{
     "input": "Get the trust fund to the bank early.",
     "references": [{
-      "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
+      "audio_path": "reference.wav",
       "text": "We asked over twenty different people, and they all said it was his."
     }],
     "stream": true
@@ -130,7 +133,7 @@ with open("output.wav", "wb") as f:
 ### Voice Cloning
 
 ```python
-REFERENCE_AUDIO = "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav"
+REFERENCE_AUDIO = "reference.wav"  # local path; see download note above
 REFERENCE_TEXT = "We asked over twenty different people, and they all said it was his."
 SPEECH_INPUT = "Get the trust fund to the bank early."
 ```
@@ -209,8 +212,8 @@ The table below lists all parameters accepted by the `/v1/audio/speech` endpoint
 | `response_format` | string | `"wav"` | Output audio format |
 | `speed` | float | `1.0` | Playback speed multiplier |
 | `stream` | bool | `false` | Enable streaming via SSE |
-| `references` | list | `null` | Reference audio for voice cloning; each item has `audio_path` (local path / remote url) and `text` |
-| `ref_audio` | string | `null` | Reference audio path / URL / base64 string; equivalent to `references[0].audio_path` |
+| `references` | list | `null` | Reference audio for voice cloning; each item has `audio_path` (server-local path or base64 `data:` URI; remote URLs rejected) and `text` |
+| `ref_audio` | string | `null` | Reference audio: server-local path or base64 `data:` URI (remote URLs rejected); equivalent to `references[0].audio_path` |
 | `ref_text` | string | `null` | Transcript for `ref_audio`; equivalent to `references[0].text` |
 | `language` | string | `null` | Model-specific language hint; Qwen3-TTS Base defaults to `auto` |
 | `max_new_tokens` | int | `null` | Maximum number of generated tokens |

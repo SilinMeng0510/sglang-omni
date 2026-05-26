@@ -34,7 +34,20 @@ S2PRO_CONFIG_PATH = "examples/configs/s2pro_tts.yaml"
 
 SPEECH_INPUT = "Get the trust fund to the bank early."
 REFERENCE_TEXT = "We asked over twenty different people, and they all said it was his."
-REFERENCE_AUDIO = "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav"
+# Reference audio must be a server-local path or inline base64 (remote URLs are
+# rejected). Download the sample clip once, then pass its local path.
+REFERENCE_AUDIO_URL = "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav"
+
+
+@pytest.fixture(scope="module")
+def reference_audio(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Fetch the sample reference clip to a local file; return its path."""
+    path = tmp_path_factory.mktemp("refs") / "reference.wav"
+    with disable_proxy():
+        response = requests.get(REFERENCE_AUDIO_URL, timeout=120)
+    response.raise_for_status()
+    path.write_bytes(response.content)
+    return str(path)
 
 
 @pytest.fixture(scope="module")
@@ -92,6 +105,7 @@ def test_basic_tts(
 @pytest.mark.docs
 def test_voice_cloning_streaming(
     server_process: tuple[subprocess.Popen, int],
+    reference_audio: str,
 ) -> None:
     """Streaming voice cloning via SSE."""
     _, port = server_process
@@ -101,7 +115,7 @@ def test_voice_cloning_streaming(
             f"{api_base}/v1/audio/speech",
             json={
                 "input": SPEECH_INPUT,
-                "references": [{"audio_path": REFERENCE_AUDIO, "text": REFERENCE_TEXT}],
+                "references": [{"audio_path": reference_audio, "text": REFERENCE_TEXT}],
                 "stream": True,
             },
             stream=True,
@@ -135,6 +149,7 @@ def test_voice_cloning_streaming(
 @pytest.mark.docs
 def test_voice_cloning_streaming_wav_reassembly(
     server_process: tuple[subprocess.Popen, int],
+    reference_audio: str,
     tmp_path: Path,
 ) -> None:
     """Streaming voice cloning with WAV reassembly from SSE chunks."""
@@ -142,7 +157,7 @@ def test_voice_cloning_streaming_wav_reassembly(
     api_base = f"http://localhost:{port}"
     payload = {
         "input": SPEECH_INPUT,
-        "references": [{"audio_path": REFERENCE_AUDIO, "text": REFERENCE_TEXT}],
+        "references": [{"audio_path": reference_audio, "text": REFERENCE_TEXT}],
         "stream": True,
         "response_format": "wav",
     }
