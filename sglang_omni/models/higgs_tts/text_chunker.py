@@ -30,9 +30,7 @@ become top-level boundaries.
 Time estimation uses a single chars-per-second (CPS) rate; the streaming path
 uses a fixed conservative :data:`DEFAULT_CPS` (no per-session audio I/O — the
 CPS only sets the oversized-sentence sub-split threshold, so precision is
-low-value), while :func:`estimate_cps` can derive it from a known
-``(text, duration)`` pair for offline/batch callers. Markup tags (``<|...|>``)
-are tag-aware: state
+low-value). Markup tags (``<|...|>``) are tag-aware: state
 tags (emotion/style/prosody) force a boundary and prefix every following chunk;
 ``<|clear|>`` resets that state; transient tags (pause/sfx) stay inline and cost
 no synthesis time.
@@ -51,7 +49,6 @@ DEFAULT_CPS = 10.0  # fallback when no reference is available
 #   STerm  — Sentence_Terminal (.!? 。！？ ؟ ։ … across scripts)
 #   Term   — Terminal_Punctuation; (Term − STerm) = clause-internal stops
 #   Pe/Pf  — close brackets / final quotes
-_SENT_END_CLS = r"[\p{STerm}…]"
 _CLAUSE_CLS = r"[\p{Term}--\p{STerm}]"
 _CLOSE_PUNCT_CLS = r"[\p{Pe}\p{Pf}\"']"
 
@@ -91,20 +88,6 @@ def _spoken_len(text: str) -> int:
 def estimate_seconds(text: str, cps: float = DEFAULT_CPS) -> float:
     """Estimated TTS synthesis time in seconds at ``cps`` chars/sec."""
     return _spoken_len(text) / cps if cps > 0 else 0.0
-
-
-def estimate_cps(ref_text: str | None, ref_audio_dur_s: float | None) -> float:
-    """Chars/sec measured from a reference ``(text, audio_duration)`` pair.
-
-    Counts spoken (non-whitespace, non-tag) characters only. Falls back to
-    :data:`DEFAULT_CPS` when the reference is missing or unusable.
-    """
-    if not ref_text or not ref_audio_dur_s or ref_audio_dur_s <= 0:
-        return DEFAULT_CPS
-    n = _spoken_len(ref_text)
-    if n == 0:
-        return DEFAULT_CPS
-    return n / ref_audio_dur_s
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +450,5 @@ __all__ = [
     "DEFAULT_MAX_SECONDS",
     "StreamingTextChunker",
     "chunk_text",
-    "estimate_cps",
     "estimate_seconds",
 ]

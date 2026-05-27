@@ -6,10 +6,8 @@ from __future__ import annotations
 import pytest
 
 from sglang_omni.models.higgs_tts.text_chunker import (
-    DEFAULT_CPS,
     StreamingTextChunker,
     chunk_text,
-    estimate_cps,
     estimate_seconds,
 )
 
@@ -128,20 +126,6 @@ def test_state_carries_across_add_text_calls() -> None:
     chunker = StreamingTextChunker()
     assert chunker.add_text("<|emotion:joy|>First. ") == ["<|emotion:joy|>First."]
     assert chunker.add_text("Second. ") == ["<|emotion:joy|>Second."]
-
-
-# ---------------------------------------------------------------------------
-# CPS estimation
-# ---------------------------------------------------------------------------
-def test_estimate_cps_counts_spoken_chars() -> None:
-    # "hello world" → 10 spoken chars over 2s = 5 cps.
-    assert estimate_cps("hello world", 2.0) == pytest.approx(5.0)
-
-
-def test_estimate_cps_falls_back_without_reference() -> None:
-    assert estimate_cps(None, 2.0) == DEFAULT_CPS
-    assert estimate_cps("hello", 0.0) == DEFAULT_CPS
-    assert estimate_cps("", 2.0) == DEFAULT_CPS
 
 
 # ---------------------------------------------------------------------------
