@@ -90,26 +90,6 @@ class HiggsTTSModelRunner(ModelRunner):
                 offset = end
                 continue
 
-            # Derive how many code rows are already covered by the KV-cached
-            # prefix from the prefix itself, NOT from an accumulating counter.
-            #
-            # ``forward_batch.input_ids`` (hence ``placeholder_mask``) is only the
-            # *uncached extend suffix*: ``fill_ids[len(prefix_indices):]``. On a
-            # radix prefix HIT (cross-chunk continuity reuses the growing session
-            # prefix) or on a later chunked-prefill pass, the leading ``-100``
-            # placeholders live in the cached prefix and are absent here. Those
-            # rows were already embedded on the pass that first materialised them,
-            # so this pass must start consuming codes *after* them. Counting the
-            # ``-100`` in ``fill_ids[:prefix_len]`` gives that offset and is robust
-            # to both radix reuse and multi-pass chunked prefill, because
-            # ``prefix_indices`` grows to cover every already-computed token.
-            #
-            # The old code started at 0 every request and walked from the FRONT
-            # of ``reference_codes_delayed`` (ref ++ history). On chunk N>=2 the
-            # ref-audio placeholders sat in the cached prefix, so the surviving
-            # extend placeholders (the newest history chunk's audio) got overlaid
-            # with the *start of the reference clip* — the model saw unrelated
-            # audio where it expected "what I just generated" and looped/repeated.
             prefix_len = int(req.prefix_indices.numel())
             fill_ids = req.fill_ids if req.fill_ids else req.origin_input_ids
             consumed = sum(

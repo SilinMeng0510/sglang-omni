@@ -50,9 +50,6 @@ class Client:
         self._coordinator = coordinator
         self._result_builder = result_builder or self._default_result_builder
         self._stream_builder = stream_builder or self._default_stream_builder
-        # Optional ``(client, request, request_id)`` async-generator delegate
-        # wrapping generate() (e.g. the Higgs chunking orchestrator); it drives
-        # submissions via _generate_single. ``None`` → plain single-shot.
         self.generate_middleware = generate_middleware
 
     # ------------------------------------------------------------------
