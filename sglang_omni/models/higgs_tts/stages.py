@@ -289,8 +289,9 @@ def create_sglang_tts_engine_executor(
     """sglang-backed AR engine for Higgs TTS.
 
     ``max_history_chunks`` is the continuity sliding-window cap (prior chunks
-    conditioning the next; ``0`` disables it) — the single source of truth,
-    overridable via ``--stage-arg tts_engine.max_history_chunks=N``.
+    conditioning the next; ``0`` disables it). Set it via the pipeline config's
+    top-level ``max_history_chunks`` (yaml or CLI ``max_history_chunks=N``),
+    which routes it here.
     """
     checkpoint_dir = resolve_checkpoint(model_path)
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
