@@ -660,6 +660,10 @@ async def _handle_streaming_speech_ws(
                         session_final=False,
                     )
                     sentence_index += 1
+            elif msg_type == "input.wait":
+                # Agent paused outputing
+                if splitter is not None:
+                    splitter.rearm_fastout()
             elif msg_type == "input.done":
                 pending = _flush_stream(splitter)
                 for offset, sentence in enumerate(pending):

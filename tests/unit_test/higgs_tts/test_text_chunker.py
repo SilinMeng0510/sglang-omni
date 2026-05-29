@@ -179,6 +179,17 @@ def test_fastout_only_affects_the_first_chunk() -> None:
     assert c.add_text("结束。") == ["还有逗号，继续结束。"]
 
 
+def test_rearm_fastout_re_enables_first_clause() -> None:
+    # rearm_fastout (input.wait) makes the next turn open at a clause boundary
+    # again — without it, the post-first sentence mode would keep "三，四。" whole.
+    c = HiggsTextChunker(
+        ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True)
+    )
+    assert c.add_text("一，二。") == ["一，", "二。"]
+    c.rearm_fastout()
+    assert c.add_text("三，四。") == ["三，", "四。"]
+
+
 def test_default_no_fastout_is_sentence_only() -> None:
     # Without the flag, a leading clause comma must NOT release early.
     c = HiggsTextChunker(ChunkerOptions(max_seconds=8.0, cps=10.0))

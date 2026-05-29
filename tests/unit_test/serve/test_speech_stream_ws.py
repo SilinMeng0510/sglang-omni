@@ -187,6 +187,41 @@ def test_streaming_speech_ws_fastout_clause_then_sentence() -> None:
     assert speech_client.prompts == ["一，", "二。", "三，四"]
 
 
+def test_streaming_speech_ws_input_wait_rearms_fastout() -> None:
+    # input.wait re-arms fastout: turn 2's first chunk is a clause again. Without
+    # the wait, "三，四。" would stay one sentence chunk (sentence mode after first).
+    speech_client = StreamingSpeechWsClient()
+    client = TestClient(create_app(speech_client, model_name="higgs"))
+
+    with client.websocket_connect("/v1/audio/speech/stream") as ws:
+        ws.send_json({"type": "session.config", "fastout": True})
+        # turn 1
+        ws.send_json({"type": "input.text", "text": "一，二。"})
+        assert ws.receive_json()["sentence_text"] == "一，"
+        assert ws.receive_bytes() == "audio:一，".encode()
+        assert ws.receive_json()["type"] == "audio.done"
+        assert ws.receive_json()["sentence_text"] == "二。"
+        assert ws.receive_bytes() == "audio:二。".encode()
+        assert ws.receive_json()["type"] == "audio.done"
+        # agent paused (user speaking) → keepalive that re-arms fastout
+        ws.send_json({"type": "input.wait"})
+        # turn 2 — first chunk is a clause again thanks to the re-arm
+        ws.send_json({"type": "input.text", "text": "三，四。"})
+        assert ws.receive_json()["sentence_text"] == "三，"
+        assert ws.receive_bytes() == "audio:三，".encode()
+        assert ws.receive_json()["type"] == "audio.done"
+        assert ws.receive_json()["sentence_text"] == "四。"
+        assert ws.receive_bytes() == "audio:四。".encode()
+        assert ws.receive_json()["type"] == "audio.done"
+        ws.send_json({"type": "input.done"})
+        assert ws.receive_json() == {
+            "type": "session.done",
+            "total_sentences": 4,
+        }
+
+    assert speech_client.prompts == ["一，", "二。", "三，", "四。"]
+
+
 def test_streaming_speech_ws_requires_config_first() -> None:
     client = TestClient(create_app(StreamingSpeechWsClient(), model_name="higgs"))
 

@@ -34,6 +34,8 @@ class TextChunker(Protocol):
 
     def flush(self) -> list[str]: ...
 
+    def rearm_fastout(self) -> None: ...
+
 
 @dataclass(frozen=True)
 class ChunkerOptions:
@@ -294,6 +296,12 @@ class HiggsTextChunker:
         out = _chunk(self._buffer, max_seconds=self._max_seconds, cps=self._cps)
         self._buffer = ""
         return out
+
+    def rearm_fastout(self) -> None:
+        """Re-arm ``fastout`` so the next chunk released is again cut at the
+        earliest clause boundary. The WS handler calls this on ``input.wait``
+        (agent paused, user speaking) so every agent turn opens fast."""
+        self._emitted_first = False
 
 
 __all__ = [
