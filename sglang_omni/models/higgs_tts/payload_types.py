@@ -19,9 +19,17 @@ class HiggsTtsState:
     # preprocessing / audio_encoder
     prompt_token_ids: list[int] = field(default_factory=list)
     reference_codes_delayed: list[list[int]] | None = None
-    target_text: str | None = None
-    reference_text: str | None = None
     reference_waveform: Any | None = None  # mono 24 kHz [1, 1, L] torch.Tensor
+    # Text tokenized once in preprocessing; the encoder + engine assemble the
+    # prompt from these (no re-tokenize downstream).
+    target_text_token_ids: list[int] | None = None
+    reference_text_token_ids: list[int] | None = None
+
+    # Cross-chunk continuity: a shared ``session_id`` ties an utterance's chunks
+    # together so the engine conditions each on the prior chunks' audio.
+    # ``session_final`` evicts the session; ``None`` => plain single-shot.
+    session_id: str | None = None
+    session_final: bool = False
 
     num_codebooks: int = 8
     codebook_size: int = 1026  # 1024 data + <|boc|> + <|eoc|>
@@ -53,12 +61,15 @@ class HiggsTtsState:
         }
         if self.reference_codes_delayed is not None:
             data["reference_codes_delayed"] = self.reference_codes_delayed
-        if self.target_text is not None:
-            data["target_text"] = self.target_text
-        if self.reference_text is not None:
-            data["reference_text"] = self.reference_text
         if self.reference_waveform is not None:
             data["reference_waveform"] = self.reference_waveform
+        if self.session_id is not None:
+            data["session_id"] = self.session_id
+            data["session_final"] = self.session_final
+        if self.target_text_token_ids is not None:
+            data["target_text_token_ids"] = self.target_text_token_ids
+        if self.reference_text_token_ids is not None:
+            data["reference_text_token_ids"] = self.reference_text_token_ids
         for key in ("top_p", "top_k", "seed"):
             value = getattr(self, key)
             if value is not None:
@@ -79,9 +90,11 @@ class HiggsTtsState:
         return cls(
             prompt_token_ids=list(data.get("prompt_token_ids", [])),
             reference_codes_delayed=data.get("reference_codes_delayed"),
-            target_text=data.get("target_text"),
-            reference_text=data.get("reference_text"),
             reference_waveform=data.get("reference_waveform"),
+            session_id=data.get("session_id"),
+            session_final=data.get("session_final", False),
+            target_text_token_ids=data.get("target_text_token_ids"),
+            reference_text_token_ids=data.get("reference_text_token_ids"),
             num_codebooks=data.get("num_codebooks", 8),
             codebook_size=data.get("codebook_size", 1026),
             max_new_tokens=data.get("max_new_tokens", 2048),

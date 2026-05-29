@@ -16,11 +16,28 @@ from sglang_omni.serve.openai_api import (
 from sglang_omni.serve.protocol import StreamingSpeechSessionConfig
 
 
+class _FakeMiddleware:
+    """Stand-in for the generate-middleware: the WS handler only needs its
+    ``new_streaming_chunker`` to obtain a per-connection sentence splitter."""
+
+    def new_streaming_chunker(self, *, split_granularity: str | None = None):
+        from sglang_omni.models.higgs_tts.text_chunker import (
+            ChunkerOptions,
+            HiggsTextChunker,
+        )
+
+        return HiggsTextChunker(
+            ChunkerOptions(split_granularity=split_granularity or "sentence")
+        )
+
+
 class StreamingSpeechWsClient:
     def __init__(self) -> None:
         self.prompts: list[str] = []
         self.stream_prompts: list[str] = []
         self.aborted: list[str] = []
+        # The WS handler reads ``client.generate_middleware.new_streaming_chunker``.
+        self.generate_middleware = _FakeMiddleware()
 
     def health(self) -> dict[str, Any]:
         return {"running": True}

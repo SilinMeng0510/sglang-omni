@@ -328,8 +328,25 @@ async def _run_server(
     )
 
     try:
-        cl_kwargs = client_kwargs or {}
-        client = Client(coordinator, **cl_kwargs)
+        cl_kwargs = dict(client_kwargs or {})
+        # A model may declare a generate orchestrator (the chunking middleware
+        # for TTS) via its PipelineConfig; plugged into the shared Client as
+        # generic ``generate_middleware``. ``None`` for non-orchestrated models.
+        generate_middleware = cl_kwargs.pop("generate_middleware", None)
+        if generate_middleware is None:
+            try:
+                generate_middleware = pipeline_config.create_generate_orchestrator()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to construct generate orchestrator for model %s: "
+                    "%s; long-text TTS will fall back to single-shot generation.",
+                    pipeline_config.name,
+                    exc,
+                )
+                generate_middleware = None
+        client = Client(
+            coordinator, generate_middleware=generate_middleware, **cl_kwargs
+        )
         app = create_app(
             client,
             model_name=model_name or pipeline_config.name,

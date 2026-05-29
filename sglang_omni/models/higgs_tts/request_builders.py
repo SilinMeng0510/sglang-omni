@@ -13,6 +13,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
+from sglang_omni.models.higgs_tts.session import session_extra_key
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
@@ -31,6 +32,11 @@ class HiggsSGLangRequestData(SGLangARRequestData):
     # OmniScheduler forwards it and clears the field every decode step.
     latest_stream_code_chunk: torch.Tensor | None = None
     engine_start_s: float = 0.0
+    # Continuity: the result adapter commits this chunk's codes + text under
+    # ``session_id`` so the next chunk conditions on it; ``session_final`` evicts.
+    session_id: str | None = None
+    session_final: bool = False
+    session_text_token_ids: list[int] | None = None
 
 
 class _ResettableHiggsModel(Protocol):
@@ -62,7 +68,10 @@ def _ref_audio_fingerprint(codes: list[list[int]] | None) -> str | None:
 
 
 def build_sglang_higgs_request(
-    state: HiggsTtsState, *, request_id: str = ""
+    state: HiggsTtsState,
+    *,
+    request_id: str = "",
+    extra_key_override: str | None = None,
 ) -> HiggsSGLangRequestData:
     input_ids_list = list(state.prompt_token_ids)
     input_ids = torch.tensor(input_ids_list, dtype=torch.long)
@@ -84,15 +93,21 @@ def build_sglang_higgs_request(
     sampling_params.normalize(tokenizer=None)
 
     # vocab_size = backbone text vocab so cb0 rides sglang's standard sampler path.
-    # extra_key namespaces the radix cache per ref-audio fingerprint so prompts
-    # sharing the -100 placeholder prefix can never cross-contaminate KV.
+    # extra_key namespaces the radix cache (identical -100 placeholder prefixes
+    # must not share KV): single-shot keys per ref-audio fingerprint, continuity
+    # sessions key per session (prefix reuse within, isolation across).
+    extra_key = (
+        extra_key_override
+        if extra_key_override is not None
+        else _ref_audio_fingerprint(state.reference_codes_delayed)
+    )
     req = Req(
         rid=request_id,
         origin_input_text="",
         origin_input_ids=input_ids_list,
         sampling_params=sampling_params,
         vocab_size=151_936,
-        extra_key=_ref_audio_fingerprint(state.reference_codes_delayed),
+        extra_key=extra_key,
     )
     # V1's prefill manager probes these attrs; absence triggers AttributeError.
     req._codec_suppress_tokens = None
@@ -125,6 +140,8 @@ def make_higgs_scheduler_adapters(
     model: _ResettableHiggsModel,
     *,
     max_new_tokens_cap: int | None = None,
+    adapter: Any = None,
+    session_store: Any = None,
 ) -> tuple[_HiggsRequestBuilder, _HiggsResultAdapter]:
     """Build (request_builder, result_adapter) closures bound to a
     :class:`HiggsTTSModel` instance.
@@ -132,6 +149,13 @@ def make_higgs_scheduler_adapters(
     The result adapter drops the model's per-request slot (sampler state +
     accumulated codes) once a result is emitted so a long-running server
     doesn't accumulate dead slots.
+
+    With ``adapter`` + ``session_store``, a request carrying
+    ``state.session_id`` is reassembled into the interleaved continuity prompt:
+    prior chunks' codes (from the store, never surfaced to serve) are woven in
+    as ``<|text|> tok(t_i) <|audio|> [a_i]`` blocks and appended after the ref
+    codes for the runner's order-based ``-100`` overlay. Both closures run in
+    the engine process, so the store needs no cross-process sync.
     """
 
     def request_builder(payload: StagePayload) -> HiggsSGLangRequestData:
@@ -141,7 +165,33 @@ def make_higgs_scheduler_adapters(
                 int(state.max_new_tokens),
                 int(max_new_tokens_cap),
             )
-        data = build_sglang_higgs_request(state, request_id=payload.request_id)
+
+        extra_key_override: str | None = None
+        session_text_token_ids: list[int] | None = None
+        session_id = state.session_id
+        if session_id and session_store is not None and adapter is not None:
+            prompt_history, overlay_codes = session_store.history_for(session_id)
+            num_ref_rows = len(state.reference_codes_delayed or [])
+            session_text_token_ids = list(state.target_text_token_ids or [])
+            state.prompt_token_ids = adapter.build_prompt_from_ids(
+                session_text_token_ids,
+                num_ref_tokens=num_ref_rows,
+                reference_text_ids=state.reference_text_token_ids,
+                history=prompt_history,
+            )
+            ref_codes = list(state.reference_codes_delayed or [])
+            ref_codes.extend(overlay_codes)
+            state.reference_codes_delayed = ref_codes or None
+            extra_key_override = session_extra_key(session_id)
+
+        data = build_sglang_higgs_request(
+            state,
+            request_id=payload.request_id,
+            extra_key_override=extra_key_override,
+        )
+        data.session_id = session_id
+        data.session_final = state.session_final
+        data.session_text_token_ids = session_text_token_ids
         data.engine_start_s = time.perf_counter()
         data.stage_payload = payload
         return data
@@ -152,6 +202,19 @@ def make_higgs_scheduler_adapters(
         apply_higgs_result(state, data)
         if data.engine_start_s:
             state.engine_time_s = time.perf_counter() - data.engine_start_s
+        if (
+            session_store is not None
+            and data.session_id
+            and state.output_codes_delayed
+        ):
+            # Codes stay engine-side — never written onto the payload serve sees.
+            session_store.commit(
+                data.session_id,
+                data.session_text_token_ids or [],
+                state.output_codes_delayed,
+            )
+            if data.session_final:
+                session_store.evict(data.session_id)
         model.reset_request(payload.request_id)
         return StagePayload(
             request_id=payload.request_id,

@@ -35,6 +35,7 @@ from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.request_builders import make_higgs_scheduler_adapters
+from sglang_omni.models.higgs_tts.session import SessionStore
 from sglang_omni.models.higgs_tts.text_tokenizer import HiggsTokenizerAdapter
 from sglang_omni.models.higgs_tts.utils import (
     apply_delay_pattern,
@@ -59,8 +60,10 @@ from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleSched
 logger = logging.getLogger(__name__)
 
 
-# Codec runs at 75 Hz; chunked prefill of the multi-codebook prompt is unsafe
-# (sampler state machine has no rollback) so reject inputs past chunked_prefill_size.
+# Reject ref audio past this many seconds; chunked prefill of the
+# multi-codebook prompt is unsafe (sampler state machine has no rollback)
+# so we cap before sglang gets the prompt. Multiplier is the codec's frame
+# rate — single source of truth in :data:`HiggsAudioCodec.FRAME_RATE`.
 _MAX_REF_AUDIO_SEC = 100
 
 
@@ -135,14 +138,30 @@ def create_preprocessing_executor(
                             "audio_path"
                         ) or first.get("path")
 
+        # Continuity session tag (set by serve for chunked utterances); the
+        # engine accumulates the audio and rebuilds the prompt. Unset = single-shot.
+        session = payload.request.metadata.get("tts_session") or {}
+        session_id = session.get("id")
+        session_final = bool(session.get("final", False))
+
         text = inputs.get("input") or inputs.get("text") or ""
         reference_text = inputs.get("reference_text") or None
+        target_text_token_ids = list(tokenizer.encode(text, add_special_tokens=False))
+        reference_text_token_ids = (
+            list(tokenizer.encode(reference_text, add_special_tokens=False))
+            if reference_text
+            else None
+        )
         ref_codes_TN = to_codes_TN(inputs.get("reference_codes"), num_codebooks)
-        if ref_codes_TN is not None and ref_codes_TN.shape[0] > _MAX_REF_AUDIO_SEC * 75:
+        if (
+            ref_codes_TN is not None
+            and ref_codes_TN.shape[0] > _MAX_REF_AUDIO_SEC * HiggsAudioCodec.FRAME_RATE
+        ):
             raise ValueError(
                 f"reference_codes is too long ({ref_codes_TN.shape[0]} frames); "
                 f"cap at {_MAX_REF_AUDIO_SEC}s of audio "
-                f"(~{_MAX_REF_AUDIO_SEC * 75} frames at 75 Hz)."
+                f"(~{_MAX_REF_AUDIO_SEC * HiggsAudioCodec.FRAME_RATE} frames at "
+                f"{HiggsAudioCodec.FRAME_RATE} Hz)."
             )
 
         waveform_tensor = None
@@ -158,35 +177,36 @@ def create_preprocessing_executor(
                 )
             waveform_tensor = wav.view(1, 1, -1).contiguous().float()
 
+        # Built from the already-tokenized ids (no re-tokenize). ref_codes are
+        # reference-only; the session path appends prior chunks' codes engine-side.
         if ref_codes_TN is not None:
             delayed = apply_delay_pattern(ref_codes_TN)
-            prompt_ids = adapter.build_prompt(
-                text,
+            prompt_ids = adapter.build_prompt_from_ids(
+                target_text_token_ids,
                 num_ref_tokens=delayed.shape[0],
-                reference_text=reference_text,
+                reference_text_ids=reference_text_token_ids,
             )
             ref_codes_delayed: list[list[int]] | None = delayed.tolist()
-            target_text_for_encoder = None
-            reference_text_for_encoder = None
         elif waveform_tensor is None:
-            prompt_ids = adapter.build_prompt(
-                text, num_ref_tokens=0, reference_text=reference_text
+            prompt_ids = adapter.build_prompt_from_ids(
+                target_text_token_ids,
+                num_ref_tokens=0,
+                reference_text_ids=reference_text_token_ids,
             )
             ref_codes_delayed = None
-            target_text_for_encoder = None
-            reference_text_for_encoder = None
         else:
+            # Raw-audio path: codec encode + prompt assembly happen in audio_encoder.
             prompt_ids = []
             ref_codes_delayed = None
-            target_text_for_encoder = text
-            reference_text_for_encoder = reference_text
 
         state = HiggsTtsState(
             prompt_token_ids=prompt_ids,
             reference_codes_delayed=ref_codes_delayed,
             reference_waveform=waveform_tensor,
-            target_text=target_text_for_encoder,
-            reference_text=reference_text_for_encoder,
+            session_id=session_id,
+            session_final=session_final,
+            target_text_token_ids=target_text_token_ids,
+            reference_text_token_ids=reference_text_token_ids,
             num_codebooks=num_codebooks,
             codebook_size=codebook_size,
             max_new_tokens=int(params.get("max_new_tokens", 2048)),
@@ -238,15 +258,14 @@ def create_audio_encoder_executor(
                 f"{tuple(ref_codes_TN.shape)}"
             )
         delayed = apply_delay_pattern(ref_codes_TN)
-        state.reference_codes_delayed = delayed.tolist()
-        state.prompt_token_ids = adapter.build_prompt(
-            state.target_text or "",
+        state.prompt_token_ids = adapter.build_prompt_from_ids(
+            state.target_text_token_ids or [],
             num_ref_tokens=delayed.shape[0],
-            reference_text=state.reference_text,
+            reference_text_ids=state.reference_text_token_ids,
         )
+        # Reference-only; the session path appends prior chunks' codes engine-side.
+        state.reference_codes_delayed = delayed.tolist()
         state.reference_waveform = None
-        state.target_text = None
-        state.reference_text = None
         payload.data = state.to_dict()
         return payload
 
@@ -262,9 +281,15 @@ def create_sglang_tts_engine_executor(
     *,
     device: str = "cuda:0",
     max_new_tokens: int | None = 2048,
+    max_history_chunks: int = 4,
     server_args_overrides: dict[str, Any] | None = None,
 ):
-    """sglang-backed AR engine for Higgs TTS."""
+    """sglang-backed AR engine for Higgs TTS.
+
+    ``max_history_chunks`` is the continuity sliding-window cap (prior chunks
+    conditioning the next; ``0`` disables it) — the single source of truth,
+    overridable via ``--stage-arg tts_engine.max_history_chunks=N``.
+    """
     checkpoint_dir = resolve_checkpoint(model_path)
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
@@ -320,9 +345,20 @@ def create_sglang_tts_engine_executor(
     )
     model_runner = HiggsTTSModelRunner(model_worker, output_proc)
     model = model_worker.model_runner.model
+
+    # Continuity: a tokenizer adapter (to rebuild the prompt) + a per-session
+    # code store, shared by the request builder and result adapter.
+    raw_tok = Tokenizer.from_file(os.path.join(checkpoint_dir, "tokenizer.json"))
+    engine_adapter = HiggsTokenizerAdapter(
+        PreTrainedTokenizerFast(tokenizer_object=raw_tok)
+    )
+    session_store = SessionStore(max_history_chunks=max_history_chunks)
+
     request_builder, result_adapter = make_higgs_scheduler_adapters(
         model,
         max_new_tokens_cap=max_new_tokens,
+        adapter=engine_adapter,
+        session_store=session_store,
     )
 
     return OmniScheduler(

@@ -40,6 +40,39 @@ _BUNDLED_CODEC_CONFIG_PATH = os.path.join(
 )
 
 
+def _load_codec_meta() -> dict:
+    """Read codec sample_rate + hop_length from the bundled config JSON.
+
+    Called **once** at module import; the return drives the
+    :class:`HiggsAudioCodec` class constants below. Single source of truth
+    for codec audio-rate / frame-rate — updating the bundled config (e.g.
+    changing acoustic downsampling ratios) auto-propagates everywhere
+    that reads ``HiggsAudioCodec.SAMPLE_RATE`` / ``FRAME_RATE``, so no
+    Python source change is needed when the codec architecture moves.
+
+    Recomputes ``hop_length`` from ``acoustic_model_config.downsampling_ratios``
+    (matching the vendored ``HiggsAudioV2TokenizerConfig.hop_length`` property)
+    rather than trusting the redundant explicit ``hop_length`` field, so a
+    mismatch in the JSON can't cause a silent disagreement with the codec.
+    """
+    import json as _json
+
+    with open(_BUNDLED_CODEC_CONFIG_PATH) as f:
+        cfg = _json.load(f)
+    sample_rate = int(cfg["sample_rate"])
+    hop_length = 1
+    for r in cfg["acoustic_model_config"]["downsampling_ratios"]:
+        hop_length *= int(r)
+    return {
+        "sample_rate": sample_rate,
+        "hop_length": hop_length,
+        "frame_rate": sample_rate / hop_length,
+    }
+
+
+_CODEC_META = _load_codec_meta()
+
+
 def _to_mono_3d(waveform: WaveformInput) -> torch.Tensor:
     """Normalise (Tensor | ndarray) waveform to mono ``[1, 1, L]``."""
     if isinstance(waveform, np.ndarray):
@@ -104,7 +137,14 @@ def _load_codec_state_dict(tts_ckpt_dir: str) -> dict[str, torch.Tensor]:
 class HiggsAudioCodec:
     """Frozen encode/decode wrapper around :class:`HiggsAudioV2TokenizerModel`."""
 
-    SAMPLE_RATE: int = 24_000
+    # Both constants are derived at module import from the bundled codec
+    # config JSON (see ``_load_codec_meta``), NOT hard-coded — updating the
+    # bundled config (e.g. swapping ``acoustic_model_config.downsampling_ratios``)
+    # propagates automatically to every reader. SAMPLE_RATE = the codec's
+    # audio sample rate (Hz). FRAME_RATE = code TPS = SAMPLE_RATE divided
+    # by hop_length (= product of downsampling ratios).
+    SAMPLE_RATE: int = _CODEC_META["sample_rate"]
+    FRAME_RATE: float = _CODEC_META["frame_rate"]
 
     def __init__(
         self, model: HiggsAudioV2TokenizerModel, *, device: torch.device

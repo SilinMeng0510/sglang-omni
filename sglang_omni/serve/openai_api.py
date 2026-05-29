@@ -17,10 +17,10 @@ import asyncio
 import base64
 import json
 import logging
-import re
 import time
 import uuid
 from contextlib import suppress
+from dataclasses import replace
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -63,9 +63,6 @@ _SPEECH_STREAM_CONFIG_TIMEOUT = 10.0
 _SPEECH_STREAM_IDLE_TIMEOUT = 30.0
 _SPEECH_STREAM_MAX_CONFIG_BYTES = 4 * 1024 * 1024
 _SPEECH_STREAM_MAX_INPUT_BYTES = 128 * 1024
-_SPEECH_STREAM_MAX_BUFFER_CHARS = 100_000
-_SPEECH_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])")
-_SPEECH_CLAUSE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|(?<=[。！？，；])")
 
 _BAD_REQUEST_MARKERS = (
     "longer than the model's context length",
@@ -560,48 +557,17 @@ def _register_speech(app: FastAPI) -> None:
         )
 
 
-class _SpeechTextSplitter:
-    def __init__(self, split_granularity: str, min_sentence_length: int = 2) -> None:
-        self._buffer = ""
-        self._min_sentence_length = min_sentence_length
-        self._boundary_re = (
-            _SPEECH_CLAUSE_BOUNDARY_RE
-            if split_granularity == "clause"
-            else _SPEECH_SENTENCE_BOUNDARY_RE
-        )
+def _split_stream(splitter: Any, text: str) -> list[str]:
+    """Incremental sentence split, or passthrough (one sentence per fragment)
+    when the model declares no chunker (``splitter is None``)."""
+    if splitter is None:
+        return [text] if text else []
+    return splitter.add_text(text)
 
-    def add_text(self, text: str) -> list[str]:
-        if not text:
-            return []
-        self._buffer += text
-        if len(self._buffer) > _SPEECH_STREAM_MAX_BUFFER_CHARS:
-            raise ValueError(
-                "Text buffer exceeded maximum size "
-                f"({_SPEECH_STREAM_MAX_BUFFER_CHARS} chars). "
-                "Consider adding sentence-ending punctuation to your input."
-            )
 
-        parts = self._boundary_re.split(self._buffer)
-        if len(parts) <= 1:
-            return []
-
-        segments: list[str] = []
-        carry = ""
-        for part in parts[:-1]:
-            text_part = carry + part
-            carry = ""
-            segment = text_part.strip()
-            if len(segment) >= self._min_sentence_length:
-                segments.append(segment)
-            elif segment:
-                carry = text_part
-        self._buffer = carry + parts[-1]
-        return segments
-
-    def flush(self) -> str | None:
-        segment = self._buffer.strip()
-        self._buffer = ""
-        return segment or None
+def _flush_stream(splitter: Any) -> list[str]:
+    """Drain the chunker at end-of-input; nothing to drain without one."""
+    return list(splitter.flush()) if splitter is not None else []
 
 
 async def _handle_streaming_speech_ws(
@@ -622,8 +588,19 @@ async def _handle_streaming_speech_ws(
         if config is None:
             return
 
-        splitter = _SpeechTextSplitter(config.split_granularity)
+        # Per-connection sentence splitter from the TTS middleware; ``None``
+        # for a non-chunking model → each fragment is one sentence (_split_stream).
+        _middleware = getattr(client, "generate_middleware", None)
+        _new_chunker = getattr(_middleware, "new_streaming_chunker", None)
+        splitter = (
+            _new_chunker(split_granularity=config.split_granularity)
+            if _new_chunker is not None
+            else None
+        )
         sentence_index = 0
+        # One continuity session per connection: every sentence is tagged with
+        # this id so the engine conditions each on the prior ones' audio.
+        session_id = f"ws-{uuid.uuid4()}"
 
         while True:
             try:
@@ -670,7 +647,8 @@ async def _handle_streaming_speech_ws(
                         "input.text requires a string value",
                     )
                     continue
-                for sentence in splitter.add_text(text):
+                for sentence in _split_stream(splitter, text):
+                    # Never final mid-stream — more text may follow.
                     await _generate_streaming_speech_sentence(
                         websocket=websocket,
                         client=client,
@@ -678,18 +656,24 @@ async def _handle_streaming_speech_ws(
                         config=config,
                         sentence_text=sentence,
                         sentence_index=sentence_index,
+                        session_id=session_id,
+                        session_final=False,
                     )
                     sentence_index += 1
             elif msg_type == "input.done":
-                remaining = splitter.flush()
-                if remaining:
+                pending = _flush_stream(splitter)
+                for offset, sentence in enumerate(pending):
+                    # Last sentence is final → engine evicts the session. If the
+                    # flush is empty, the session is reclaimed by idle TTL instead.
                     await _generate_streaming_speech_sentence(
                         websocket=websocket,
                         client=client,
                         default_model=default_model,
                         config=config,
-                        sentence_text=remaining,
+                        sentence_text=sentence,
                         sentence_index=sentence_index,
+                        session_id=session_id,
+                        session_final=(offset == len(pending) - 1),
                     )
                     sentence_index += 1
                 await websocket.send_json(
@@ -803,7 +787,14 @@ async def _generate_streaming_speech_sentence(
     config: StreamingSpeechSessionConfig,
     sentence_text: str,
     sentence_index: int,
+    session_id: str,
+    session_final: bool,
 ) -> None:
+    """Generate audio for one sentence and stream it out the WebSocket.
+
+    Tagged with ``session_id`` so the engine conditions it on the session's
+    prior audio; ``session_final`` evicts the session afterward.
+    """
     response_format = config.response_format or "wav"
     start_payload: dict[str, Any] = {
         "type": "audio.start",
@@ -820,6 +811,7 @@ async def _generate_streaming_speech_sentence(
     request_id = f"speech-stream-{uuid.uuid4()}"
     request = _build_streaming_speech_request(config, sentence_text)
     gen_req = build_speech_generate_request(request, default_model)
+    gen_req = _tag_speech_session(gen_req, session_id, session_final)
 
     try:
         if config.stream_audio:
@@ -865,12 +857,25 @@ async def _generate_streaming_speech_sentence(
             )
 
 
+def _tag_speech_session(
+    gen_req: GenerateRequest,
+    session_id: str,
+    session_final: bool,
+) -> GenerateRequest:
+    """Tag the request with its continuity session (the engine reads
+    ``metadata['tts_session']``). Internal — not a public request field."""
+    metadata = dict(gen_req.metadata)
+    metadata["tts_session"] = {"id": session_id, "final": session_final}
+    return replace(gen_req, metadata=metadata)
+
+
 async def _streaming_speech_pcm_chunks(
     *,
     client: Client,
     gen_req: GenerateRequest,
     request_id: str,
 ):
+    """Yield PCM byte deltas from a streaming TTS request."""
     emitted_samples = 0
     async for chunk in client.generate(gen_req, request_id=request_id):
         if chunk.audio_data is None:

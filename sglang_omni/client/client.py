@@ -39,10 +39,21 @@ class Client:
         coordinator: Coordinator,
         result_builder: Callable[[str, Any], GenerateChunk] | None = None,
         stream_builder: Callable[[str, StreamMessage], GenerateChunk] | None = None,
+        *,
+        generate_middleware: (
+            Callable[
+                ["Client", GenerateRequest, str], AsyncIterator[GenerateChunk]
+            ]
+            | None
+        ) = None,
     ) -> None:
         self._coordinator = coordinator
         self._result_builder = result_builder or self._default_result_builder
         self._stream_builder = stream_builder or self._default_stream_builder
+        # Optional ``(client, request, request_id)`` async-generator delegate
+        # wrapping generate() (e.g. the Higgs chunking orchestrator); it drives
+        # submissions via _generate_single. ``None`` → plain single-shot.
+        self.generate_middleware = generate_middleware
 
     # ------------------------------------------------------------------
     # Low-level generate (backward compatible)
@@ -54,17 +65,32 @@ class Client:
         request_id: str | None = None,
     ) -> AsyncIterator[GenerateChunk]:
         req_id = request_id or str(uuid.uuid4())
+        if self.generate_middleware is not None:
+            async for chunk in self.generate_middleware(self, request, req_id):
+                yield chunk
+            return
+        async for chunk in self._generate_single(request, req_id):
+            yield chunk
+
+    async def _generate_single(
+        self,
+        request: GenerateRequest,
+        request_id: str,
+    ) -> AsyncIterator[GenerateChunk]:
+        """One coordinator submission → chunks. The single-shot primitive a
+        ``generate_middleware`` drives per sub-request (no middleware
+        re-entry)."""
         omni_request = self._build_omni_request(request)
         if request.stream:
-            async for msg in self._coordinator.stream(req_id, omni_request):
+            async for msg in self._coordinator.stream(request_id, omni_request):
                 if isinstance(msg, StreamMessage):
-                    yield self._stream_builder(req_id, msg)
+                    yield self._stream_builder(request_id, msg)
                 else:
-                    yield self._result_builder(req_id, msg.result)
+                    yield self._result_builder(request_id, msg.result)
             return
 
-        result = await self._coordinator.submit(req_id, omni_request)
-        yield self._result_builder(req_id, result)
+        result = await self._coordinator.submit(request_id, omni_request)
+        yield self._result_builder(request_id, result)
 
     # ------------------------------------------------------------------
     # High-level: non-streaming completion
