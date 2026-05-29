@@ -30,7 +30,6 @@ class HiggsTtsPipelineConfig(PipelineConfig):
 
     model_path: str
     chunker_max_seconds: float = Field(default=8.0, gt=0)
-    # ~10 chars/s sits between Latin (~15-20) and CJK (~3-5)
     chunker_cps: float = Field(default=10.0, gt=0)
     max_history_chunks: int = Field(default=4, ge=0)
     stages: list[StageConfig] = [

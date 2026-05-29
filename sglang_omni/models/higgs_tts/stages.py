@@ -61,10 +61,7 @@ from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleSched
 logger = logging.getLogger(__name__)
 
 
-# Reject ref audio past this many seconds; chunked prefill of the
-# multi-codebook prompt is unsafe (sampler state machine has no rollback)
-# so we cap before sglang gets the prompt. Multiplier is the codec's frame
-# rate — single source of truth in :data:`HiggsAudioCodec.FRAME_RATE`.
+# Reject ref audio past this many seconds
 _MAX_REF_AUDIO_SEC = 30
 
 
