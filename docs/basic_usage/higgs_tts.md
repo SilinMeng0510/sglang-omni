@@ -30,16 +30,11 @@ sgl-omni serve \
   --port 8000
 ```
 
-The audio codec defaults to the public [`bosonai/higgs-audio-v2-tokenizer`](https://huggingface.co/bosonai/higgs-audio-v2-tokenizer) repo. Override per-stage if you need a different codec checkpoint:
-
-```bash
-sgl-omni serve \
-  --model-path boson-sglang/higgs-audio-v3-tts-4b-base \
-  --config examples/configs/higgs_tts.yaml \
-  --stage-arg preprocessing.audio_codec_path=<path-or-repo-id> \
-  --stage-arg vocoder.audio_codec_path=<path-or-repo-id> \
-  --port 8000
-```
+The audio codec ships inside the Higgs TTS checkpoint — its weights live under
+the `tied.embedding.modality_embeddings.0.model.*` prefix and are decoded with
+the bundled [`bosonai/higgs-audio-v2-tokenizer`](https://huggingface.co/bosonai/higgs-audio-v2-tokenizer)
+architecture config. It loads automatically from `--model-path`; there is no
+separate codec download and no per-stage option to point at a different codec.
 
 ## Use Curl
 
