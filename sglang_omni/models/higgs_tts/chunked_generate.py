@@ -72,15 +72,15 @@ class HiggsChunkedGenerate:
     def new_streaming_chunker(
         self,
         *,
-        split_granularity: str | None = None,
+        fastout: bool = False,
     ) -> "TextChunker | None":
         """Fresh per-WS-connection streaming chunker (each needs its own
         ``add_text`` buffer); ``None`` if no factory was supplied."""
         if self._chunker_factory is None or self._chunker_options is None:
             return None
         opts = self._chunker_options
-        if split_granularity is not None and split_granularity != opts.split_granularity:
-            opts = replace(opts, split_granularity=split_granularity)
+        if fastout != opts.fastout:
+            opts = replace(opts, fastout=fastout)
         return self._chunker_factory(opts)
 
     def _chunk_text(self, request: GenerateRequest) -> list[str] | None:

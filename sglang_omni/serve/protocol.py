@@ -235,7 +235,7 @@ class StreamingSpeechSessionConfig(BaseModel):
     x_vector_only_mode: bool | None = None
     speaker_embedding: list[float] | None = Field(default=None, max_length=8192)
     stream_audio: bool = False
-    split_granularity: Literal["sentence", "clause"] = "sentence"
+    fastout: bool = False
     stage_params: dict[str, dict[str, Any]] | None = None
 
     @model_validator(mode="after")

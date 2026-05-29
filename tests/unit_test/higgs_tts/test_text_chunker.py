@@ -157,6 +157,35 @@ def test_streaming_flush_drains_remaining_buffer() -> None:
     assert c.flush() == []
 
 
+def test_fastout_releases_first_clause_then_sentences() -> None:
+    # First chunk cuts at the earliest clause boundary (CJK comma); every later
+    # chunk uses sentence boundaries, so the comma in "三，四。" does NOT split.
+    c = HiggsTextChunker(
+        ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True)
+    )
+    assert c.add_text("一，二。三，四。") == ["一，", "二。", "三，四。"]
+    assert c.flush() == []
+
+
+def test_fastout_only_affects_the_first_chunk() -> None:
+    c = HiggsTextChunker(
+        ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True)
+    )
+    # Earliest clause boundary releases chunk 1 right away.
+    assert c.add_text("第一句，") == ["第一句，"]
+    # Now in sentence mode: a clause comma alone is NOT a cut point.
+    assert c.add_text("还有逗号，继续") == []
+    # A sentence terminator releases the buffered remainder as one chunk.
+    assert c.add_text("结束。") == ["还有逗号，继续结束。"]
+
+
+def test_default_no_fastout_is_sentence_only() -> None:
+    # Without the flag, a leading clause comma must NOT release early.
+    c = HiggsTextChunker(ChunkerOptions(max_seconds=8.0, cps=10.0))
+    assert c.add_text("一，二") == []
+    assert c.add_text("。") == ["一，二。"]
+
+
 def test_streaming_options_max_seconds_respected() -> None:
     # Custom small budget should force tier-refine on oversized sentences.
     c = HiggsTextChunker(ChunkerOptions(max_seconds=2.0, cps=10.0))

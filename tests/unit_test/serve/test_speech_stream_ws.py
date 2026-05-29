@@ -20,7 +20,7 @@ class _FakeMiddleware:
     """Stand-in for the generate-middleware: the WS handler only needs its
     ``new_streaming_chunker`` to obtain a per-connection sentence splitter."""
 
-    def new_streaming_chunker(self, *, split_granularity: str | None = None):
+    def new_streaming_chunker(self, *, fastout: bool = False):
         from sglang_omni.models.higgs_tts.text_chunker import (
             ChunkerOptions,
             HiggsTextChunker,
@@ -30,7 +30,7 @@ class _FakeMiddleware:
             ChunkerOptions(
                 max_seconds=8.0,
                 cps=10.0,
-                split_granularity=split_granularity or "sentence",
+                fastout=fastout,
             )
         )
 
@@ -155,27 +155,36 @@ def test_streaming_speech_ws_matches_vllm_english_sentence_boundary() -> None:
     assert speech_client.prompts == ["Hello.World"]
 
 
-def test_streaming_speech_ws_clause_mode_matches_vllm_boundaries() -> None:
+def test_streaming_speech_ws_fastout_clause_then_sentence() -> None:
+    # fastout: the FIRST chunk is released at the earliest clause
+    # boundary (CJK comma) for low first-audio latency; every later chunk uses
+    # sentence boundaries — so the comma inside the final piece does NOT split.
     speech_client = StreamingSpeechWsClient()
     client = TestClient(create_app(speech_client, model_name="higgs"))
 
     with client.websocket_connect("/v1/audio/speech/stream") as ws:
-        ws.send_json({"type": "session.config", "split_granularity": "clause"})
-        ws.send_json({"type": "input.text", "text": "alpha, beta；gamma"})
+        ws.send_json({"type": "session.config", "fastout": True})
+        ws.send_json({"type": "input.text", "text": "一，二。三，四"})
         ws.send_json({"type": "input.done"})
 
-        assert ws.receive_json()["sentence_text"] == "alpha, beta；"
-        assert ws.receive_bytes() == "audio:alpha, beta；".encode()
+        # chunk 0 — earliest clause boundary (fast first audio)
+        assert ws.receive_json()["sentence_text"] == "一，"
+        assert ws.receive_bytes() == "audio:一，".encode()
         assert ws.receive_json()["type"] == "audio.done"
-        assert ws.receive_json()["sentence_text"] == "gamma"
-        assert ws.receive_bytes() == b"audio:gamma"
+        # chunk 1 — sentence boundary
+        assert ws.receive_json()["sentence_text"] == "二。"
+        assert ws.receive_bytes() == "audio:二。".encode()
+        assert ws.receive_json()["type"] == "audio.done"
+        # chunk 2 (flush) — the comma did NOT split: sentence mode after first
+        assert ws.receive_json()["sentence_text"] == "三，四"
+        assert ws.receive_bytes() == "audio:三，四".encode()
         assert ws.receive_json()["type"] == "audio.done"
         assert ws.receive_json() == {
             "type": "session.done",
-            "total_sentences": 2,
+            "total_sentences": 3,
         }
 
-    assert speech_client.prompts == ["alpha, beta；", "gamma"]
+    assert speech_client.prompts == ["一，", "二。", "三，四"]
 
 
 def test_streaming_speech_ws_requires_config_first() -> None:

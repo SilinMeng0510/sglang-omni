@@ -593,7 +593,7 @@ async def _handle_streaming_speech_ws(
         _middleware = getattr(client, "generate_middleware", None)
         _new_chunker = getattr(_middleware, "new_streaming_chunker", None)
         splitter = (
-            _new_chunker(split_granularity=config.split_granularity)
+            _new_chunker(fastout=config.fastout)
             if _new_chunker is not None
             else None
         )

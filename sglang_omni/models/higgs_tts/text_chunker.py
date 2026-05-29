@@ -41,7 +41,10 @@ class ChunkerOptions:
 
     max_seconds: float  # per-chunk synthesis-time budget
     cps: float  # default chars/sec when there's no per-request ref calibration
-    split_granularity: str = "sentence"
+    # Low first-audio latency: release the FIRST streamed chunk at the earliest
+    # clause boundary so audio starts ASAP; every later chunk uses sentence
+    # boundaries (their latency hides behind playback). Off → sentences only.
+    fastout: bool = False
     # Codec Hz — lets the orchestrator get ref duration from ``vq_codes`` rows
     # for a per-request CPS. ``None`` → skip that (no audio I/O), use ``cps``.
     codec_frame_rate: float | None = None
@@ -209,18 +212,28 @@ def _chunk(text: str, max_seconds: float, cps: float) -> list[str]:
     return out
 
 
-def _last_confirmed_cut(buffer: str, granularity: str) -> int:
-    """Offset after the last confirmed sentence/clause boundary (trailing
-    whitespace consumed); 0 if none yet confirmed."""
-    pattern = (
-        _CONFIRMED_SENT_RE if granularity == "sentence" else _CONFIRMED_CLAUSE_RE
-    )
+def _last_confirmed_cut(buffer: str) -> int:
+    """Offset after the last confirmed *sentence* boundary (trailing whitespace
+    consumed); 0 if none yet confirmed."""
     last = None
-    for m in pattern.finditer(buffer):
+    for m in _CONFIRMED_SENT_RE.finditer(buffer):
         last = m
     if last is None:
         return 0
     end = last.end()
+    while end < len(buffer) and buffer[end].isspace():
+        end += 1
+    return end
+
+
+def _first_clause_cut(buffer: str) -> int:
+    """Offset after the *first* clause-or-sentence boundary (trailing whitespace
+    consumed); 0 if none yet. Releases the opening chunk as early as possible
+    for low first-audio latency."""
+    m = _CONFIRMED_CLAUSE_RE.search(buffer)
+    if m is None:
+        return 0
+    end = m.end()
     while end < len(buffer) and buffer[end].isspace():
         end += 1
     return end
@@ -234,7 +247,8 @@ class HiggsTextChunker:
     def __init__(self, options: ChunkerOptions) -> None:
         self._max_seconds = options.max_seconds
         self._cps = options.cps
-        self._granularity = options.split_granularity
+        self._fastout = options.fastout
+        self._emitted_first = False
         # Read by the orchestrator for CPS (see ChunkerOptions.codec_frame_rate).
         self.codec_frame_rate: float | None = options.codec_frame_rate
         self._buffer: str = ""
@@ -247,17 +261,30 @@ class HiggsTextChunker:
         )
 
     def add_text(self, text: str) -> list[str]:
-        """Buffer a fragment; emit confirmed-complete sentences (the unconfirmed
-        tail is held for the next ``add_text``/``flush``)."""
+        """Buffer a fragment; emit confirmed-complete chunks (the unconfirmed
+        tail is held for the next ``add_text``/``flush``).
+
+        With ``fastout`` the very first chunk is released at the
+        earliest clause boundary so audio starts ASAP; every later chunk cuts at
+        sentence boundaries (by then audio is playing, so their latency hides).
+        Otherwise every chunk uses sentence boundaries."""
         if not text:
             return []
         self._buffer += text
-        cut = _last_confirmed_cut(self._buffer, self._granularity)
-        if cut == 0:
-            return []
-        confirmed = self._buffer[:cut]
-        self._buffer = self._buffer[cut:]
-        return _chunk(confirmed, max_seconds=self._max_seconds, cps=self._cps)
+        out: list[str] = []
+        if self._fastout and not self._emitted_first:
+            cut = _first_clause_cut(self._buffer)
+            if cut == 0:
+                return []
+            confirmed, self._buffer = self._buffer[:cut], self._buffer[cut:]
+            out.extend(_chunk(confirmed, max_seconds=self._max_seconds, cps=self._cps))
+            self._emitted_first = True
+        cut = _last_confirmed_cut(self._buffer)
+        if cut > 0:
+            confirmed, self._buffer = self._buffer[:cut], self._buffer[cut:]
+            out.extend(_chunk(confirmed, max_seconds=self._max_seconds, cps=self._cps))
+            self._emitted_first = True
+        return out
 
     def flush(self) -> list[str]:
         """Drain whatever remains at end-of-input."""
