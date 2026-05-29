@@ -768,6 +768,7 @@ def _build_streaming_speech_request(
         "initial_codec_chunk_frames",
         "ref_audio",
         "ref_text",
+        "references",
         "x_vector_only_mode",
         "speaker_embedding",
         "stage_params",

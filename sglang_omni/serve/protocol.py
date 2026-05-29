@@ -166,6 +166,8 @@ class SpeechReference(BaseModel):
     audio_path: str | None = None
     text: str | None = None
     vq_codes: list[list[int]] | list[int] | None = None
+    base64: str | None = None
+    media_type: str | None = None
 
 
 class CreateSpeechRequest(BaseModel):
@@ -229,6 +231,7 @@ class StreamingSpeechSessionConfig(BaseModel):
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
     ref_audio: str | None = None
     ref_text: str | None = None
+    references: list[SpeechReference] | None = None
     x_vector_only_mode: bool | None = None
     speaker_embedding: list[float] | None = Field(default=None, max_length=8192)
     stream_audio: bool = False
