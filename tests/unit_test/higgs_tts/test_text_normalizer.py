@@ -3,8 +3,18 @@ from sglang_omni.models.higgs_tts.text_normalizer import normalize_punctuation
 
 
 def test_cjk_sentence_punctuation_to_ascii():
-    assert normalize_punctuation("你好，世界。") == "你好,世界."
+    # Comma gets a trailing space (English mid-sentence style); sentence
+    # terminators do not.
+    assert normalize_punctuation("你好，世界。") == "你好, 世界."
     assert normalize_punctuation("真的吗？太好了！") == "真的吗?太好了!"
+
+
+def test_comma_and_colon_get_trailing_space():
+    # Only the mid-sentence separators ，/： gain a trailing space; ；and the
+    # terminators stay tight.
+    assert normalize_punctuation("一，二，三") == "一, 二, 三"
+    assert normalize_punctuation("项目：内容") == "项目: 内容"
+    assert normalize_punctuation("分号；连接") == "分号;连接"
 
 
 def test_quotes_and_brackets():

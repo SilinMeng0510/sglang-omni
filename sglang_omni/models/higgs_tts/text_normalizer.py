@@ -11,12 +11,12 @@ from __future__ import annotations
 # Single char → ASCII.
 _PUNCT_MAP = {
     "。": ".",
-    "，": ",",
-    "、": ",",
+    "，": ", ",
     "！": "!",
     "？": "?",
     "；": ";",
-    "：": ":",
+    "：": ": ",
+    "～": "~",
     "（": "(",
     "）": ")",
     "【": "[",
@@ -25,7 +25,6 @@ _PUNCT_MAP = {
     "”": '"',
     "‘": "'",
     "’": "'",
-    "～": "~",
 }
 
 _TRANSLATION = {ord(k): v for k, v in _PUNCT_MAP.items()}
