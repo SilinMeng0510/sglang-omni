@@ -156,6 +156,15 @@ Sentence splitting follows vLLM-Omni's streaming TTS rule: English `.`, `?`,
 and `!` split only when followed by whitespace; CJK `。！？` split immediately.
 With `split_granularity="clause"`, CJK `，；` are also split points.
 
+### Text Normalization
+
+On every path (curl, Python, WebSocket), CJK / full-width punctuation in the
+`input` text is normalized to its ASCII form just before synthesis — e.g.
+`。→ .`, `，→ ,`, `！→ !`, `？→ ?`, `（）→ ()`, `“”→ "` — so the model sees one
+consistent punctuation style. Spoken content is unchanged. Normalization runs
+*after* sentence/chunk splitting, so it does not affect where the text is split
+(boundaries are computed on the original punctuation).
+
 ## Use Python
 
 ### Voice Cloning

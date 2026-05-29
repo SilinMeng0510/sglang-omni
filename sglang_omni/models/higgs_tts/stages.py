@@ -36,6 +36,7 @@ from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.request_builders import make_higgs_scheduler_adapters
 from sglang_omni.models.higgs_tts.session import SessionStore
+from sglang_omni.models.higgs_tts.text_normalizer import normalize_punctuation
 from sglang_omni.models.higgs_tts.text_tokenizer import HiggsTokenizerAdapter
 from sglang_omni.models.higgs_tts.utils import (
     apply_delay_pattern,
@@ -64,7 +65,7 @@ logger = logging.getLogger(__name__)
 # multi-codebook prompt is unsafe (sampler state machine has no rollback)
 # so we cap before sglang gets the prompt. Multiplier is the codec's frame
 # rate — single source of truth in :data:`HiggsAudioCodec.FRAME_RATE`.
-_MAX_REF_AUDIO_SEC = 100
+_MAX_REF_AUDIO_SEC = 30
 
 
 def _build_higgs_audio_code_stream_outputs(
@@ -144,7 +145,8 @@ def create_preprocessing_executor(
         session_id = session.get("id")
         session_final = bool(session.get("final", False))
 
-        text = inputs.get("input") or inputs.get("text") or ""
+        # Normalize CJK/full-width punctuation to ASCII just before tokenizing.
+        text = normalize_punctuation(inputs.get("input") or inputs.get("text") or "")
         reference_text = inputs.get("reference_text") or None
         target_text_token_ids = list(tokenizer.encode(text, add_special_tokens=False))
         reference_text_token_ids = (
