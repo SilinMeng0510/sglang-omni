@@ -10,7 +10,7 @@ from pydantic import Field
 from sglang_omni.config import PipelineConfig, StageConfig
 
 if TYPE_CHECKING:
-    from sglang_omni.models.higgs_tts.text_chunker import ChunkerOptions, TextChunker
+    from sglang_omni.models.higgs_tts.text_chunker import ChunkerOptions
 
 _PKG = "sglang_omni.models.higgs_tts"
 
@@ -81,46 +81,27 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                 }
                 break
 
-    @classmethod
-    def class_default_chunker_options(cls) -> "ChunkerOptions":
-        """Class-level chunker defaults — codec frame rate from the codec."""
-        from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
-        from sglang_omni.models.higgs_tts.text_chunker import ChunkerOptions
-
-        return ChunkerOptions(codec_frame_rate=float(HiggsAudioCodec.FRAME_RATE))
-
-    def default_chunker_options(self) -> "ChunkerOptions":
-        """Class defaults with the yaml ``chunker_max_seconds`` override applied."""
-        from dataclasses import replace
-
-        opts = type(self).class_default_chunker_options()
-        if self.chunker_max_seconds is not None:
-            opts = replace(opts, max_seconds=self.chunker_max_seconds)
-        return opts
-
-    @classmethod
-    def create_text_chunker(
-        cls,
-        options: "ChunkerOptions",
-    ) -> "TextChunker | None":
-        """Declare Higgs's sentence chunker (text-splitting only)."""
-        from sglang_omni.models.higgs_tts.text_chunker import HiggsTextChunker
-
-        return HiggsTextChunker(options)
-
     def create_generate_orchestrator(self):
         """The chunking middleware the launcher plugs into the shared Client."""
         from sglang_omni.models.higgs_tts.chunked_generate import HiggsChunkedGenerate
+        from sglang_omni.models.higgs_tts.text_chunker import HiggsTextChunker
 
-        options = self.default_chunker_options()
-        chunker = self.create_text_chunker(options)
-        if chunker is None:
-            return None
+        options = self._chunker_options()
         return HiggsChunkedGenerate(
-            text_chunker=chunker,
-            chunker_factory=self.create_text_chunker,
+            text_chunker=HiggsTextChunker(options),
+            chunker_factory=HiggsTextChunker,
             chunker_options=options,
         )
+
+    def _chunker_options(self) -> "ChunkerOptions":
+        """Codec frame rate + the optional ``chunker_max_seconds`` override."""
+        from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
+        from sglang_omni.models.higgs_tts.text_chunker import ChunkerOptions
+
+        kwargs: dict = {"codec_frame_rate": float(HiggsAudioCodec.FRAME_RATE)}
+        if self.chunker_max_seconds is not None:
+            kwargs["max_seconds"] = self.chunker_max_seconds
+        return ChunkerOptions(**kwargs)
 
 
 EntryClass = HiggsTtsPipelineConfig

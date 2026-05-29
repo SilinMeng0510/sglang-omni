@@ -169,8 +169,13 @@ def test_streaming_options_max_seconds_respected() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_higgs_config_returns_chunker_via_hook() -> None:
+def test_higgs_config_chunker_options() -> None:
     from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
 
-    chunker = HiggsTtsPipelineConfig.create_text_chunker(ChunkerOptions())
-    assert isinstance(chunker, HiggsTextChunker)
+    opts = HiggsTtsPipelineConfig(model_path="m")._chunker_options()
+    assert opts.codec_frame_rate == 25.0
+    assert opts.max_seconds == 8.0  # chunker default when chunker_max_seconds unset
+    assert isinstance(HiggsTextChunker(opts), HiggsTextChunker)
+    # chunker_max_seconds override flows through
+    overridden = HiggsTtsPipelineConfig(model_path="m", chunker_max_seconds=15)
+    assert overridden._chunker_options().max_seconds == 15.0
