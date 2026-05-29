@@ -1,11 +1,8 @@
 """Thin facade over the vendored Higgs Audio V2 tokenizer.
 
 The codec weights are bundled inside the Higgs TTS checkpoint under the
-prefix ``tied.embedding.modality_embeddings.0.model.*`` (1584 tensors;
-acoustic_encoder, acoustic_decoder, quantizer, semantic_model, etc.).
-:meth:`HiggsAudioCodec.from_pretrained` extracts those keys directly from
-the TTS ``model.safetensors`` so a single checkpoint serves both the AR
-engine and the codec.
+``tied.embedding.modality_embeddings.0.model.*`` prefix, so one checkpoint
+serves both the AR engine and the codec.
 """
 
 from __future__ import annotations
@@ -31,46 +28,23 @@ WaveformInput = torch.Tensor | np.ndarray
 # Codec weights live under this prefix inside the TTS checkpoint.
 _CODEC_IN_TTS_CKPT_PREFIX = "tied.embedding.modality_embeddings.0.model."
 
-# Bundled codec config (taken byte-for-byte from
-# https://huggingface.co/bosonai/higgs-audio-v2-tokenizer/blob/main/config.json).
-_BUNDLED_CODEC_CONFIG_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "_vendored",
-    "higgs_audio_v2_tokenizer_config.json",
+# Codec architecture config, vendored byte-for-byte from
+# https://huggingface.co/bosonai/higgs-audio-v2-tokenizer/blob/main/config.json.
+# Read once here; reused for the class constants below and in from_pretrained.
+_BUNDLED_CODEC_CONFIG = json.loads(
+    (Path(__file__).parent / "_vendored" / "higgs_audio_v2_tokenizer_config.json")
+    .read_text()
 )
 
 
-def _load_codec_meta() -> dict:
-    """Read codec sample_rate + hop_length from the bundled config JSON.
-
-    Called **once** at module import; the return drives the
-    :class:`HiggsAudioCodec` class constants below. Single source of truth
-    for codec audio-rate / frame-rate — updating the bundled config (e.g.
-    changing acoustic downsampling ratios) auto-propagates everywhere
-    that reads ``HiggsAudioCodec.SAMPLE_RATE`` / ``FRAME_RATE``, so no
-    Python source change is needed when the codec architecture moves.
-
-    Recomputes ``hop_length`` from ``acoustic_model_config.downsampling_ratios``
-    (matching the vendored ``HiggsAudioV2TokenizerConfig.hop_length`` property)
-    rather than trusting the redundant explicit ``hop_length`` field, so a
-    mismatch in the JSON can't cause a silent disagreement with the codec.
-    """
-    import json as _json
-
-    with open(_BUNDLED_CODEC_CONFIG_PATH) as f:
-        cfg = _json.load(f)
-    sample_rate = int(cfg["sample_rate"])
-    hop_length = 1
+def _codec_hop_length(cfg: dict) -> int:
+    """Sample stride = product of the acoustic downsampling ratios (matches the
+    vendored ``hop_length`` property; recomputed rather than trusting the
+    redundant explicit field so the two can't silently disagree)."""
+    hop = 1
     for r in cfg["acoustic_model_config"]["downsampling_ratios"]:
-        hop_length *= int(r)
-    return {
-        "sample_rate": sample_rate,
-        "hop_length": hop_length,
-        "frame_rate": sample_rate / hop_length,
-    }
-
-
-_CODEC_META = _load_codec_meta()
+        hop *= int(r)
+    return hop
 
 
 def _to_mono_3d(waveform: WaveformInput) -> torch.Tensor:
@@ -135,16 +109,14 @@ def _load_codec_state_dict(tts_ckpt_dir: str) -> dict[str, torch.Tensor]:
 
 
 class HiggsAudioCodec:
-    """Frozen encode/decode wrapper around :class:`HiggsAudioV2TokenizerModel`."""
+    """Frozen encode/decode wrapper around :class:`HiggsAudioV2TokenizerModel`.
 
-    # Both constants are derived at module import from the bundled codec
-    # config JSON (see ``_load_codec_meta``), NOT hard-coded — updating the
-    # bundled config (e.g. swapping ``acoustic_model_config.downsampling_ratios``)
-    # propagates automatically to every reader. SAMPLE_RATE = the codec's
-    # audio sample rate (Hz). FRAME_RATE = code TPS = SAMPLE_RATE divided
-    # by hop_length (= product of downsampling ratios).
-    SAMPLE_RATE: int = _CODEC_META["sample_rate"]
-    FRAME_RATE: float = _CODEC_META["frame_rate"]
+    ``SAMPLE_RATE`` (codec audio Hz) and ``FRAME_RATE`` (code TPS =
+    SAMPLE_RATE / hop_length) derive from the bundled config, so they track the
+    vendored codec without a source edit."""
+
+    SAMPLE_RATE: int = int(_BUNDLED_CODEC_CONFIG["sample_rate"])
+    FRAME_RATE: float = SAMPLE_RATE / _codec_hop_length(_BUNDLED_CODEC_CONFIG)
 
     def __init__(
         self, model: HiggsAudioV2TokenizerModel, *, device: torch.device
@@ -163,19 +135,15 @@ class HiggsAudioCodec:
     ) -> "HiggsAudioCodec":
         """Load codec from a Higgs TTS checkpoint (local dir or HF repo id).
 
-        Codec weights are bundled inside the TTS ``model.safetensors`` under
-        the ``tied.embedding.modality_embeddings.0.model.*`` prefix; we use
-        the bundled vendored config for the codec architecture and load the
-        585 codec tensors out of the TTS shards directly.
-
-        ``dtype`` defaults to fp32; decode ConvTranspose is unstable in bf16
-        — opt in only if you've validated quality at your sample rate.
+        Uses the vendored config for the codec architecture and pulls the codec
+        tensors out of the TTS ``model.safetensors`` shards. ``dtype`` defaults
+        to fp32; decode ConvTranspose is unstable in bf16 — opt in only after
+        validating quality at your sample rate.
         """
         device = torch.device(device)
         ckpt_dir = _resolve_ckpt_dir(model_path)
 
-        with open(_BUNDLED_CODEC_CONFIG_PATH) as f:
-            cfg_dict = json.load(f)
+        cfg_dict = dict(_BUNDLED_CODEC_CONFIG)
         for k in ("architectures", "torch_dtype", "transformers_version"):
             cfg_dict.pop(k, None)
         config = HiggsAudioV2TokenizerConfig(**cfg_dict)
