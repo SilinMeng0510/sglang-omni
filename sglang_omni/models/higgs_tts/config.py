@@ -29,7 +29,9 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     architecture: ClassVar[str] = "HiggsMultimodalQwen3ForConditionalGeneration"
 
     model_path: str
-    chunker_max_seconds: float | None = Field(default=None, gt=0)
+    chunker_max_seconds: float = Field(default=8.0, gt=0)
+    # ~10 chars/s sits between Latin (~15-20) and CJK (~3-5)
+    chunker_cps: float = Field(default=10.0, gt=0)
     max_history_chunks: int = Field(default=4, ge=0)
     stages: list[StageConfig] = [
         StageConfig(
@@ -94,14 +96,15 @@ class HiggsTtsPipelineConfig(PipelineConfig):
         )
 
     def _chunker_options(self) -> "ChunkerOptions":
-        """Codec frame rate + the optional ``chunker_max_seconds`` override."""
+        """Chunker knobs from the top-level config fields."""
         from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
         from sglang_omni.models.higgs_tts.text_chunker import ChunkerOptions
 
-        kwargs: dict = {"codec_frame_rate": float(HiggsAudioCodec.FRAME_RATE)}
-        if self.chunker_max_seconds is not None:
-            kwargs["max_seconds"] = self.chunker_max_seconds
-        return ChunkerOptions(**kwargs)
+        return ChunkerOptions(
+            max_seconds=self.chunker_max_seconds,
+            cps=self.chunker_cps,
+            codec_frame_rate=float(HiggsAudioCodec.FRAME_RATE),
+        )
 
 
 EntryClass = HiggsTtsPipelineConfig

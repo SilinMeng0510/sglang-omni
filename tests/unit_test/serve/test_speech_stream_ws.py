@@ -27,7 +27,11 @@ class _FakeMiddleware:
         )
 
         return HiggsTextChunker(
-            ChunkerOptions(split_granularity=split_granularity or "sentence")
+            ChunkerOptions(
+                max_seconds=8.0,
+                cps=10.0,
+                split_granularity=split_granularity or "sentence",
+            )
         )
 
 

@@ -13,7 +13,8 @@ from sglang_omni.models.higgs_tts.text_chunker import (
 
 # Public batch entry point. ``chunk`` is stateless for batch input, so one
 # shared instance backs all the module-level batch tests.
-chunk = HiggsTextChunker().chunk
+_OPTS = ChunkerOptions(max_seconds=8.0, cps=10.0)
+chunk = HiggsTextChunker(_OPTS).chunk
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +109,7 @@ def test_estimate_seconds_excludes_whitespace() -> None:
 
 
 def test_streaming_buffers_until_confirmed() -> None:
-    c = HiggsTextChunker()
+    c = HiggsTextChunker(_OPTS)
     # No terminator yet → buffered.
     assert c.add_text("Hello world.") == []
     # Trailing whitespace confirms the ASCII boundary.
@@ -118,7 +119,7 @@ def test_streaming_buffers_until_confirmed() -> None:
 
 
 def test_streaming_cjk_cuts_immediately() -> None:
-    c = HiggsTextChunker()
+    c = HiggsTextChunker(_OPTS)
     assert c.add_text("你好世界") == []  # no terminator yet
     assert c.add_text("。再见") == ["你好世界。"]
     # "再见" has no terminator — flush drains it.
@@ -126,7 +127,7 @@ def test_streaming_cjk_cuts_immediately() -> None:
 
 
 def test_streaming_holds_ascii_period_until_whitespace() -> None:
-    c = HiggsTextChunker()
+    c = HiggsTextChunker(_OPTS)
     got: list[str] = []
     # "3.14" arrives — must NOT cut at the embedded period.
     got += c.add_text("Pi is 3.14")
@@ -135,20 +136,20 @@ def test_streaming_holds_ascii_period_until_whitespace() -> None:
 
 
 def test_streaming_two_in_one_add() -> None:
-    c = HiggsTextChunker()
+    c = HiggsTextChunker(_OPTS)
     out = c.add_text("First sentence. Second sentence. ")
     # Leading whitespace on second chunk is preserved (matches batch chunker).
     assert out == ["First sentence.", " Second sentence."]
 
 
 def test_streaming_empty_add_is_noop() -> None:
-    c = HiggsTextChunker()
+    c = HiggsTextChunker(_OPTS)
     assert c.add_text("") == []
     assert c.flush() == []
 
 
 def test_streaming_flush_drains_remaining_buffer() -> None:
-    c = HiggsTextChunker()
+    c = HiggsTextChunker(_OPTS)
     c.add_text("Incomplete sentence with no terminator")
     out = c.flush()
     assert out == ["Incomplete sentence with no terminator"]
@@ -158,7 +159,7 @@ def test_streaming_flush_drains_remaining_buffer() -> None:
 
 def test_streaming_options_max_seconds_respected() -> None:
     # Custom small budget should force tier-refine on oversized sentences.
-    c = HiggsTextChunker(ChunkerOptions(max_seconds=2.0))
+    c = HiggsTextChunker(ChunkerOptions(max_seconds=2.0, cps=10.0))
     out = c.chunk("a" * 100)
     # 100 chars / 10 cps = 10s, budget 2s → at least 5 chunks.
     assert len(out) >= 5
@@ -174,8 +175,11 @@ def test_higgs_config_chunker_options() -> None:
 
     opts = HiggsTtsPipelineConfig(model_path="m")._chunker_options()
     assert opts.codec_frame_rate == 25.0
-    assert opts.max_seconds == 8.0  # chunker default when chunker_max_seconds unset
+    assert opts.max_seconds == 8.0  # config-default budget
+    assert opts.cps == 10.0  # config-default fallback CPS
     assert isinstance(HiggsTextChunker(opts), HiggsTextChunker)
-    # chunker_max_seconds override flows through
-    overridden = HiggsTtsPipelineConfig(model_path="m", chunker_max_seconds=15)
-    assert overridden._chunker_options().max_seconds == 15.0
+    # overrides flow through
+    overridden = HiggsTtsPipelineConfig(
+        model_path="m", chunker_max_seconds=15, chunker_cps=6
+    )._chunker_options()
+    assert (overridden.max_seconds, overridden.cps) == (15.0, 6.0)

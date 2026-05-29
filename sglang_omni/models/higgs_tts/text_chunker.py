@@ -10,7 +10,8 @@ quotes → whitespace → per-char — re-packed within the sentence only.
 :meth:`add_text`/:meth:`flush` (WS stream-in). Boundary rule (vLLM-Omni): ASCII
 ``.!?`` only split when followed by whitespace (so ``3.14``/``U.S.A`` survive);
 non-ASCII terminators (``。！？``…) split immediately. Sizing uses a CPS budget
-(default 10); callers may pass a per-request ``cps`` from the reference.
+from :class:`ChunkerOptions`; callers may pass a per-request ``cps`` from the
+reference instead.
 """
 
 from __future__ import annotations
@@ -20,9 +21,6 @@ from functools import lru_cache
 from typing import Protocol
 
 import regex  # PCRE-style Unicode \p{...} property classes
-
-DEFAULT_MAX_SECONDS = 8.0
-DEFAULT_CPS = 10.0  # ~10 chars/s sits between Latin (~15-20) and CJK (~3-5)
 
 
 class TextChunker(Protocol):
@@ -41,10 +39,11 @@ class TextChunker(Protocol):
 class ChunkerOptions:
     """Launch-time chunker knobs (from the model's :class:`PipelineConfig`)."""
 
+    max_seconds: float  # per-chunk synthesis-time budget
+    cps: float  # default chars/sec when there's no per-request ref calibration
     split_granularity: str = "sentence"
-    max_seconds: float = DEFAULT_MAX_SECONDS  # per-chunk synthesis-time budget
     # Codec Hz — lets the orchestrator get ref duration from ``vq_codes`` rows
-    # for CPS. ``None`` → skip that source (no audio I/O), use the default CPS.
+    # for a per-request CPS. ``None`` → skip that (no audio I/O), use ``cps``.
     codec_frame_rate: float | None = None
 
 
@@ -82,7 +81,7 @@ def _spoken_len(text: str) -> int:
     return sum(1 for c in text if not c.isspace())
 
 
-def estimate_seconds(text: str, cps: float = DEFAULT_CPS) -> float:
+def estimate_seconds(text: str, cps: float) -> float:
     """Estimated synthesis time (s) at ``cps`` chars/sec."""
     return _spoken_len(text) / cps if cps > 0 else 0.0
 
@@ -181,11 +180,7 @@ def _pack(parts: list[str], max_seconds: float, cps: float) -> list[str]:
     return out
 
 
-def _chunk(
-    text: str,
-    max_seconds: float = DEFAULT_MAX_SECONDS,
-    cps: float = DEFAULT_CPS,
-) -> list[str]:
+def _chunk(text: str, max_seconds: float, cps: float) -> list[str]:
     """Batch algorithm (public entry point is :meth:`HiggsTextChunker.chunk`).
     ``[]`` for empty input; ``[text]`` (1 chunk) when it fits one budget, so
     callers can fast-path to single-shot."""
@@ -236,19 +231,19 @@ class HiggsTextChunker:
     streaming :meth:`add_text`/:meth:`flush` hold buffer state, so create one
     instance per WS session."""
 
-    def __init__(self, options: ChunkerOptions | None = None) -> None:
-        opts = options or ChunkerOptions()
-        self._max_seconds = opts.max_seconds
-        self._granularity = opts.split_granularity
+    def __init__(self, options: ChunkerOptions) -> None:
+        self._max_seconds = options.max_seconds
+        self._cps = options.cps
+        self._granularity = options.split_granularity
         # Read by the orchestrator for CPS (see ChunkerOptions.codec_frame_rate).
-        self.codec_frame_rate: float | None = opts.codec_frame_rate
+        self.codec_frame_rate: float | None = options.codec_frame_rate
         self._buffer: str = ""
 
     def chunk(self, text: str, *, cps: float | None = None) -> list[str]:
         return _chunk(
             text,
             max_seconds=self._max_seconds,
-            cps=cps if cps is not None else DEFAULT_CPS,
+            cps=cps if cps is not None else self._cps,
         )
 
     def add_text(self, text: str) -> list[str]:
@@ -262,22 +257,20 @@ class HiggsTextChunker:
             return []
         confirmed = self._buffer[:cut]
         self._buffer = self._buffer[cut:]
-        return _chunk(confirmed, max_seconds=self._max_seconds, cps=DEFAULT_CPS)
+        return _chunk(confirmed, max_seconds=self._max_seconds, cps=self._cps)
 
     def flush(self) -> list[str]:
         """Drain whatever remains at end-of-input."""
         if not self._buffer.strip():
             self._buffer = ""
             return []
-        out = _chunk(self._buffer, max_seconds=self._max_seconds, cps=DEFAULT_CPS)
+        out = _chunk(self._buffer, max_seconds=self._max_seconds, cps=self._cps)
         self._buffer = ""
         return out
 
 
 __all__ = [
     "ChunkerOptions",
-    "DEFAULT_CPS",
-    "DEFAULT_MAX_SECONDS",
     "HiggsTextChunker",
     "TextChunker",
     "estimate_seconds",
