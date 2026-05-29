@@ -29,11 +29,6 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     architecture: ClassVar[str] = "HiggsMultimodalQwen3ForConditionalGeneration"
 
     model_path: str
-    # Launch-time overrides (yaml- and CLI-settable, no Python edit).
-    # chunker_max_seconds: the chunker's per-chunk synthesis-time budget.
-    # max_history_chunks: continuity sliding-window cap (prior chunks
-    # conditioning the next; 0 disables it). Injected into the tts_engine
-    # factory args in model_post_init.
     chunker_max_seconds: float | None = Field(default=None, gt=0)
     max_history_chunks: int = Field(default=4, ge=0)
     stages: list[StageConfig] = [
@@ -78,8 +73,6 @@ class HiggsTtsPipelineConfig(PipelineConfig):
 
     def model_post_init(self, __context: object = None) -> None:
         super().model_post_init(__context)
-        # Route the top-level knob into the tts_engine factory args. Pydantic
-        # gives each instance its own stages/StageConfig copies, so this is safe.
         for stage in self.stages:
             if stage.name == "tts_engine":
                 stage.factory_args = {
