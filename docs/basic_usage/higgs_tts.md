@@ -1,6 +1,6 @@
 # Higgs TTS Model Usage
 
-This guide uses [`boson-sglang/higgs-audio-v3-tts-4b-base`](https://huggingface.co/boson-sglang/higgs-audio-v3-tts-4b-base) — Higgs Audio v3 (Qwen3-4B backbone, 8 discrete codebooks × 1026 vocab, bf16) — with SGLang-Omni and the OpenAI-compatible API. The pipeline is `preprocessing → audio_encoder → tts_engine → vocoder`; the vocoder loads the public [`bosonai/higgs-audio-v2-tokenizer`](https://huggingface.co/bosonai/higgs-audio-v2-tokenizer) codec.
+This guide uses [`boson-sglang/higgs-audio-v3-tts-4b-base`](https://huggingface.co/boson-sglang/higgs-audio-v3-tts-4b-base) — Higgs Audio v3 (Qwen3-4B backbone, 8 discrete codebooks × 1026 vocab, bf16) — with SGLang-Omni and the OpenAI-compatible API. The pipeline is `preprocessing → audio_encoder → tts_engine → vocoder`.
 
 ## Prerequisites
 
@@ -18,7 +18,6 @@ uv pip install -v .
 # Higgs TTS model is private; export your HF token before downloading.
 export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 hf download boson-sglang/higgs-audio-v3-tts-4b-base
-hf download bosonai/higgs-audio-v2-tokenizer
 ```
 
 ## Launch the Server
@@ -30,11 +29,8 @@ sgl-omni serve \
   --port 8000
 ```
 
-The audio codec ships inside the Higgs TTS checkpoint — its weights live under
-the `tied.embedding.modality_embeddings.0.model.*` prefix and are decoded with
-the bundled [`bosonai/higgs-audio-v2-tokenizer`](https://huggingface.co/bosonai/higgs-audio-v2-tokenizer)
-architecture config. It loads automatically from `--model-path`; there is no
-separate codec download and no per-stage option to point at a different codec.
+The audio codec is bundled in the TTS checkpoint and loads automatically from
+`--model-path`; it can't be swapped for a different codec.
 
 ## Use Curl
 
