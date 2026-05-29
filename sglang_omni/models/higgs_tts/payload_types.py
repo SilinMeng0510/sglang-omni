@@ -19,15 +19,11 @@ class HiggsTtsState:
     # preprocessing / audio_encoder
     prompt_token_ids: list[int] = field(default_factory=list)
     reference_codes_delayed: list[list[int]] | None = None
-    reference_waveform: Any | None = None  # mono 24 kHz [1, 1, L] torch.Tensor
-    # Text tokenized once in preprocessing; the encoder + engine assemble the
-    # prompt from these (no re-tokenize downstream).
+    reference_waveform: Any | None = None
     target_text_token_ids: list[int] | None = None
     reference_text_token_ids: list[int] | None = None
 
-    # Cross-chunk continuity: a shared ``session_id`` ties an utterance's chunks
-    # together so the engine conditions each on the prior chunks' audio.
-    # ``session_final`` evicts the session; ``None`` => plain single-shot.
+    # Cross-chunk continuity
     session_id: str | None = None
     session_final: bool = False
 
