@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import torch
@@ -71,10 +72,13 @@ class HiggsTTSModelRunner(ModelRunner):
         safe_ids = torch.where(placeholder_mask, torch.zeros_like(input_ids), input_ids)
         text_embeds = embed_tokens(safe_ids)
 
+        _dbg = os.environ.get("HIGGS_DEBUG_ALIGN")
+
         offset = 0
         for sched_req in requests:
             data = sched_req.data
-            end = offset + int(data.req.extend_input_len)
+            req = data.req
+            end = offset + int(req.extend_input_len)
             codes_rows = data.reference_codes_delayed
             if not codes_rows:
                 offset = end
@@ -86,12 +90,62 @@ class HiggsTTSModelRunner(ModelRunner):
                 offset = end
                 continue
 
+            # Derive how many code rows are already covered by the KV-cached
+            # prefix from the prefix itself, NOT from an accumulating counter.
+            #
+            # ``forward_batch.input_ids`` (hence ``placeholder_mask``) is only the
+            # *uncached extend suffix*: ``fill_ids[len(prefix_indices):]``. On a
+            # radix prefix HIT (cross-chunk continuity reuses the growing session
+            # prefix) or on a later chunked-prefill pass, the leading ``-100``
+            # placeholders live in the cached prefix and are absent here. Those
+            # rows were already embedded on the pass that first materialised them,
+            # so this pass must start consuming codes *after* them. Counting the
+            # ``-100`` in ``fill_ids[:prefix_len]`` gives that offset and is robust
+            # to both radix reuse and multi-pass chunked prefill, because
+            # ``prefix_indices`` grows to cover every already-computed token.
+            #
+            # The old code started at 0 every request and walked from the FRONT
+            # of ``reference_codes_delayed`` (ref ++ history). On chunk N>=2 the
+            # ref-audio placeholders sat in the cached prefix, so the surviving
+            # extend placeholders (the newest history chunk's audio) got overlaid
+            # with the *start of the reference clip* — the model saw unrelated
+            # audio where it expected "what I just generated" and looped/repeated.
+            prefix_len = int(req.prefix_indices.numel())
+            fill_ids = req.fill_ids if req.fill_ids else req.origin_input_ids
+            consumed = sum(
+                1 for t in fill_ids[:prefix_len] if t == AUDIO_PLACEHOLDER_ID
+            )
+
             codes = torch.tensor(codes_rows, dtype=torch.long, device=device)
-            consumed = data.num_ref_codes_consumed
             with torch.no_grad():
                 embed = fused_embed(codes[consumed : consumed + n_placeholders])
             mask_idx = full_mask.nonzero(as_tuple=True)[0] + offset
             text_embeds[mask_idx] = embed.to(text_embeds.dtype)
+
+            if _dbg:
+                full_prompt_len = len(req.origin_input_ids or [])
+                full_n_ph = sum(
+                    1 for t in (req.origin_input_ids or []) if t == AUDIO_PLACEHOLDER_ID
+                )
+                logger.warning(
+                    "[HIGGS_ALIGN] rid=%s sess=%s full_prompt=%d full_ph=%d "
+                    "prefix_cached=%d extend_len=%d extend_ph=%d "
+                    "consumed_before=%d consumed_after=%d len_ref_codes=%d "
+                    "first_code_idx=%d last_code_idx=%d",
+                    req.rid,
+                    getattr(data, "session_id", None),
+                    full_prompt_len,
+                    full_n_ph,
+                    prefix_len,
+                    int(req.extend_input_len),
+                    n_placeholders,
+                    consumed,
+                    consumed + n_placeholders,
+                    len(codes_rows),
+                    consumed,
+                    consumed + n_placeholders - 1,
+                )
+
             data.num_ref_codes_consumed = consumed + n_placeholders
             offset = end
 
