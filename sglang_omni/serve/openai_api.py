@@ -1023,6 +1023,36 @@ def _select_speech_audio_delta(
     return audio[emitted_samples:], total_samples
 
 
+_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+
+def _speech_reference_from_ref_audio(
+    ref_audio: str, ref_text: str | None
+) -> dict[str, Any]:
+    """Map a ``ref_audio`` string to a higgs-style reference dict.
+
+    ``ref_audio`` is overloaded (URL / path / data: URI / raw base64). The audio
+    loader fetches URLs and reads local paths via ``audio_path``, but only
+    decodes base64 through the ``{base64, media_type}`` dict form — so base64
+    must be unwrapped here rather than handed through as ``audio_path`` (which
+    would be treated as a filename and fail). Raw base64 carries no scheme, so we
+    separate it from a path by requiring a long, pure-base64 string; no real path
+    is hundreds of base64 characters long.
+    """
+    if ref_audio.startswith("data:") and ";base64," in ref_audio:
+        header, data = ref_audio.split(";base64,", 1)
+        ref = {"base64": data, "media_type": header[len("data:") :] or "audio/wav"}
+    elif ref_audio.startswith(("http://", "https://", "file://", "/", "./", "~")):
+        ref = {"audio_path": ref_audio}
+    elif len(ref_audio) >= 256 and len(ref_audio) % 4 == 0 and _BASE64_RE.match(ref_audio):
+        ref = {"base64": ref_audio, "media_type": "audio/wav"}
+    else:
+        ref = {"audio_path": ref_audio}
+    if ref_text is not None:
+        ref["text"] = ref_text
+    return ref
+
+
 def build_speech_generate_request(
     req: CreateSpeechRequest,
     default_model: str,
@@ -1102,12 +1132,12 @@ def build_speech_generate_request(
             [reference.model_dump(exclude_none=True) for reference in req.references]
         )
 
-    # Backward compatibility with ref_audio/ref_text form.
+    # ref_audio/ref_text convenience form -> a reference dict. ref_audio may be a
+    # URL / local path / data: URI / raw base64 blob (see helper).
     if req.ref_audio is not None:
-        ref: dict[str, Any] = {"audio_path": req.ref_audio}
-        if req.ref_text is not None:
-            ref["text"] = req.ref_text
-        references.append(ref)
+        references.append(
+            _speech_reference_from_ref_audio(req.ref_audio, req.ref_text)
+        )
 
     if references:
         prompt = {"text": req.input, "references": references}
