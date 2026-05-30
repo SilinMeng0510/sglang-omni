@@ -170,6 +170,9 @@ def make_higgs_scheduler_adapters(
         session_text_token_ids: list[int] | None = None
         session_id = state.session_id
         if session_id and session_store is not None and adapter is not None:
+            # Barge-in (input.stop): drop chunks generated past
+            if state.session_truncate_after is not None:
+                session_store.truncate_after(session_id, state.session_truncate_after)
             prompt_history, overlay_codes = session_store.history_for(session_id)
             num_ref_rows = len(state.reference_codes_delayed or [])
             session_text_token_ids = list(state.target_text_token_ids or [])
@@ -212,6 +215,7 @@ def make_higgs_scheduler_adapters(
                 data.session_id,
                 data.session_text_token_ids or [],
                 state.output_codes_delayed,
+                index=state.session_index,
             )
             if data.session_final:
                 session_store.evict(data.session_id)

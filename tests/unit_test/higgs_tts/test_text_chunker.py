@@ -199,7 +199,19 @@ def test_fastout_only_affects_the_first_chunk() -> None:
     assert c.add_text("结束。") == ["还有逗号，继续结束。"]
 
 
-def test_rearm_fastout_re_enables_first_clause() -> None:
+def test_reset_drops_buffer_and_state_for_barge_in() -> None:
+    # input.stop: the interrupted turn's buffered tail + propagated tag state are
+    # abandoned; the next turn starts clean and fastout-armed.
+    c = HiggsTextChunker(
+        ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True)
+    )
+    # A state tag propagates and an unterminated tail is buffered.
+    c.add_text("<|emotion:joy|>Half a sentence with no")
+    c.reset()
+    # State prefix is gone and the buffer is empty: a fresh terminated sentence
+    # comes out verbatim, no leftover from before.
+    assert c.add_text("Fresh start, here we go!") == ["Fresh start,"]
+    assert list(c.flush()) == ["here we go!"]
     # rearm_fastout (input.wait) makes the next turn open at a clause boundary
     # again — without it, the post-first sentence mode would keep "三，四。" whole.
     c = HiggsTextChunker(

@@ -169,7 +169,14 @@ class HiggsChunkedGenerate:
         request: GenerateRequest, session_id: str, *, final: bool
     ) -> GenerateRequest:
         metadata = dict(request.metadata)
-        metadata["tts_session"] = {"id": session_id, "final": final}
+        prior = metadata.get("tts_session") or {}
+        tag: dict[str, Any] = {"id": session_id, "final": final}
+
+        if prior.get("index") is not None:
+            tag["index"] = prior["index"]
+        if prior.get("truncate_after") is not None:
+            tag["truncate_after"] = prior["truncate_after"]
+        metadata["tts_session"] = tag
         return replace(request, metadata=metadata)
 
 

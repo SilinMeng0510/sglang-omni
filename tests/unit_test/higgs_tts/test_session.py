@@ -121,3 +121,52 @@ def test_store_lru_capacity_cap() -> None:
     assert store.history_for("a") == ([], [])
     assert store.history_for("b") != ([], [])
     assert store.history_for("c") != ([], [])
+
+
+# ---------------------------------------------------------------------------
+# SessionStore.truncate_after (barge-in rollback)
+# ---------------------------------------------------------------------------
+
+
+def test_commit_records_index() -> None:
+    store = SessionStore(max_history_chunks=8)
+    store.commit("s", [0], [[0]], index=7)
+    assert store._sessions["s"].segments[0].index == 7
+
+
+def test_truncate_after_drops_chunks_past_index() -> None:
+    # Server ran ahead of playback: chunks 0..3 committed, user barged in while
+    # chunk 1 was playing → keep 0,1; drop 2,3 (generated but never spoken).
+    store = SessionStore(max_history_chunks=8)
+    for i in range(4):
+        store.commit("s", [i], [[i]], index=i)
+    store.truncate_after("s", 1)
+    prompt_history, overlay = store.history_for("s")
+    assert [t for t, _ in prompt_history] == [[0], [1]]
+    assert overlay == [[0], [1]]
+
+
+def test_truncate_after_to_latest_is_noop() -> None:
+    store = SessionStore(max_history_chunks=8)
+    for i in range(3):
+        store.commit("s", [i], [[i]], index=i)
+    store.truncate_after("s", 2)  # last committed chunk → nothing to drop
+    prompt_history, _ = store.history_for("s")
+    assert [t for t, _ in prompt_history] == [[0], [1], [2]]
+
+
+def test_truncate_after_unknown_session_is_noop() -> None:
+    store = SessionStore(max_history_chunks=8)
+    store.truncate_after("missing", 0)  # must not raise
+    assert store.history_for("missing") == ([], [])
+
+
+def test_truncate_after_keeps_unindexed_segments() -> None:
+    # A segment committed without an index (-1) can't be located, so it's kept;
+    # only positively-identified later chunks are dropped.
+    store = SessionStore(max_history_chunks=8)
+    store.commit("s", [0], [[0]])  # index defaults to -1
+    store.commit("s", [1], [[1]], index=1)
+    store.truncate_after("s", 0)
+    prompt_history, _ = store.history_for("s")
+    assert [t for t, _ in prompt_history] == [[0]]

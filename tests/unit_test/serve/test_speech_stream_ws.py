@@ -40,6 +40,8 @@ class StreamingSpeechWsClient:
         self.prompts: list[str] = []
         self.stream_prompts: list[str] = []
         self.aborted: list[str] = []
+        # tts_session metadata seen per generated chunk (continuity + barge-in).
+        self.sessions: list[dict[str, Any]] = []
         # The WS handler reads ``client.generate_middleware.new_streaming_chunker``.
         self.generate_middleware = _FakeMiddleware()
 
@@ -56,6 +58,7 @@ class StreamingSpeechWsClient:
     ) -> SpeechResult:
         del request_id, response_format, speed
         assert isinstance(request.prompt, str)
+        self.sessions.append(dict(request.metadata.get("tts_session") or {}))
         self.prompts.append(request.prompt)
         return SpeechResult(
             audio_bytes=f"audio:{request.prompt}".encode(),
@@ -251,6 +254,50 @@ def test_streaming_speech_ws_input_wait_flushes_unterminated_tail() -> None:
         }
 
     assert speech_client.prompts == ["See you guys tomorrow night!", "Bye."]
+
+
+def test_streaming_speech_ws_input_stop_rolls_back_and_rewinds_index() -> None:
+    # Barge-in: the server generated chunks 0..3 (ahead of playback), but the user
+    # only heard up to chunk 1. input.stop{chunk:1} aborts the in-flight request,
+    # resets the chunker (dropping the unspoken tail), rolls history back to ≤1,
+    # and REWINDS the index so the resume starts at chunk 2 (not 4) — old chunks
+    # 2,3 are discarded on both sides, indices stay a contiguous restartable run.
+    speech_client = StreamingSpeechWsClient()
+    client = TestClient(create_app(speech_client, model_name="higgs"))
+
+    with client.websocket_connect("/v1/audio/speech/stream") as ws:
+        ws.send_json({"type": "session.config"})
+        # turn 1 → chunks 0,1,2,3 + an unterminated tail held in the buffer.
+        ws.send_json(
+            {"type": "input.text", "text": "One. Two. Three. Four. dangling tail"}
+        )
+        for _ in range(4):
+            assert ws.receive_json()["type"] == "audio.start"
+            ws.receive_bytes()
+            assert ws.receive_json()["type"] == "audio.done"
+        # User barges in having only heard up to chunk 1.
+        ws.send_json({"type": "input.stop", "chunk": 1})
+        assert ws.receive_json() == {"type": "generation.stopped", "chunk": 1}
+        # Resume turn — its chunk must be index 2 (rewound), carrying the rollback.
+        ws.send_json({"type": "input.text", "text": "Five."})
+        ws.send_json({"type": "input.done"})
+        assert ws.receive_json()["sentence_text"].strip() == "Five."
+        ws.receive_bytes()
+        assert ws.receive_json()["type"] == "audio.done"
+        assert ws.receive_json()["type"] == "session.done"
+
+    # The in-flight/stale request was aborted on stop.
+    assert speech_client.aborted
+    # The held tail was dropped by reset() — it never reached generation.
+    assert not any("dangling" in p for p in speech_client.prompts)
+    # Index rewound: the resume reuses index 2 (not 4), proving the rewind.
+    assert [s["index"] for s in speech_client.sessions] == [0, 1, 2, 3, 2]
+    # Only the resume chunk carries the rollback, to K=1.
+    rollback = [s for s in speech_client.sessions if "truncate_after" in s]
+    assert len(rollback) == 1
+    assert rollback[0]["truncate_after"] == 1
+    assert rollback[0]["index"] == 2
+    assert speech_client.sessions[0].get("truncate_after") is None
 
 
 def test_streaming_speech_ws_requires_config_first() -> None:

@@ -597,118 +597,214 @@ async def _handle_streaming_speech_ws(
             if _new_chunker is not None
             else None
         )
-        sentence_index = 0
-        # One continuity session per connection: every sentence is tagged with
-        # this id so the engine conditions each on the prior ones' audio.
-        session_id = f"ws-{uuid.uuid4()}"
-
-        while True:
-            try:
-                raw = await asyncio.wait_for(
-                    websocket.receive_text(),
-                    timeout=idle_timeout,
-                )
-            except asyncio.TimeoutError:
-                await _send_streaming_speech_error(
-                    websocket,
-                    "Idle timeout: no message received",
-                )
-                return
-
-            if len(raw.encode("utf-8")) > _SPEECH_STREAM_MAX_INPUT_BYTES:
-                await _send_streaming_speech_error(
-                    websocket,
-                    "input.text message too large",
-                )
-                continue
-
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                await _send_streaming_speech_error(
-                    websocket,
-                    "Invalid JSON message",
-                )
-                continue
-
-            if not isinstance(msg, dict):
-                await _send_streaming_speech_error(
-                    websocket,
-                    "WebSocket messages must be JSON objects",
-                )
-                continue
-
-            msg_type = msg.get("type")
-            if msg_type == "input.text":
-                text = msg.get("text", "")
-                if not isinstance(text, str):
-                    await _send_streaming_speech_error(
-                        websocket,
-                        "input.text requires a string value",
-                    )
-                    continue
-                for sentence in _split_stream(splitter, text):
-                    # Never final mid-stream — more text may follow.
-                    await _generate_streaming_speech_sentence(
-                        websocket=websocket,
-                        client=client,
-                        default_model=default_model,
-                        config=config,
-                        sentence_text=sentence,
-                        sentence_index=sentence_index,
-                        session_id=session_id,
-                        session_final=False,
-                    )
-                    sentence_index += 1
-            elif msg_type == "input.wait":
-                # Agent paused output
-                for sentence in _flush_stream(splitter):
-                    await _generate_streaming_speech_sentence(
-                        websocket=websocket,
-                        client=client,
-                        default_model=default_model,
-                        config=config,
-                        sentence_text=sentence,
-                        sentence_index=sentence_index,
-                        session_id=session_id,
-                        session_final=False,
-                    )
-                    sentence_index += 1
-                if splitter is not None:
-                    splitter.rearm_fastout()
-            elif msg_type == "input.done":
-                pending = _flush_stream(splitter)
-                for offset, sentence in enumerate(pending):
-                    # Last sentence is final → engine evicts the session. If the
-                    # flush is empty, the session is reclaimed by idle TTL instead.
-                    await _generate_streaming_speech_sentence(
-                        websocket=websocket,
-                        client=client,
-                        default_model=default_model,
-                        config=config,
-                        sentence_text=sentence,
-                        sentence_index=sentence_index,
-                        session_id=session_id,
-                        session_final=(offset == len(pending) - 1),
-                    )
-                    sentence_index += 1
-                await websocket.send_json(
-                    {
-                        "type": "session.done",
-                        "total_sentences": sentence_index,
-                    }
-                )
-                return
-            else:
-                await _send_streaming_speech_error(
-                    websocket,
-                    f"Unknown message type: {msg_type}",
-                )
+        session = _SpeechStreamSession(
+            websocket=websocket,
+            client=client,
+            default_model=default_model,
+            config=config,
+            splitter=splitter,
+            idle_timeout=idle_timeout,
+        )
+        await session.run()
     except WebSocketDisconnect:
         logger.info("Streaming speech client disconnected")
     except Exception as exc:
         logger.exception("Streaming speech session failed")
         await _send_streaming_speech_error(websocket, f"Internal error: {exc}")
+
+
+class _SpeechStreamSession:
+    """One ``/v1/audio/speech/stream`` connection.
+
+    A **reader** (:meth:`run`) consumes control messages and enqueues chunks
+    instantly; a serial **worker** (:meth:`_drain`) generates and streams them in
+    order (cross-chunk continuity requires order). Decoupling the two is what
+    lets ``input.stop`` (barge-in) abort the in-flight chunk immediately instead
+    of waiting for it to finish — the sequential design could not, since the
+    receive loop was parked inside generation. Mirrors ``realtime/session.py``'s
+    ``drain_queue``/``active_task`` pattern.
+    """
+
+    def __init__(
+        self,
+        *,
+        websocket: WebSocket,
+        client: Client,
+        default_model: str,
+        config: StreamingSpeechSessionConfig,
+        splitter: Any,
+        idle_timeout: float,
+    ) -> None:
+        self._ws = websocket
+        self._client = client
+        self._default_model = default_model
+        self._config = config
+        self._splitter = splitter
+        self._idle_timeout = idle_timeout
+        # One continuity session per connection: every chunk is tagged with this
+        # id so the engine conditions each on the prior ones' audio.
+        self._session_id = f"ws-{uuid.uuid4()}"
+        self._sentence_index = 0
+        # Chunks awaiting generation: (text, index, final, truncate_after).
+        self._queue: asyncio.Queue[tuple[str, int, bool, int | None]] = (
+            asyncio.Queue()
+        )
+        self._active_task: asyncio.Task | None = None
+        self._active_request_id: str | None = None
+        # Set by input.stop; rides on the next turn's first chunk, then clears.
+        self._pending_truncate_after: int | None = None
+        self._closed = False
+
+    async def run(self) -> None:
+        drainer = asyncio.create_task(self._drain())
+        try:
+            while not self._closed:
+                try:
+                    raw = await asyncio.wait_for(
+                        self._ws.receive_text(),
+                        timeout=self._idle_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    await _send_streaming_speech_error(
+                        self._ws,
+                        "Idle timeout: no message received",
+                    )
+                    return
+                msg = await self._parse(raw)
+                if msg is not None:
+                    await self._dispatch(msg)
+        finally:
+            self._closed = True
+            await self._abort_active()
+            drainer.cancel()
+            # cancel() makes ``await drainer`` raise CancelledError, which is a
+            # BaseException — suppress(Exception) would NOT catch it.
+            with suppress(asyncio.CancelledError):
+                await drainer
+
+    async def _parse(self, raw: str) -> dict | None:
+        if len(raw.encode("utf-8")) > _SPEECH_STREAM_MAX_INPUT_BYTES:
+            await _send_streaming_speech_error(self._ws, "input.text message too large")
+            return None
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            await _send_streaming_speech_error(self._ws, "Invalid JSON message")
+            return None
+        if not isinstance(msg, dict):
+            await _send_streaming_speech_error(
+                self._ws, "WebSocket messages must be JSON objects"
+            )
+            return None
+        return msg
+
+    async def _dispatch(self, msg: dict) -> None:
+        msg_type = msg.get("type")
+        if msg_type == "input.text":
+            text = msg.get("text", "")
+            if not isinstance(text, str):
+                await _send_streaming_speech_error(
+                    self._ws, "input.text requires a string value"
+                )
+                return
+            for sentence in _split_stream(self._splitter, text):
+                # Never final mid-stream — more text may follow.
+                self._enqueue(sentence, final=False)
+        elif msg_type == "input.wait":
+            # Agent paused output: flush the buffered tail and speak it now (a
+            # clause with no terminator would otherwise wait for input.done),
+            # but keep the session open. Re-arm fastout for the next turn.
+            for sentence in _flush_stream(self._splitter):
+                self._enqueue(sentence, final=False)
+            if self._splitter is not None:
+                self._splitter.rearm_fastout()
+        elif msg_type == "input.stop":
+            await self._handle_stop(msg)
+        elif msg_type == "input.done":
+            pending = _flush_stream(self._splitter)
+            for offset, sentence in enumerate(pending):
+                # Last sentence is final → engine evicts the session. If the
+                # flush is empty, the session is reclaimed by idle TTL instead.
+                self._enqueue(sentence, final=(offset == len(pending) - 1))
+            await self._queue.join()  # let the worker drain before closing
+            await self._ws.send_json(
+                {"type": "session.done", "total_sentences": self._sentence_index}
+            )
+            self._closed = True
+        else:
+            await _send_streaming_speech_error(
+                self._ws, f"Unknown message type: {msg_type}"
+            )
+
+    def _enqueue(self, text: str, *, final: bool) -> None:
+        # The barge-in truncate rides on the first chunk generated after a stop,
+        # then clears — only that chunk should roll history back.
+        truncate_after = self._pending_truncate_after
+        self._pending_truncate_after = None
+        self._queue.put_nowait((text, self._sentence_index, final, truncate_after))
+        self._sentence_index += 1
+
+    async def _drain(self) -> None:
+        while True:
+            item = await self._queue.get()
+            self._active_task = asyncio.create_task(self._generate(item))
+            # gather absorbs CancelledError (input.stop) so the loop survives.
+            await asyncio.gather(self._active_task, return_exceptions=True)
+            self._active_task = None
+            self._queue.task_done()
+
+    async def _generate(self, item: tuple[str, int, bool, int | None]) -> None:
+        text, index, final, truncate_after = item
+        self._active_request_id = f"speech-stream-{uuid.uuid4()}"
+        await _generate_streaming_speech_sentence(
+            websocket=self._ws,
+            client=self._client,
+            default_model=self._default_model,
+            config=self._config,
+            sentence_text=text,
+            sentence_index=index,
+            session_id=self._session_id,
+            session_final=final,
+            request_id=self._active_request_id,
+            truncate_after=truncate_after,
+        )
+
+    async def _handle_stop(self, msg: dict) -> None:
+        """Barge-in. ``chunk`` (K) is the last chunk the user actually heard.
+
+        Roll history back to ≤ K and **rewind the index** so the resumed
+        generation continues from K+1: chunks generated past K — already streamed
+        but never heard — are discarded on the server, and the contiguous index
+        sequence means the agent discards the matching stale audio on its side.
+        Both ends realign on "next chunk is K+1"."""
+        chunk = msg.get("chunk")
+        valid = isinstance(chunk, int) and not isinstance(chunk, bool)
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+
+        await self._abort_active()
+
+        if self._splitter is not None:
+            self._splitter.reset()
+
+        if valid:
+            self._pending_truncate_after = chunk
+            self._sentence_index = chunk + 1
+        await self._ws.send_json({"type": "generation.stopped", "chunk": chunk})
+
+    async def _abort_active(self) -> None:
+        if self._active_request_id is not None:
+            with suppress(Exception):
+                await self._client.abort(self._active_request_id)
+        task = self._active_task
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(Exception):
+                await asyncio.gather(task, return_exceptions=True)
 
 
 async def _receive_streaming_speech_config(
@@ -806,11 +902,16 @@ async def _generate_streaming_speech_sentence(
     sentence_index: int,
     session_id: str,
     session_final: bool,
+    request_id: str,
+    truncate_after: int | None = None,
 ) -> None:
     """Generate audio for one sentence and stream it out the WebSocket.
 
     Tagged with ``session_id`` so the engine conditions it on the session's
-    prior audio; ``session_final`` evicts the session afterward.
+    prior audio; ``session_final`` evicts the session afterward. ``request_id``
+    is supplied by the caller so a barge-in can abort this exact request, and
+    ``truncate_after`` (set on the first chunk after input.stop) rolls the
+    engine's history back before this chunk is conditioned.
     """
     response_format = config.response_format or "wav"
     start_payload: dict[str, Any] = {
@@ -825,10 +926,15 @@ async def _generate_streaming_speech_sentence(
 
     total_bytes = 0
     generation_failed = False
-    request_id = f"speech-stream-{uuid.uuid4()}"
     request = _build_streaming_speech_request(config, sentence_text)
     gen_req = build_speech_generate_request(request, default_model)
-    gen_req = _tag_speech_session(gen_req, session_id, session_final)
+    gen_req = _tag_speech_session(
+        gen_req,
+        session_id,
+        session_final,
+        index=sentence_index,
+        truncate_after=truncate_after,
+    )
 
     try:
         if config.stream_audio:
@@ -878,11 +984,26 @@ def _tag_speech_session(
     gen_req: GenerateRequest,
     session_id: str,
     session_final: bool,
+    *,
+    index: int = -1,
+    truncate_after: int | None = None,
 ) -> GenerateRequest:
     """Tag the request with its continuity session (the engine reads
-    ``metadata['tts_session']``). Internal — not a public request field."""
+    ``metadata['tts_session']``). Internal — not a public request field.
+
+    ``index`` is the chunk's per-session sentence index (recorded so a barge-in
+    can roll history back to it); ``truncate_after`` — present only on the first
+    chunk after input.stop — tells the engine to drop history past that index
+    before conditioning this chunk."""
     metadata = dict(gen_req.metadata)
-    metadata["tts_session"] = {"id": session_id, "final": session_final}
+    tag: dict[str, Any] = {
+        "id": session_id,
+        "final": session_final,
+        "index": index,
+    }
+    if truncate_after is not None:
+        tag["truncate_after"] = truncate_after
+    metadata["tts_session"] = tag
     return replace(gen_req, metadata=metadata)
 
 

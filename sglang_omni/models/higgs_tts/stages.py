@@ -141,6 +141,8 @@ def create_preprocessing_executor(
         session = payload.request.metadata.get("tts_session") or {}
         session_id = session.get("id")
         session_final = bool(session.get("final", False))
+        session_index = int(session.get("index", -1))
+        session_truncate_after = session.get("truncate_after")
 
         # Normalize CJK/full-width punctuation to ASCII just before tokenizing.
         text = normalize_punctuation(inputs.get("input") or inputs.get("text") or "")
@@ -204,6 +206,8 @@ def create_preprocessing_executor(
             reference_waveform=waveform_tensor,
             session_id=session_id,
             session_final=session_final,
+            session_index=session_index,
+            session_truncate_after=session_truncate_after,
             target_text_token_ids=target_text_token_ids,
             reference_text_token_ids=reference_text_token_ids,
             num_codebooks=num_codebooks,

@@ -38,6 +38,8 @@ class TextChunker(Protocol):
 
     def rearm_fastout(self) -> None: ...
 
+    def reset(self) -> None: ...
+
 
 @dataclass(frozen=True)
 class ChunkerOptions:
@@ -332,6 +334,16 @@ class HiggsTextChunker:
         """Re-arm ``fastout`` so the next chunk is again cut at the earliest
         clause boundary — the WS handler calls this on ``input.wait`` (agent
         paused) so every turn opens fast. Tag ``state`` is left intact."""
+        self._emitted_first = False
+
+    def reset(self) -> None:
+        """Drop all buffered text and tag state — used on ``input.stop``
+        (barge-in): the interrupted turn's unspoken remainder is abandoned and
+        the next turn starts clean. ``fastout`` is re-armed (``_emitted_first``
+        cleared) so the resumed turn opens fast."""
+        self._buffer = ""
+        self._state = ""
+        self._state_used = False
         self._emitted_first = False
 
 

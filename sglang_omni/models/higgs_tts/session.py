@@ -26,10 +26,13 @@ def session_extra_key(session_id: str) -> str:
 
 @dataclass
 class Segment:
-    """One committed prior chunk: its text tokens + delayed audio codes."""
+    """One committed prior chunk: its text tokens + delayed audio codes, tagged
+    with the chunk's ``index`` (serve's per-session sentence index) so a barge-in
+    can roll history back to a specific chunk via :meth:`SessionStore.truncate_after`."""
 
     text_token_ids: list[int]
     codes_delayed: list[list[int]]
+    index: int = -1  # serve sentence_index; -1 = unknown (pre-index caller)
 
     @property
     def num_audio_rows(self) -> int:
@@ -94,9 +97,11 @@ class SessionStore:
         session_id: str,
         text_token_ids: list[int],
         codes_delayed: list[list[int]] | None,
+        index: int = -1,
     ) -> None:
         """Append a generated chunk to the session. A chunk with no codes is
-        dropped; only the most-recent ``max_history_chunks`` are kept."""
+        dropped; only the most-recent ``max_history_chunks`` are kept. ``index``
+        is the chunk's serve-side sentence index, recorded for :meth:`truncate_after`."""
         if not codes_delayed:
             return
         with self._lock:
@@ -105,7 +110,11 @@ class SessionStore:
                 state = SessionState()
                 self._sessions[session_id] = state
             state.segments.append(
-                Segment(text_token_ids=list(text_token_ids), codes_delayed=codes_delayed)
+                Segment(
+                    text_token_ids=list(text_token_ids),
+                    codes_delayed=codes_delayed,
+                    index=index,
+                )
             )
             if self.max_history_chunks > 0:
                 excess = len(state.segments) - self.max_history_chunks
@@ -113,6 +122,20 @@ class SessionStore:
                     del state.segments[:excess]
             state.last_used_s = time.monotonic()
             self._enforce_capacity_locked()
+
+    def truncate_after(self, session_id: str, last_kept_index: int) -> None:
+        """Barge-in rollback: drop every committed segment whose chunk index is
+        greater than ``last_kept_index`` (chunks generated ahead of playback but
+        never heard). Segments with an unknown index (``-1``) are kept; no-op for
+        an unknown session."""
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None:
+                return
+            state.segments = [
+                s for s in state.segments if s.index < 0 or s.index <= last_kept_index
+            ]
+            state.last_used_s = time.monotonic()
 
     def evict(self, session_id: str) -> None:
         with self._lock:
