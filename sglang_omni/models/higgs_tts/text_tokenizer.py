@@ -52,19 +52,61 @@ class HiggsTokenizerAdapter:
         *,
         num_ref_tokens: int = 0,
         reference_text: str | None = None,
+        history: list[tuple[list[int], int]] | None = None,
     ) -> list[int]:
-        """``num_ref_tokens=0`` → zero-shot; non-zero must match delayed row count."""
+        """String-taking wrapper over :meth:`build_prompt_from_ids` (tokenizes
+        ``prompt_text`` / ``reference_text`` first)."""
+        ref_text_ids = (
+            self._tok.encode(reference_text, add_special_tokens=False)
+            if reference_text
+            else None
+        )
+        return self.build_prompt_from_ids(
+            self._tok.encode(prompt_text, add_special_tokens=False),
+            num_ref_tokens=num_ref_tokens,
+            reference_text_ids=ref_text_ids,
+            history=history,
+        )
+
+    def build_prompt_from_ids(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        num_ref_tokens: int = 0,
+        reference_text_ids: list[int] | None = None,
+        history: list[tuple[list[int], int]] | None = None,
+    ) -> list[int]:
+        """Assemble the prompt from already-tokenized pieces.
+        ``num_ref_tokens=0`` → zero-shot; non-zero must match the delayed ref
+        row count.
+
+        Each ``history`` pair ``(text_ids_i, num_audio_rows_i)`` (a prior chunk,
+        chronological) becomes a ``<|text|> tok(t_i) <|audio|> [-100]×N_i`` block
+        between the reference and the new prompt; ``N_i`` must equal chunk
+        ``i``'s delayed row count (``T_i + num_codebooks - 1``). Empty/``None``
+        history → byte-identical to the single-shot prompt.
+        """
         if num_ref_tokens < 0:
             raise ValueError(f"num_ref_tokens must be >= 0, got {num_ref_tokens}")
         ids: list[int] = [self.tts_id]
-        if reference_text and num_ref_tokens > 0 and self.ref_text_id is not None:
+        if reference_text_ids and num_ref_tokens > 0 and self.ref_text_id is not None:
             ids.append(self.ref_text_id)
-            ids.extend(self._tok.encode(reference_text, add_special_tokens=False))
+            ids.extend(reference_text_ids)
         if num_ref_tokens > 0:
             ids.append(self.ref_audio_id)
             ids.extend([AUDIO_PLACEHOLDER_ID] * num_ref_tokens)
+        for hist_text_ids, hist_num_audio_rows in history or []:
+            if hist_num_audio_rows < 0:
+                raise ValueError(
+                    "history audio-row counts must be >= 0, got "
+                    f"{hist_num_audio_rows}"
+                )
+            ids.append(self.text_id)
+            ids.extend(hist_text_ids)
+            ids.append(self.audio_id)
+            ids.extend([AUDIO_PLACEHOLDER_ID] * hist_num_audio_rows)
         ids.append(self.text_id)
-        ids.extend(self._tok.encode(prompt_text, add_special_tokens=False))
+        ids.extend(prompt_token_ids)
         ids.append(self.audio_id)
         return ids
 

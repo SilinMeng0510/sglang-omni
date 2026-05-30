@@ -87,6 +87,15 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     monkeypatch.setattr(stages, "OmniScheduler", FakeOmniScheduler, raising=False)
     monkeypatch.setattr(stages, "HiggsScheduler", FakeHiggsScheduler, raising=False)
 
+    # Engine-side session continuity builds a tokenizer adapter + session
+    # store; stub them so the test doesn't need a real checkpoint on disk.
+    monkeypatch.setattr(
+        stages, "Tokenizer", SimpleNamespace(from_file=lambda _path: object())
+    )
+    monkeypatch.setattr(stages, "PreTrainedTokenizerFast", lambda **kwargs: object())
+    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", lambda _tok: object())
+    monkeypatch.setattr(stages, "SessionStore", lambda **kwargs: object())
+
     stages.create_sglang_tts_engine_executor("boson-sglang/higgs-audio-v3-tts-4b-base")
 
     assert captured["checkpoint_dir"] == "boson-sglang/higgs-audio-v3-tts-4b-base"
@@ -99,7 +108,11 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     assert captured["cuda_graph_decoder_kwargs"] == {"max_batch_size": 16}
     assert captured["init_device_graphs_called"] is True
     assert captured["server_args"].disable_overlap_schedule is True
-    assert captured["adapter_kwargs"] == {"max_new_tokens_cap": 2048}
+    assert captured["adapter_kwargs"]["max_new_tokens_cap"] == 2048
+    # Engine-side continuity wiring: a tokenizer adapter + session store are
+    # handed to the scheduler adapters.
+    assert captured["adapter_kwargs"]["adapter"] is not None
+    assert captured["adapter_kwargs"]["session_store"] is not None
     assert captured["scheduler"] == "omni"
     assert captured["scheduler_kwargs"]["tp_worker"] is captured["model_runner_args"][0]
     assert callable(captured["scheduler_kwargs"]["stream_output_builder"])

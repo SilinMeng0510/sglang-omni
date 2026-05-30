@@ -3,9 +3,14 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
+
+from pydantic import Field
 
 from sglang_omni.config import PipelineConfig, StageConfig
+
+if TYPE_CHECKING:
+    from sglang_omni.models.higgs_tts.text_chunker import ChunkerOptions
 
 _PKG = "sglang_omni.models.higgs_tts"
 
@@ -24,6 +29,9 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     architecture: ClassVar[str] = "HiggsMultimodalQwen3ForConditionalGeneration"
 
     model_path: str
+    chunker_max_seconds: float = Field(default=8.0, gt=0)
+    chunker_cps: float = Field(default=10.0, gt=0)
+    max_history_chunks: int = Field(default=4, ge=0)
     stages: list[StageConfig] = [
         StageConfig(
             name="preprocessing",
@@ -63,6 +71,39 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             can_accept_stream_before_payload=True,
         ),
     ]
+
+    def model_post_init(self, __context: object = None) -> None:
+        super().model_post_init(__context)
+        for stage in self.stages:
+            if stage.name == "tts_engine":
+                stage.factory_args = {
+                    **stage.factory_args,
+                    "max_history_chunks": self.max_history_chunks,
+                }
+                break
+
+    def create_generate_orchestrator(self):
+        """The chunking middleware the launcher plugs into the shared Client."""
+        from sglang_omni.models.higgs_tts.chunked_generate import HiggsChunkedGenerate
+        from sglang_omni.models.higgs_tts.text_chunker import HiggsTextChunker
+
+        options = self._chunker_options()
+        return HiggsChunkedGenerate(
+            text_chunker=HiggsTextChunker(options),
+            chunker_factory=HiggsTextChunker,
+            chunker_options=options,
+        )
+
+    def _chunker_options(self) -> "ChunkerOptions":
+        """Chunker knobs from the top-level config fields."""
+        from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
+        from sglang_omni.models.higgs_tts.text_chunker import ChunkerOptions
+
+        return ChunkerOptions(
+            max_seconds=self.chunker_max_seconds,
+            cps=self.chunker_cps,
+            codec_frame_rate=float(HiggsAudioCodec.FRAME_RATE),
+        )
 
 
 EntryClass = HiggsTtsPipelineConfig

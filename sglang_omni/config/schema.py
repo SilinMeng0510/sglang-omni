@@ -239,6 +239,14 @@ class PipelineConfig(BaseModel):
         """Class-level public role map for SGLang mem_fraction_static overrides."""
         return {}
 
+    def create_generate_orchestrator(self) -> Any | None:
+        """Optional ``generate_middleware`` for the shared ``Client`` — a
+        ``(client, request, request_id)`` async generator for request-level
+        orchestration (e.g. chunked TTS). The launcher wires it into
+        ``Client(generate_middleware=...)``. Default ``None`` → single-shot.
+        """
+        return None
+
     @property
     def gpu_placement(self) -> dict[str, int | list[int]]:
         out: dict[str, int | list[int]] = {}

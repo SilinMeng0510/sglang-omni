@@ -1,6 +1,6 @@
 # Higgs TTS Model Usage
 
-This guide uses [`boson-sglang/higgs-audio-v3-tts-4b-base`](https://huggingface.co/boson-sglang/higgs-audio-v3-tts-4b-base) — Higgs Audio v3 (Qwen3-4B backbone, 8 discrete codebooks × 1026 vocab, bf16) — with SGLang-Omni and the OpenAI-compatible API. The pipeline is `preprocessing → audio_encoder → tts_engine → vocoder`; the vocoder loads the public [`bosonai/higgs-audio-v2-tokenizer`](https://huggingface.co/bosonai/higgs-audio-v2-tokenizer) codec.
+This guide uses [`boson-sglang/higgs-audio-v3-tts-4b-base`](https://huggingface.co/boson-sglang/higgs-audio-v3-tts-4b-base) — Higgs Audio v3 (Qwen3-4B backbone, 8 discrete codebooks × 1026 vocab, bf16) — with SGLang-Omni and the OpenAI-compatible API. The pipeline is `preprocessing → audio_encoder → tts_engine → vocoder`.
 
 ## Prerequisites
 
@@ -18,7 +18,6 @@ uv pip install -v .
 # Higgs TTS model is private; export your HF token before downloading.
 export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 hf download boson-sglang/higgs-audio-v3-tts-4b-base
-hf download bosonai/higgs-audio-v2-tokenizer
 ```
 
 ## Launch the Server
@@ -30,16 +29,8 @@ sgl-omni serve \
   --port 8000
 ```
 
-The audio codec defaults to the public [`bosonai/higgs-audio-v2-tokenizer`](https://huggingface.co/bosonai/higgs-audio-v2-tokenizer) repo. Override per-stage if you need a different codec checkpoint:
-
-```bash
-sgl-omni serve \
-  --model-path boson-sglang/higgs-audio-v3-tts-4b-base \
-  --config examples/configs/higgs_tts.yaml \
-  --stage-arg preprocessing.audio_codec_path=<path-or-repo-id> \
-  --stage-arg vocoder.audio_codec_path=<path-or-repo-id> \
-  --port 8000
-```
+The audio codec is bundled in the TTS checkpoint and loads automatically from
+`--model-path`; it can't be swapped for a different codec.
 
 ## Use Curl
 
@@ -155,6 +146,15 @@ Set `stream_audio` to `true` for progressive raw PCM binary frames. In that mode
 Sentence splitting follows vLLM-Omni's streaming TTS rule: English `.`, `?`,
 and `!` split only when followed by whitespace; CJK `。！？` split immediately.
 With `split_granularity="clause"`, CJK `，；` are also split points.
+
+### Text Normalization
+
+On every path (curl, Python, WebSocket), CJK / full-width punctuation in the
+`input` text is normalized to its ASCII form just before synthesis — e.g.
+`。→ .`, `，→ ,`, `！→ !`, `？→ ?`, `（）→ ()`, `“”→ "` — so the model sees one
+consistent punctuation style. Spoken content is unchanged. Normalization runs
+*after* sentence/chunk splitting, so it does not affect where the text is split
+(boundaries are computed on the original punctuation).
 
 ## Use Python
 
