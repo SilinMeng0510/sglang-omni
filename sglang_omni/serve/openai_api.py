@@ -661,7 +661,19 @@ async def _handle_streaming_speech_ws(
                     )
                     sentence_index += 1
             elif msg_type == "input.wait":
-                # Agent paused outputing
+                # Agent paused output
+                for sentence in _flush_stream(splitter):
+                    await _generate_streaming_speech_sentence(
+                        websocket=websocket,
+                        client=client,
+                        default_model=default_model,
+                        config=config,
+                        sentence_text=sentence,
+                        sentence_index=sentence_index,
+                        session_id=session_id,
+                        session_final=False,
+                    )
+                    sentence_index += 1
                 if splitter is not None:
                     splitter.rearm_fastout()
             elif msg_type == "input.done":

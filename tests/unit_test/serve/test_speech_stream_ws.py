@@ -222,6 +222,37 @@ def test_streaming_speech_ws_input_wait_rearms_fastout() -> None:
     assert speech_client.prompts == ["一，", "二。", "三，", "四。"]
 
 
+def test_streaming_speech_ws_input_wait_flushes_unterminated_tail() -> None:
+    # A tail with no sentence terminator ("night!" — '!' not followed by space)
+    # stays buffered on input.text. input.wait drains it like input.done, but
+    # keeps the session open so a later turn still works.
+    speech_client = StreamingSpeechWsClient()
+    client = TestClient(create_app(speech_client, model_name="higgs"))
+
+    with client.websocket_connect("/v1/audio/speech/stream") as ws:
+        ws.send_json({"type": "session.config", "fastout": True})
+        ws.send_json({"type": "input.text", "text": "See you guys tomorrow night!"})
+        # Nothing emitted yet — the whole sentence is held in the chunker buffer.
+        ws.send_json({"type": "input.wait"})
+        assert (
+            ws.receive_json()["sentence_text"] == "See you guys tomorrow night!"
+        )
+        assert ws.receive_bytes() == "audio:See you guys tomorrow night!".encode()
+        assert ws.receive_json()["type"] == "audio.done"
+        # Session still open: a second turn (also unterminated) flushes on done.
+        ws.send_json({"type": "input.text", "text": "Bye."})
+        ws.send_json({"type": "input.done"})
+        assert ws.receive_json()["sentence_text"] == "Bye."
+        assert ws.receive_bytes() == "audio:Bye.".encode()
+        assert ws.receive_json()["type"] == "audio.done"
+        assert ws.receive_json() == {
+            "type": "session.done",
+            "total_sentences": 2,
+        }
+
+    assert speech_client.prompts == ["See you guys tomorrow night!", "Bye."]
+
+
 def test_streaming_speech_ws_requires_config_first() -> None:
     client = TestClient(create_app(StreamingSpeechWsClient(), model_name="higgs"))
 
