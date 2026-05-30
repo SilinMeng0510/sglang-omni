@@ -1,32 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Language-agnostic TTS text chunker for Higgs TTS (ported from ``chunk.py``).
+"""Language-agnostic, tag-aware TTS text chunker for Higgs TTS.
 
-Each chunk = one sentence; adjacent sentences are never merged (preserves
-prosody boundaries). An oversized sentence (synthesis time > ``max_seconds``)
-sub-splits through 5 tiers — sentence punct → clause punct → close brackets/
-quotes → whitespace → per-char — re-packed within the sentence only.
+Each chunk is one sentence (adjacent sentences are never merged, to keep prosody
+boundaries). A sentence whose synthesis time exceeds ``max_seconds`` is
+sub-split through tiers — clause punct → close brackets/quotes → whitespace →
+per-char — re-packed within that sentence only.
+
+Control tags ``<|...|>`` are honoured (the model and users emit them). *State*
+tags (``emotion``/``style``/``prosody:speed_*|pitch_*|expressive_*``) force a
+boundary and are propagated as a prefix onto every following chunk until
+``<|clear|>`` (which resets and is dropped) or the next state tag. *Transient*
+tags (``prosody:pause``/``sfx:*`` …) stay inline and cost no budget.
 
 :class:`HiggsTextChunker` offers batch :meth:`chunk` and incremental
-:meth:`add_text`/:meth:`flush` (WS stream-in). Boundary rule (vLLM-Omni): ASCII
-``.!?`` only split when followed by whitespace (so ``3.14``/``U.S.A`` survive);
-non-ASCII terminators (``。！？``…) split immediately. Sizing uses a CPS budget
-from :class:`ChunkerOptions`; callers may pass a per-request ``cps`` from the
-reference instead.
+:meth:`add_text`/:meth:`flush` (WS stream-in); both share one core walk. ASCII
+``.!?`` only split before whitespace (so ``3.14``/``U.S.A`` survive); non-ASCII
+terminators (``。！？``…) split immediately.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Protocol
 
 import regex  # PCRE-style Unicode \p{...} property classes
 
 
 class TextChunker(Protocol):
-    """Splits text into sentence-bounded TTS chunks. Batch :meth:`chunk`, or
-    incremental :meth:`add_text`/:meth:`flush` (WS stream-in); a 1-element
-    ``chunk`` return means "no chunking needed"."""
+    """Batch :meth:`chunk`, or incremental :meth:`add_text`/:meth:`flush`
+    (WS stream-in); a 1-element ``chunk`` return means "no chunking needed"."""
 
     def chunk(self, text: str, *, cps: float | None = None) -> list[str]: ...
 
@@ -41,266 +43,295 @@ class TextChunker(Protocol):
 class ChunkerOptions:
     """Launch-time chunker knobs (from the model's :class:`PipelineConfig`)."""
 
-    max_seconds: float  # per-chunk synthesis-time budget
-    cps: float  # default chars/sec when there's no per-request ref calibration
-    # Low first-audio latency: release the FIRST streamed chunk at the earliest
-    # clause boundary so audio starts ASAP; every later chunk uses sentence
-    # boundaries (their latency hides behind playback). Off → sentences only.
+    max_seconds: float
+    cps: float
     fastout: bool = False
-    # Codec Hz — lets the orchestrator get ref duration from ``vq_codes`` rows
-    # for a per-request CPS. ``None`` → skip that (no audio I/O), use ``cps``.
     codec_frame_rate: float | None = None
 
 
-# Unicode classes (regex \p{}): STerm = sentence terminals (.!? 。！？…); the
-# Term−STerm difference = clause stops (, ; : 、); Pe/Pf = close brackets +
-# final quotes.
-_CLAUSE_CLS = r"[\p{Term}--\p{STerm}]"
-_CLOSE_PUNCT_CLS = r"[\p{Pe}\p{Pf}\"']"
-# Non-ASCII terminators — cut immediately (no 3.14/U.S.A ambiguity).
-_IMMEDIATE_SENT_CLS = r"[\p{STerm}…--[\x00-\x7f]]"
-_IMMEDIATE_CLAUSE_CLS = r"[\p{Term}…--[\x00-\x7f]]"
-
-# ASCII .!? are boundaries only before whitespace/end; non-ASCII run greedily.
-# Shared by batch + streaming so behaviour matches.
-_SENT_BOUNDARY_RE = regex.compile(
-    rf"(?:{_IMMEDIATE_SENT_CLS}+|[.!?](?=\s|$))",
-    regex.V1,
-)
-# Streaming variant: ASCII needs trailing whitespace (no end-of-input shortcut;
-# ``flush`` handles end-of-input).
-_CONFIRMED_SENT_RE = regex.compile(
-    rf"(?:{_IMMEDIATE_SENT_CLS}|[.!?](?=\s))",
-    regex.V1,
-)
-_CONFIRMED_CLAUSE_RE = regex.compile(
-    rf"(?:{_IMMEDIATE_CLAUSE_CLS}|[.!?](?=\s))",
-    regex.V1,
+# Sentence / clause boundary matchers.
+_SENT_RE, _CLAUSE_RE = (
+    regex.compile(rf"(?:[{cls}…--[\x00-\x7f]]|[.!?](?=\s))", regex.V1)
+    for cls in (r"\p{STerm}", r"\p{Term}")
 )
 
-_WORD_RE = regex.compile(r"\S+\s*|\s+")
+_REFINE_TIERS = tuple(
+    regex.compile(rf".*?{cls}+|.+", regex.V1 | regex.DOTALL)
+    for cls in (_CLAUSE_RE.pattern, r"[\p{Pe}\p{Pf}\"']", r"\s")
+)
+
+_TAG_RE = regex.compile(r"<\|[^|]+\|>")
+
+_STATE_TAG_RUN_RE = regex.compile(
+    r"(?:<\|(?:clear"
+    r"|emotion:[^|]+"
+    r"|style:[^|]+"
+    r"|prosody:(?:expressive_[^|]+|speed_[^|]+|pitch_[^|]+))\|>)+"
+)
+
+_CLEAR_TAG = "<|clear|>"  # resets state; forces a cut, then is dropped
+
+_ATOM_RE = regex.compile(
+    r"(?:https?://|www\.)\S+"  # URL
+    r"|[^\s@]+@[^\s@]+\.[^\s@]+"  # email
+    r"|\d[\d.,:/-]*\d|\d"  # number / phone / time / date / IP
+)
 
 
-def _spoken_len(text: str) -> int:
-    """Non-whitespace char count (whitespace is silent in TTS)."""
-    return sum(1 for c in text if not c.isspace())
+def _classify_tag(tag: str) -> str:
+    """One of {'state', 'clear', 'transient'} for a ``<|...|>`` tag."""
+    if tag == _CLEAR_TAG:
+        return "clear"
+    if _STATE_TAG_RUN_RE.fullmatch(tag):
+        return "state"
+    return "transient"
+
+
+def _iter_tokens(text: str):
+    """Lex ``text`` into ``(kind, text)`` tokens; kind in
+    text/state/clear/transient."""
+    last = 0
+    for m in _TAG_RE.finditer(text):
+        if m.start() > last:
+            yield ("text", text[last : m.start()])
+        yield (_classify_tag(m.group(0)), m.group(0))
+        last = m.end()
+    if last < len(text):
+        yield ("text", text[last:])
 
 
 def estimate_seconds(text: str, cps: float) -> float:
-    """Estimated synthesis time (s) at ``cps`` chars/sec."""
-    return _spoken_len(text) / cps if cps > 0 else 0.0
-
-
-@lru_cache(maxsize=None)
-def _split_re(cls: str):
-    """Match ``<anything><delim+>`` runs plus a trailing tail (no delim)."""
-    return regex.compile(rf".*?{cls}+|.+", regex.V1 | regex.DOTALL)
-
-
-_CLAUSE_RE = _split_re(_CLAUSE_CLS)
-_CLOSE_RE = _split_re(_CLOSE_PUNCT_CLS)
-
-
-def _split_keep(text: str, compiled) -> list[str]:
-    """Split keeping each match verbatim (whitespace preserved)."""
-    return [m.group(0) for m in compiled.finditer(text) if m.group(0)]
-
-
-def _budget_split_chars(text: str, max_seconds: float, cps: float) -> list[str]:
-    """Tier 5: greedy-pack chars into pieces of ≤ ``max_seconds`` (whitespace
-    flows through; pieces re-concatenate to ``text``)."""
-    out: list[str] = []
-    buf: list[str] = []
-    t = 0.0
-    for c in text:
-        ct = 0.0 if c.isspace() else 1.0 / cps
-        if buf and t + ct > max_seconds:
-            out.append("".join(buf))
-            buf, t = [c], ct
-        else:
-            buf.append(c)
-            t += ct
-    if buf:
-        out.append("".join(buf))
-    return out
-
-
-def _refine(piece: str, max_seconds: float, cps: float) -> list[str]:
-    """Apply tiers 2→5 to one piece until under budget."""
-    if estimate_seconds(piece, cps) <= max_seconds:
-        return [piece]
-    parts = _split_keep(piece, _CLAUSE_RE)  # tier 2: clause
-    if len(parts) > 1:
-        out: list[str] = []
-        for p in parts:
-            out.extend(_refine_tier3(p, max_seconds, cps))
-        return out
-    return _refine_tier3(piece, max_seconds, cps)
-
-
-def _refine_tier3(piece: str, max_seconds: float, cps: float) -> list[str]:
-    if estimate_seconds(piece, cps) <= max_seconds:
-        return [piece]
-    parts = _split_keep(piece, _CLOSE_RE)
-    if len(parts) > 1:
-        out: list[str] = []
-        for p in parts:
-            out.extend(_refine_tier4(p, max_seconds, cps))
-        return out
-    return _refine_tier4(piece, max_seconds, cps)
-
-
-def _refine_tier4(piece: str, max_seconds: float, cps: float) -> list[str]:
-    if estimate_seconds(piece, cps) <= max_seconds:
-        return [piece]
-    parts = _split_keep(piece, _WORD_RE)
-    if len(parts) > 1:
-        out: list[str] = []
-        for p in parts:
-            if estimate_seconds(p, cps) <= max_seconds:
-                out.append(p)
-            else:
-                out.extend(_budget_split_chars(p, max_seconds, cps))
-        return out
-    return _budget_split_chars(piece, max_seconds, cps)
+    """Estimated synthesis time (s); whitespace is silent so it's excluded."""
+    spoken = sum(1 for c in text if not c.isspace())
+    return spoken / cps if cps > 0 else 0.0
 
 
 def _pack(parts: list[str], max_seconds: float, cps: float) -> list[str]:
-    """Greedy-merge consecutive fragments under budget (join with ``''``)."""
+    """Greedy-merge consecutive fragments under budget (join with ``''``). A
+    whole-tag fragment is a control directive, not audio, so it costs nothing;
+    an atom never gets split, so an over-budget atom stays whole on its own."""
     out: list[str] = []
     buf = ""
     t = 0.0
     for p in parts:
-        pt = estimate_seconds(p, cps)
-        if not buf:
-            buf, t = p, pt
-            continue
-        if t + pt <= max_seconds:
-            buf, t = buf + p, t + pt
-        else:
+        pt = 0.0 if _TAG_RE.fullmatch(p) else estimate_seconds(p, cps)
+        if buf and t + pt > max_seconds:
             out.append(buf)
             buf, t = p, pt
+        else:
+            buf, t = buf + p, t + pt
     if buf:
         out.append(buf)
     return out
 
 
-def _chunk(text: str, max_seconds: float, cps: float) -> list[str]:
-    """Batch algorithm (public entry point is :meth:`HiggsTextChunker.chunk`).
-    ``[]`` for empty input; ``[text]`` (1 chunk) when it fits one budget, so
-    callers can fast-path to single-shot."""
-    text = (text or "").strip()
-    if not text:
-        return []
-
-    # Pass 1: cut at sentence boundaries (trailing tail = its own piece).
-    pieces: list[str] = []
+def _char_atoms(piece: str) -> list[str]:
+    """Atomize a piece for the per-character budget split: each char is its own
+    atom, except a structured token (:data:`_ATOM_RE`) stays whole."""
+    atoms: list[str] = []
     last = 0
-    for m in _SENT_BOUNDARY_RE.finditer(text):
-        piece = text[last : m.end()]
-        if piece:
-            pieces.append(piece)
+    for m in _ATOM_RE.finditer(piece):
+        atoms.extend(piece[last : m.start()])
+        atoms.append(m.group(0))
         last = m.end()
-    if last < len(text):
-        pieces.append(text[last:])
+    atoms.extend(piece[last:])
+    return atoms
 
-    # Pass 2: refine + repack oversized pieces within their own sentence.
+
+def _refine(piece: str, max_seconds: float, cps: float, tier: int = 0) -> list[str]:
+    """Recursively split an oversized PURE-TEXT piece to fit the budget: try
+    each tier, then a per-character split as the last resort."""
+    if estimate_seconds(piece, cps) <= max_seconds:
+        return [piece]
+    if tier >= len(_REFINE_TIERS):
+        return _pack(_char_atoms(piece), max_seconds, cps)
+    parts = [m.group(0) for m in _REFINE_TIERS[tier].finditer(piece) if m.group(0)]
+    if len(parts) <= 1:  # this tier didn't divide it — drop to the next
+        return _refine(piece, max_seconds, cps, tier + 1)
     out: list[str] = []
-    for p in pieces:
-        if estimate_seconds(p, cps) > max_seconds:
-            out.extend(_pack(_refine(p, max_seconds, cps), max_seconds, cps))
-        else:
-            out.append(p)
+    for p in parts:
+        out.extend(_refine(p, max_seconds, cps, tier + 1))
     return out
 
 
-def _last_confirmed_cut(buffer: str) -> int:
-    """Offset after the last confirmed *sentence* boundary (trailing whitespace
-    consumed); 0 if none yet confirmed."""
-    last = None
-    for m in _CONFIRMED_SENT_RE.finditer(buffer):
-        last = m
-    if last is None:
-        return 0
-    end = last.end()
-    while end < len(buffer) and buffer[end].isspace():
-        end += 1
-    return end
+def _refine_oversized(body: str, max_seconds: float, cps: float) -> list[str]:
+    """Refine an oversized sentence that may carry inline tags. Tags never enter
+    the splittable range: ``_TAG_RE`` lexes them out so only pure-text spans are
+    split, each tag rides along as an atomic cost-free unit, and ``_pack``
+    re-interleaves them in order — no tag is ever cut at its inner ``:``."""
+    atoms: list[str] = []
+    last = 0
+    for m in _TAG_RE.finditer(body):
+        if m.start() > last:
+            atoms.extend(_refine(body[last : m.start()], max_seconds, cps))
+        atoms.append(m.group(0))  # tag: atomic, never split
+        last = m.end()
+    if last < len(body):
+        atoms.extend(_refine(body[last:], max_seconds, cps))
+    return _pack(atoms, max_seconds, cps)
 
 
-def _first_clause_cut(buffer: str) -> int:
-    """Offset after the *first* clause-or-sentence boundary (trailing whitespace
-    consumed); 0 if none yet. Releases the opening chunk as early as possible
-    for low first-audio latency."""
-    m = _CONFIRMED_CLAUSE_RE.search(buffer)
-    if m is None:
-        return 0
-    end = m.end()
-    while end < len(buffer) and buffer[end].isspace():
-        end += 1
-    return end
+def _split_safe_tag(buffer: str) -> tuple[str, str]:
+    """Hold back a trailing INCOMPLETE tag (a ``<|`` with no closing ``|>``) so
+    a tag arriving across two ``add_text`` fragments isn't lexed mid-token.
+    Returns ``(safe, held)``."""
+    i = buffer.rfind("<|")
+    if i != -1 and buffer.find("|>", i + 2) == -1:
+        return buffer[:i], buffer[i:]
+    return buffer, ""
+
+
+def _walk(
+    text: str,
+    *,
+    state: str,
+    state_used: bool,
+    emitted_first: bool,
+    fastout: bool,
+    max_seconds: float,
+    cps: float,
+    final: bool,
+) -> tuple[list[str], str, str, bool, bool]:
+    """Causal, tag-aware walk over a tag-safe slice.
+
+    State tags force a cut and propagate as a prefix; ``<|clear|>`` resets;
+    transient tags stay inline. Text cuts at confirmed sentence boundaries (the
+    first chunk at a clause boundary when ``fastout`` and nothing emitted yet).
+    When ``final`` the trailing fragment is emitted; otherwise it's returned as
+    ``leftover`` to re-buffer.
+
+    Returns ``(chunks, leftover, state, state_used, emitted_first)``.
+    """
+    chunks: list[str] = []
+    body = ""  # spoken text + inline transient tags for the chunk-in-progress
+
+    def emit_seg(seg: str) -> None:
+        nonlocal emitted_first, state_used
+        if not emitted_first:
+            seg = seg.lstrip()  # trim the very first chunk's leading whitespace
+        if not seg.strip():
+            return
+        if estimate_seconds(seg, cps) > max_seconds:
+            chunks.extend(state + p for p in _refine_oversized(seg, max_seconds, cps))
+        else:
+            chunks.append(state + seg)
+        state_used = emitted_first = True
+
+    def flush_body() -> None:
+        """Emit ``body`` under the current state (forced cut at a tag, or EOF)."""
+        nonlocal body
+        if not body:
+            return
+        if _TAG_RE.sub("", body).strip():  # real spoken text
+            emit_seg(body)
+        elif chunks:  # transient/whitespace filler → attach to the prior chunk
+            chunks[-1] += body
+        elif body.strip():  # standalone transient with no prior chunk (rare)
+            emit_seg(body)
+        body = ""
+
+    for kind, tok in _iter_tokens(text):
+        if kind == "state":
+            flush_body()
+            if not state:
+                state = tok  # first state (or after a clear)
+            elif not state_used:
+                state += tok  # accumulate consecutive state tags
+            else:
+                state, state_used = tok, False  # replace: prior state was used
+        elif kind == "clear":
+            flush_body()
+            state, state_used = "", False
+        elif kind == "transient":
+            body += tok  # inline, no cut, no budget cost
+        else:  # text
+            body += tok
+            while body:
+                rx = _CLAUSE_RE if (fastout and not emitted_first) else _SENT_RE
+                m = rx.search(body)
+                if not m:
+                    break
+                seg, body = body[: m.end()], body[m.end() :]
+                emit_seg(seg)
+
+    if final:
+        flush_body()
+    return chunks, ("" if final else body), state, state_used, emitted_first
 
 
 class HiggsTextChunker:
-    """:class:`TextChunker` for Higgs TTS. Stateless batch :meth:`chunk`;
-    streaming :meth:`add_text`/:meth:`flush` hold buffer state, so create one
+    """:class:`TextChunker` for Higgs TTS. Batch :meth:`chunk` is stateless;
+    streaming :meth:`add_text`/:meth:`flush` hold buffer + tag state, so use one
     instance per WS session."""
 
     def __init__(self, options: ChunkerOptions) -> None:
         self._max_seconds = options.max_seconds
         self._cps = options.cps
         self._fastout = options.fastout
+        self.codec_frame_rate = options.codec_frame_rate  # read by orchestrator
+        self._buffer = ""
+        self._state = ""  # propagated state-tag prefix run
+        self._state_used = False
         self._emitted_first = False
-        # Read by the orchestrator for CPS (see ChunkerOptions.codec_frame_rate).
-        self.codec_frame_rate: float | None = options.codec_frame_rate
-        self._buffer: str = ""
 
     def chunk(self, text: str, *, cps: float | None = None) -> list[str]:
-        return _chunk(
+        """Batch (stateless, no ``fastout``): ``[]`` for empty input; a 1-element
+        list when it fits one budget, so callers can fast-path to single-shot."""
+        text = (text or "").strip()
+        if not text:
+            return []
+        chunks, *_ = _walk(
             text,
+            state="",
+            state_used=False,
+            emitted_first=False,
+            fastout=False,
             max_seconds=self._max_seconds,
-            cps=cps if cps is not None else self._cps,
+            cps=self._cps if cps is None else cps,
+            final=True,
         )
+        return chunks
+
+    def _drive(self, text: str, *, final: bool) -> tuple[list[str], str]:
+        """Run the shared walk with this instance's tag state + fastout flag."""
+        chunks, leftover, self._state, self._state_used, self._emitted_first = _walk(
+            text,
+            state=self._state,
+            state_used=self._state_used,
+            emitted_first=self._emitted_first,
+            fastout=self._fastout,
+            max_seconds=self._max_seconds,
+            cps=self._cps,
+            final=final,
+        )
+        return chunks, leftover
 
     def add_text(self, text: str) -> list[str]:
-        """Buffer a fragment; emit confirmed-complete chunks (the unconfirmed
-        tail is held for the next ``add_text``/``flush``).
-
-        With ``fastout`` the very first chunk is released at the
-        earliest clause boundary so audio starts ASAP; every later chunk cuts at
-        sentence boundaries (by then audio is playing, so their latency hides).
-        Otherwise every chunk uses sentence boundaries."""
+        """Buffer a fragment; emit confirmed-complete chunks. The unconfirmed
+        tail (and a tag split across fragments) is held for the next call. With
+        ``fastout`` the first chunk is released at the earliest clause boundary;
+        state tags force a cut and propagate as a prefix across chunks."""
         if not text:
             return []
         self._buffer += text
-        out: list[str] = []
-        if self._fastout and not self._emitted_first:
-            cut = _first_clause_cut(self._buffer)
-            if cut == 0:
-                return []
-            confirmed, self._buffer = self._buffer[:cut], self._buffer[cut:]
-            out.extend(_chunk(confirmed, max_seconds=self._max_seconds, cps=self._cps))
-            self._emitted_first = True
-        cut = _last_confirmed_cut(self._buffer)
-        if cut > 0:
-            confirmed, self._buffer = self._buffer[:cut], self._buffer[cut:]
-            out.extend(_chunk(confirmed, max_seconds=self._max_seconds, cps=self._cps))
-            self._emitted_first = True
-        return out
+        safe, held = _split_safe_tag(self._buffer)
+        if not safe:
+            return []  # only a partial tag so far — wait for the rest
+        chunks, leftover = self._drive(safe, final=False)
+        self._buffer = leftover + held
+        return chunks
 
     def flush(self) -> list[str]:
         """Drain whatever remains at end-of-input."""
-        if not self._buffer.strip():
-            self._buffer = ""
+        text, self._buffer = self._buffer.strip(), ""
+        if not text:
             return []
-        out = _chunk(self._buffer, max_seconds=self._max_seconds, cps=self._cps)
-        self._buffer = ""
-        return out
+        return self._drive(text, final=True)[0]
 
     def rearm_fastout(self) -> None:
-        """Re-arm ``fastout`` so the next chunk released is again cut at the
-        earliest clause boundary. The WS handler calls this on ``input.wait``
-        (agent paused, user speaking) so every agent turn opens fast."""
+        """Re-arm ``fastout`` so the next chunk is again cut at the earliest
+        clause boundary — the WS handler calls this on ``input.wait`` (agent
+        paused) so every turn opens fast. Tag ``state`` is left intact."""
         self._emitted_first = False
 
 

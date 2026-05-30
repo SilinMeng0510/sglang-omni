@@ -197,6 +197,114 @@ def test_default_no_fastout_is_sentence_only() -> None:
     assert c.add_text("。") == ["一，二。"]
 
 
+# ---------------------------------------------------------------------------
+# Control tags: state propagation, clear reset, transient inline
+# ---------------------------------------------------------------------------
+
+
+def test_batch_state_tag_forces_cut_and_propagates() -> None:
+    # An emotion tag forces a boundary at the tag and prefixes every following
+    # chunk; text before it stays under the prior (neutral) state.
+    assert chunk("你好<|emotion:sad|>再见。世界。") == [
+        "你好",
+        "<|emotion:sad|>再见。",
+        "<|emotion:sad|>世界。",
+    ]
+
+
+def test_batch_clear_tag_resets_state_and_is_dropped() -> None:
+    # The space before <|clear|> stays with the preceding chunk (matches the
+    # batch whitespace rule: inter-piece whitespace is preserved verbatim).
+    assert chunk("<|emotion:joy|>Hello. <|clear|>World.") == [
+        "<|emotion:joy|>Hello. ",
+        "World.",
+    ]
+
+
+def test_batch_transient_tag_stays_inline_no_cut() -> None:
+    # sfx/pause are transient: inline, no boundary, no budget cost.
+    assert chunk("Hi<|sfx:laugh|> there. Bye.") == ["Hi<|sfx:laugh|> there.", " Bye."]
+
+
+def test_streaming_state_propagates_across_add_text() -> None:
+    c = HiggsTextChunker(_OPTS)
+    out = c.add_text("<|emotion:joy|>你好。")
+    out += c.add_text("世界。")
+    out += c.flush()
+    # The carried state prefixes the second add_text's chunk too.
+    assert out == ["<|emotion:joy|>你好。", "<|emotion:joy|>世界。"]
+
+
+def test_streaming_tag_split_across_fragments_is_held() -> None:
+    # A tag arriving in two pieces must not be lexed mid-token.
+    c = HiggsTextChunker(_OPTS)
+    out = c.add_text("你好。<|emo")  # partial tag held back
+    assert out == ["你好。"]
+    out += c.add_text("tion:sad|>再见。")  # completes the tag
+    out += c.flush()
+    assert out == ["你好。", "<|emotion:sad|>再见。"]
+
+
+def test_streaming_clear_resets_state_across_add_text() -> None:
+    c = HiggsTextChunker(_OPTS)
+    out = c.add_text("<|emotion:joy|>A。")
+    out += c.add_text("<|clear|>B。")
+    out += c.flush()
+    assert out == ["<|emotion:joy|>A。", "B。"]
+
+
+def test_fastout_with_state_tag_prefixes_every_chunk() -> None:
+    c = HiggsTextChunker(ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True))
+    out = c.add_text("<|emotion:joy|>一，二。三，四。")
+    out += c.flush()
+    # First chunk cut at the clause boundary; emotion prefix on all.
+    assert out == [
+        "<|emotion:joy|>一，",
+        "<|emotion:joy|>二。",
+        "<|emotion:joy|>三，四。",
+    ]
+
+
+def test_refine_never_splits_a_number() -> None:
+    # No tier may cut inside 3.14 / 3:15 / 100,000,000 — not the clause tier
+    # (ASCII , : . excluded) nor the per-char fallback (numbers stay atomic).
+    c = HiggsTextChunker(ChunkerOptions(max_seconds=8.0, cps=10.0))
+    for num in ("3.14", "3:15", "100,000,000", "1,234.56"):
+        # bury the number in a long, punctuation-free, space-free CJK run so the
+        # only thing that can split it is the per-character fallback tier
+        for pad in (74, 76, 78, 80):
+            src = "啊" * pad + num + "啊" * 4
+            out = c.chunk(src, cps=10.0)
+            assert "".join(out) == src  # reconstruction
+            assert any(num in piece for piece in out), (num, pad, out)
+
+
+def test_refine_keeps_a_long_url_whole() -> None:
+    # The realistic per-char case: a single URL longer than the budget. It must
+    # stay one atom (never cut mid-URL), even if that chunk exceeds max_seconds.
+    c = HiggsTextChunker(ChunkerOptions(max_seconds=8.0, cps=10.0))
+    url = "https://example.com/" + "very/long/path/segment/" * 6
+    out = c.chunk("详见" + url, cps=10.0)
+    assert any(url in piece for piece in out), out
+    assert "".join(out) == "详见" + url
+
+
+def test_realistic_phone_stays_in_one_chunk() -> None:
+    # In real text a phone number is short and under budget, so it never even
+    # reaches refine — no special handling needed for the common case.
+    c = HiggsTextChunker(ChunkerOptions(max_seconds=8.0, cps=10.0))
+    assert c.chunk("请拨打510-320-7725联系我们", cps=10.0) == ["请拨打510-320-7725联系我们"]
+
+
+def test_refine_keeps_cjk_clause_split() -> None:
+    # The clause tier still splits an oversized CJK sentence at 、，；： (these
+    # are non-ASCII, so number protection doesn't disable them).
+    c = HiggsTextChunker(ChunkerOptions(max_seconds=8.0, cps=10.0))
+    out = c.chunk("甲乙丙，" * 30, cps=10.0)
+    assert len(out) > 1
+    assert all(piece.endswith("，") for piece in out)
+
+
 def test_streaming_options_max_seconds_respected() -> None:
     # Custom small budget should force tier-refine on oversized sentences.
     c = HiggsTextChunker(ChunkerOptions(max_seconds=2.0, cps=10.0))
