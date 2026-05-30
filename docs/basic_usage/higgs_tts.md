@@ -4,33 +4,50 @@ This guide uses [`boson-sglang/higgs-audio-v3-tts-4b-base`](https://huggingface.
 
 ## Prerequisites
 
-```bash
-docker pull frankleeeee/sglang-omni:dev
-docker run -it --shm-size 32g --gpus all frankleeeee/sglang-omni:dev /bin/zsh
-```
+Build the runtime image from the repo's Dockerfile. This is the recommended,
+reproducible path — it starts from the tuned CUDA / SGLang / FlashInfer base and
+installs `sglang-omni` on top **without** reinstalling the base's SGLang /
+FlashInfer build (reinstalling them from PyPI would replace the tuned build).
+The image's entrypoint is `sgl-omni`.
 
 ```bash
 git clone https://github.com/sgl-project/sglang-omni.git
 cd sglang-omni
-uv venv .venv -p 3.12 && source .venv/bin/activate
-uv pip install -v .
+docker build -f docker/Dockerfile.higgs-runtime -t sglang-omni:higgs .
+```
 
-# Higgs TTS model is private; export your HF token before downloading.
+The Higgs TTS model is private; download it on the host with your HF token (the
+cache is mounted into the container at launch):
+
+```bash
 export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 hf download boson-sglang/higgs-audio-v3-tts-4b-base
 ```
 
+> **Installing into an existing environment instead of building the image?** Use
+> the same exclude list the Dockerfile uses, so you don't overwrite the tuned
+> SGLang / FlashInfer stack:
+> ```bash
+> printf '%s\n' sglang torch torchvision flashinfer flashinfer-python \
+>   flashinfer-jit-cache > /tmp/excludes.txt
+> uv pip install -v -e . --excludes /tmp/excludes.txt
+> ```
+
 ## Launch the Server
 
 ```bash
-sgl-omni serve \
+docker run --gpus all --shm-size 32g -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  sglang-omni:higgs serve \
   --model-path boson-sglang/higgs-audio-v3-tts-4b-base \
   --config examples/configs/higgs_tts.yaml \
-  --port 8000
+  --host 0.0.0.0 --port 8000
 ```
 
-The audio codec is bundled in the TTS checkpoint and loads automatically from
-`--model-path`; it can't be swapped for a different codec.
+`serve` is passed to the image's `sgl-omni` entrypoint, and `--config` resolves
+against the image's working directory (`/workspace/sglang-omni`). The audio codec
+is bundled in the TTS checkpoint and loads automatically from `--model-path`; it
+can't be swapped for a different codec.
 
 ## Use Curl
 
