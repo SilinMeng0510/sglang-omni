@@ -18,7 +18,7 @@ import torchaudio
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
-from sglang_omni.models.higgs_tts._vendored.higgs_audio_v2_tokenizer_hf import (
+from sglang_omni.models.higgs_tts.audio.tokenizer import (
     HiggsAudioV2TokenizerConfig,
     HiggsAudioV2TokenizerModel,
 )
@@ -32,8 +32,7 @@ _CODEC_IN_TTS_CKPT_PREFIX = "tied.embedding.modality_embeddings.0.model."
 # https://huggingface.co/bosonai/higgs-audio-v2-tokenizer/blob/main/config.json.
 # Read once here; reused for the class constants below and in from_pretrained.
 _BUNDLED_CODEC_CONFIG = json.loads(
-    (Path(__file__).parent / "_vendored" / "higgs_audio_v2_tokenizer_config.json")
-    .read_text()
+    (Path(__file__).parent / "config.json").read_text()
 )
 
 

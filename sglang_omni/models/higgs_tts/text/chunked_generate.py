@@ -15,7 +15,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
 
 from sglang_omni.client.types import GenerateChunk, GenerateRequest
-from sglang_omni.models.higgs_tts.text_chunker import ChunkerOptions, TextChunker
+from sglang_omni.models.higgs_tts.text.chunker import ChunkerOptions, TextChunker
 
 if TYPE_CHECKING:
     from sglang_omni.client.client import Client

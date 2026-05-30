@@ -85,7 +85,7 @@ class SGLModelRunner(ModelRunner):
         from sglang_omni.models.fishaudio_s2_pro.sglang_model import (
             S2ProSGLangTextModel,
         )
-        from sglang_omni.models.higgs_tts.model import HiggsTTSModel
+        from sglang_omni.models.higgs_tts.sglang_model import HiggsTTSModel
         from sglang_omni.models.llada2_uni.components.thinker import LLaDA2MoeModelLM
         from sglang_omni.models.ming_omni.registration import (
             register_ming_hf_config,
