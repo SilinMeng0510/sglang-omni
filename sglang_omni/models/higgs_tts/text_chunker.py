@@ -51,8 +51,8 @@ class ChunkerOptions:
 
 # Sentence / clause boundary matchers.
 _SENT_RE, _CLAUSE_RE = (
-    regex.compile(rf"(?:[{cls}…--[\x00-\x7f]]|[.!?](?=\s))", regex.V1)
-    for cls in (r"\p{STerm}", r"\p{Term}")
+    regex.compile(rf"(?:[{cls}…--[\x00-\x7f]]|[{asc}](?=\s))", regex.V1)
+    for cls, asc in ((r"\p{STerm}", r".!?"), (r"\p{Term}", r".!?,;:"))
 )
 
 _REFINE_TIERS = tuple(

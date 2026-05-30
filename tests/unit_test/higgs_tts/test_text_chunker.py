@@ -167,6 +167,26 @@ def test_fastout_releases_first_clause_then_sentences() -> None:
     assert c.flush() == []
 
 
+def test_fastout_first_chunk_cuts_at_ascii_comma() -> None:
+    # ASCII "," before whitespace is a clause boundary too (not just CJK "，"),
+    # so an English opening clause is released early for low first-audio latency.
+    c = HiggsTextChunker(
+        ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True)
+    )
+    out = c.add_text("Hello everyone, welcome to the show!") + list(c.flush())
+    assert out == ["Hello everyone,", "welcome to the show!"]
+
+
+def test_fastout_first_chunk_never_splits_inside_a_number() -> None:
+    # The comma in "1,288" has no following space, so even as the first fastout
+    # chunk it stays intact; the cut lands on the clause comma after "yuan".
+    c = HiggsTextChunker(
+        ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True)
+    )
+    out = c.add_text("Original price 1,288 yuan, going fast!") + list(c.flush())
+    assert out == ["Original price 1,288 yuan,", "going fast!"]
+
+
 def test_fastout_only_affects_the_first_chunk() -> None:
     c = HiggsTextChunker(
         ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True)
