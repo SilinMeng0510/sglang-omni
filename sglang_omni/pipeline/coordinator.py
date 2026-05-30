@@ -264,11 +264,7 @@ class Coordinator:
         # Update state
         info.state = RequestState.ABORTED
 
-        # Resolve future with error
-        if request_id in self._completion_futures:
-            self._completion_futures[request_id].set_exception(
-                asyncio.CancelledError(f"Request {request_id} aborted")
-            )
+        # Signal the request's consumer
         if request_id in self._stream_queues:
             await self._stream_queues[request_id].put(
                 CompleteMessage(
@@ -277,6 +273,10 @@ class Coordinator:
                     success=False,
                     error="aborted",
                 )
+            )
+        elif request_id in self._completion_futures:
+            self._completion_futures[request_id].set_exception(
+                asyncio.CancelledError(f"Request {request_id} aborted")
             )
 
         # Cleanup request tracking
