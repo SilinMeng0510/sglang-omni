@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import logging
 import time
@@ -57,6 +58,14 @@ from sglang_omni.serve.protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+_AUDIO_MAGIC_PREFIXES = (
+    b"RIFF",  # wav
+    b"fLaC",  # flac
+    b"OggS",  # ogg/opus
+    b"ID3",  # mp3 with ID3
+    b"\x1aE\xdf\xa3",  # webm/matroska
+)
 MIME_TO_FORMAT = {mime: fmt for fmt, mime in FORMAT_MIME_TYPES.items()}
 STREAM_DONE_SENTINEL = "[DONE]"
 _SPEECH_STREAM_CONFIG_TIMEOUT = 10.0
@@ -1166,7 +1175,45 @@ def _select_speech_audio_delta(
     return audio[emitted_samples:], total_samples
 
 
-_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+def _strip_base64_whitespace(value: str) -> str:
+    return "".join(value.split())
+
+
+def _decode_base64_candidate(value: str) -> bytes | None:
+    data = _strip_base64_whitespace(value)
+    if len(data) < 16:
+        return None
+    padded = data + ("=" * (-len(data) % 4))
+    try:
+        return base64.b64decode(padded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _looks_like_audio_bytes(data: bytes) -> bool:
+    if data.startswith(_AUDIO_MAGIC_PREFIXES):
+        return True
+    if data.startswith((b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")):
+        return True
+    return len(data) >= 12 and data[4:8] == b"ftyp"
+
+
+def _base64_reference_from_ref_audio(ref_audio: str) -> dict[str, Any] | None:
+    value = ref_audio.strip()
+    if value.lower().startswith("data:"):
+        header, sep, data = value.partition(",")
+        if sep and ";base64" in header.lower():
+            media_type = header[5:].split(";", 1)[0] or "audio/wav"
+            return {
+                "base64": _strip_base64_whitespace(data),
+                "media_type": media_type,
+            }
+        return None
+
+    decoded = _decode_base64_candidate(value)
+    if decoded is None or not _looks_like_audio_bytes(decoded):
+        return None
+    return {"base64": _strip_base64_whitespace(value), "media_type": "audio/wav"}
 
 
 def _speech_reference_from_ref_audio(
@@ -1174,23 +1221,11 @@ def _speech_reference_from_ref_audio(
 ) -> dict[str, Any]:
     """Map a ``ref_audio`` string to a higgs-style reference dict.
 
-    ``ref_audio`` is overloaded (URL / path / data: URI / raw base64). The audio
-    loader fetches URLs and reads local paths via ``audio_path``, but only
-    decodes base64 through the ``{base64, media_type}`` dict form — so base64
-    must be unwrapped here rather than handed through as ``audio_path`` (which
-    would be treated as a filename and fail). Raw base64 carries no scheme, so we
-    separate it from a path by requiring a long, pure-base64 string; no real path
-    is hundreds of base64 characters long.
+    ``ref_audio`` is overloaded (URL / path / data: URI / raw base64). Base64
+    must be unwrapped here instead of being handed through as ``audio_path``,
+    which the Higgs loader treats as a filename or URL.
     """
-    if ref_audio.startswith("data:") and ";base64," in ref_audio:
-        header, data = ref_audio.split(";base64,", 1)
-        ref = {"base64": data, "media_type": header[len("data:") :] or "audio/wav"}
-    elif ref_audio.startswith(("http://", "https://", "file://", "/", "./", "~")):
-        ref = {"audio_path": ref_audio}
-    elif len(ref_audio) >= 256 and len(ref_audio) % 4 == 0 and _BASE64_RE.match(ref_audio):
-        ref = {"base64": ref_audio, "media_type": "audio/wav"}
-    else:
-        ref = {"audio_path": ref_audio}
+    ref = _base64_reference_from_ref_audio(ref_audio) or {"audio_path": ref_audio}
     if ref_text is not None:
         ref["text"] = ref_text
     return ref

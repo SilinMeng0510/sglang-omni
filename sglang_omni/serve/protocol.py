@@ -193,7 +193,7 @@ class CreateSpeechRequest(BaseModel):
     instructions: str | None = None  # style/emotion instructions
 
     # Voice cloning parameters
-    ref_audio: str | None = None  # path or URL to reference audio
+    ref_audio: str | None = None  # path, URL, data URI, or base64 reference audio
     ref_text: str | None = None  # transcript of reference audio
     references: list[SpeechReference] | None = None  # S2-Pro-style refs
     x_vector_only_mode: bool | None = None

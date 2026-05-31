@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from typing import Any
 
@@ -267,6 +268,70 @@ def test_speech_request_uses_higgs_tts_sampling_defaults() -> None:
     assert request.sampling.top_p == 0.95
     assert request.sampling.top_k == 50
     assert request.sampling.repetition_penalty == 1.0
+
+
+def test_speech_request_maps_ref_audio_raw_base64() -> None:
+    ref_audio = base64.b64encode(b"RIFF....WAVE").decode("ascii")
+    req = CreateSpeechRequest(
+        input="hello",
+        ref_audio=ref_audio,
+        ref_text="reference transcript",
+    )
+
+    gen_req = build_speech_generate_request(req, "higgs-tts")
+
+    assert gen_req.prompt == {
+        "text": "hello",
+        "references": [
+            {
+                "base64": ref_audio,
+                "media_type": "audio/wav",
+                "text": "reference transcript",
+            }
+        ],
+    }
+
+
+def test_speech_request_keeps_ref_audio_url_as_audio_path() -> None:
+    req = CreateSpeechRequest(
+        input="hello",
+        ref_audio="https://example.com/ref.wav",
+        ref_text="reference transcript",
+    )
+
+    gen_req = build_speech_generate_request(req, "higgs-tts")
+
+    assert gen_req.prompt == {
+        "text": "hello",
+        "references": [
+            {
+                "audio_path": "https://example.com/ref.wav",
+                "text": "reference transcript",
+            }
+        ],
+    }
+
+
+def test_speech_request_maps_ref_audio_data_uri_base64() -> None:
+    ref_audio = base64.b64encode(b"OggS....").decode("ascii")
+    req = CreateSpeechRequest(
+        input="hello",
+        ref_audio=f"data:audio/ogg;base64,{ref_audio}",
+        ref_text="reference transcript",
+    )
+
+    gen_req = build_speech_generate_request(req, "higgs-tts")
+
+    assert gen_req.prompt == {
+        "text": "hello",
+        "references": [
+            {
+                "base64": ref_audio,
+                "media_type": "audio/ogg",
+                "text": "reference transcript",
+            }
+        ],
+    }
 
 
 def test_speech_request_preserves_stage_params() -> None:
