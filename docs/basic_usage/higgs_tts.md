@@ -83,26 +83,6 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   --output output.wav
 ```
 
-### Inline (base64) Reference Audio
-
-Besides `references[].audio_path` (local path or HTTP URL), reference audio can be
-passed inline with the top-level `ref_audio` field — useful when the client holds
-the audio in memory and there is no shared filesystem or URL. `ref_audio` accepts
-a `data:` URI, a raw base64 string, an `http(s)://` / `file://` URL, or a local
-path; pair it with `ref_text` for the transcript. This works on both the HTTP and
-WebSocket (`session.config`) paths.
-
-```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{
-    "input": "Get the trust fund to the bank early.",
-    "ref_audio": "data:audio/wav;base64,UklGRiQAAABXQVZF...",
-    "ref_text": "We asked over twenty different people, and they all said it was his."
-  }' \
-  --output output.wav
-```
-
 ### Streaming
 
 Set `"stream": true` to receive audio chunks over Server-Sent Events (SSE).
@@ -131,11 +111,95 @@ event. The stream ends with `data: [DONE]`.
 The streaming chunk policy is configured server-side by the Higgs TTS pipeline.
 Clients should not pass model-internal chunk sizing parameters for normal use.
 
+## Use Python
+
+### Voice Cloning
+
+```python
+import base64
+
+import requests
+
+REFERENCE_PATH = "reference.wav"  # local reference audio
+REFERENCE_TEXT = "We asked over twenty different people, and they all said it was his."
+SPEECH_INPUT = "Get the trust fund to the bank early."
+
+# Inline the reference audio as base64. To point at a file or URL instead, use
+# {"audio_path": "/path/or/https://...", "text": REFERENCE_TEXT}.
+with open(REFERENCE_PATH, "rb") as f:
+    ref_b64 = base64.b64encode(f.read()).decode()
+
+REFERENCES = [{"base64": ref_b64, "media_type": "audio/wav", "text": REFERENCE_TEXT}]
+
+resp = requests.post(
+    "http://localhost:8000/v1/audio/speech",
+    json={
+        "input": SPEECH_INPUT,
+        "references": REFERENCES,
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "top_k": 50,
+        "max_new_tokens": 1024,
+    },
+)
+resp.raise_for_status()
+with open("output.wav", "wb") as f:
+    f.write(resp.content)
+```
+
+### Streaming Request
+
+```python
+import base64
+import json
+import wave
+
+import requests
+
+payload = {
+    "input": SPEECH_INPUT,
+    "references": REFERENCES,  # from the Voice Cloning example above
+    "stream": True,
+    "response_format": "pcm",
+    "max_new_tokens": 1024,
+}
+
+pcm_chunks = []
+sample_rate = 24000
+
+with requests.post(
+    "http://localhost:8000/v1/audio/speech",
+    json=payload,
+    stream=True,
+    timeout=600,
+) as stream:
+    stream.raise_for_status()
+    for line in stream.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: "):
+            continue
+        data = line[len("data:") :].lstrip()
+        if data == "[DONE]":
+            break
+        event = json.loads(data)
+        audio = event.get("audio")
+        if audio is None:
+            continue
+        sample_rate = audio.get("sample_rate", sample_rate)
+        pcm_chunks.append(base64.b64decode(audio["data"]))
+
+with wave.open("output_stream.wav", "wb") as wav:
+    wav.setnchannels(1)
+    wav.setsampwidth(2)  # int16 PCM
+    wav.setframerate(sample_rate)
+    wav.writeframes(b"".join(pcm_chunks))
+```
+
 ### Streaming Text Input
 
 Use the WebSocket endpoint when text arrives incrementally (e.g. token-by-token
 from an upstream LLM) and the server should start synthesizing completed
-sentences before the full text is available:
+sentences before the full text is available. Voice cloning works the same as on
+the HTTP path — put the reference in `session.config`:
 
 ```python
 import asyncio
@@ -154,6 +218,10 @@ async def main():
                     "response_format": "pcm",
                     "stream_audio": True,
                     "fastout": True,  # release the first chunk early (see below)
+                    # Voice cloning: session.config takes the same `references`
+                    # list as the HTTP request (REFERENCES from the Voice Cloning
+                    # example above). Omit it for zero-shot.
+                    "references": REFERENCES,
                 }
             )
         )
@@ -222,104 +290,6 @@ replies `{"type": "generation.stopped", "chunk": K}`. The engine retains the ful
 per-session history, so `K` may be **any** previously-heard chunk — not only the
 most recent few.
 
-### Text Normalization
-
-On every path (curl, Python, WebSocket), CJK / full-width punctuation in the
-`input` text is normalized to its ASCII form just before synthesis — e.g.
-`。→ .`, `，→ ,`, `！→ !`, `？→ ?`, `（）→ ()`, `“”→ "` — so the model sees one
-consistent punctuation style. Spoken content is unchanged. Normalization runs
-*after* sentence/chunk splitting, so it does not affect where the text is split
-(boundaries are computed on the original punctuation).
-
-## Use Python
-
-### Voice Cloning
-
-```python
-import requests
-
-REFERENCE_AUDIO = "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav"
-REFERENCE_TEXT = "We asked over twenty different people, and they all said it was his."
-SPEECH_INPUT = "Get the trust fund to the bank early."
-
-resp = requests.post(
-    "http://localhost:8000/v1/audio/speech",
-    json={
-        "input": SPEECH_INPUT,
-        "references": [{"audio_path": REFERENCE_AUDIO, "text": REFERENCE_TEXT}],
-        "temperature": 0.8,
-        "top_p": 0.95,
-        "top_k": 50,
-        "max_new_tokens": 1024,
-    },
-)
-resp.raise_for_status()
-with open("output.wav", "wb") as f:
-    f.write(resp.content)
-```
-
-### Pre-encoded Reference Codes
-
-For high-throughput pipelines (e.g. RL rollout) where the same reference audio is reused across many requests, you can encode the reference audio offline and pass the discrete codes directly via `reference_codes` — this skips the server-side codec encode step. Shape must be `[T, num_codebooks=8]`.
-
-```python
-resp = requests.post(
-    "http://localhost:8000/v1/audio/speech",
-    json={
-        "input": SPEECH_INPUT,
-        "reference_codes": codes_TN,  # [T, 8] int list, pre-delay-pattern
-        "reference_text": REFERENCE_TEXT,
-    },
-)
-```
-
-### Streaming Request
-
-```python
-import base64
-import json
-import wave
-
-import requests
-
-payload = {
-    "input": SPEECH_INPUT,
-    "references": [{"audio_path": REFERENCE_AUDIO, "text": REFERENCE_TEXT}],
-    "stream": True,
-    "response_format": "pcm",
-    "max_new_tokens": 1024,
-}
-
-pcm_chunks = []
-sample_rate = 24000
-
-with requests.post(
-    "http://localhost:8000/v1/audio/speech",
-    json=payload,
-    stream=True,
-    timeout=600,
-) as stream:
-    stream.raise_for_status()
-    for line in stream.iter_lines(decode_unicode=True):
-        if not line or not line.startswith("data: "):
-            continue
-        data = line[len("data:") :].lstrip()
-        if data == "[DONE]":
-            break
-        event = json.loads(data)
-        audio = event.get("audio")
-        if audio is None:
-            continue
-        sample_rate = audio.get("sample_rate", sample_rate)
-        pcm_chunks.append(base64.b64decode(audio["data"]))
-
-with wave.open("output_stream.wav", "wb") as wav:
-    wav.setnchannels(1)
-    wav.setsampwidth(2)  # int16 PCM
-    wav.setframerate(sample_rate)
-    wav.writeframes(b"".join(pcm_chunks))
-```
-
 ## Request Parameters
 
 | Parameter | Type | Default | Description |
@@ -331,8 +301,6 @@ with wave.open("output_stream.wav", "wb") as wav:
 | `references` | list | `null` | Reference audio for voice cloning; each item has `audio_path` (local path or HTTP URL) and `text` (transcript) |
 | `ref_audio` | string | `null` | Inline reference audio: `data:` URI, raw base64, `http(s)://` / `file://` URL, or local path (alternative to `references`) |
 | `ref_text` | string | `null` | Transcript of `ref_audio` |
-| `reference_codes` | list[list[int]] | `null` | Pre-encoded discrete codes, shape `[T, 8]` — alternative to `references[0].audio_path` |
-| `reference_text` | string | `null` | Transcript of reference audio when supplying `reference_codes` |
 | `max_new_tokens` | int | `2048` | Maximum number of generated multi-codebook steps |
 | `temperature` | float | `0.8` | Sampling temperature |
 | `top_p` | float | `0.95` | Top-p sampling |
