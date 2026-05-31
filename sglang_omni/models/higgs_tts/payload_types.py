@@ -33,7 +33,7 @@ class HiggsTtsState:
     codebook_size: int = 1026  # 1024 data + <|boc|> + <|eoc|>
 
     # generation params
-    max_new_tokens: int = 2048
+    max_new_tokens: int = 1024
     temperature: float = 1.0
     top_p: float | None = None
     top_k: int | None = None
@@ -100,7 +100,7 @@ class HiggsTtsState:
             reference_text_token_ids=data.get("reference_text_token_ids"),
             num_codebooks=data.get("num_codebooks", 8),
             codebook_size=data.get("codebook_size", 1026),
-            max_new_tokens=data.get("max_new_tokens", 2048),
+            max_new_tokens=data.get("max_new_tokens", 1024),
             temperature=data.get("temperature", 1.0),
             top_p=data.get("top_p"),
             top_k=data.get("top_k"),

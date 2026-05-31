@@ -229,7 +229,7 @@ def create_preprocessing_executor(
             reference_text_token_ids=reference_text_token_ids,
             num_codebooks=num_codebooks,
             codebook_size=codebook_size,
-            max_new_tokens=int(params.get("max_new_tokens", 2048)),
+            max_new_tokens=int(params.get("max_new_tokens", 1024)),
             temperature=float(params.get("temperature", 1.0)),
             top_p=params.get("top_p"),
             top_k=params.get("top_k"),
@@ -300,7 +300,7 @@ def create_sglang_tts_engine_executor(
     model_path: str,
     *,
     device: str = "cuda:0",
-    max_new_tokens: int | None = 2048,
+    max_new_tokens: int | None = 1024,
     max_history_chunks: int = 4,
     server_args_overrides: dict[str, Any] | None = None,
 ):

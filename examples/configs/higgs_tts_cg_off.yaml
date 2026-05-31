@@ -18,7 +18,7 @@ stages:
     factory: sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor
     factory_args:
       device: cuda
-      max_new_tokens: 2048
+      max_new_tokens: 1024
       server_args_overrides:
         disable_cuda_graph: true
     gpu: 0

@@ -108,7 +108,7 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     assert captured["cuda_graph_decoder_kwargs"] == {"max_batch_size": 16}
     assert captured["init_device_graphs_called"] is True
     assert captured["server_args"].disable_overlap_schedule is True
-    assert captured["adapter_kwargs"]["max_new_tokens_cap"] == 2048
+    assert captured["adapter_kwargs"]["max_new_tokens_cap"] == 1024
     # Engine-side continuity wiring: a tokenizer adapter + session store are
     # handed to the scheduler adapters.
     assert captured["adapter_kwargs"]["adapter"] is not None

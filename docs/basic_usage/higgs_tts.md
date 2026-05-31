@@ -301,7 +301,7 @@ most recent few.
 | `references` | list | `null` | Reference audio for voice cloning; each item has `audio_path` (local path or HTTP URL) and `text` (transcript) |
 | `ref_audio` | string | `null` | Inline reference audio: `data:` URI, raw base64, `http(s)://` / `file://` URL, or local path (alternative to `references`) |
 | `ref_text` | string | `null` | Transcript of `ref_audio` |
-| `max_new_tokens` | int | `2048` | Maximum number of generated multi-codebook steps |
+| `max_new_tokens` | int | `1024` | Per-chunk generation cap (one sentence), not a whole-input budget |
 | `temperature` | float | `0.8` | Sampling temperature |
 | `top_p` | float | `0.95` | Top-p sampling |
 | `top_k` | int | `50` | Top-k sampling |

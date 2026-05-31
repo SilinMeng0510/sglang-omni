@@ -239,7 +239,7 @@ class HiggsResourceManager:
 
 
 class HiggsIterationController:
-    def __init__(self, tree_cache: Any, max_new_tokens: int = 2048) -> None:
+    def __init__(self, tree_cache: Any, max_new_tokens: int = 1024) -> None:
         self.tree_cache = tree_cache
         self._max_new_tokens = int(max_new_tokens)
 
