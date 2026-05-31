@@ -25,7 +25,7 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang_omni.models.higgs_tts.utils import BOC_ID, EOC_ID
+from sglang_omni.models.higgs_tts.audio.utils import BOC_ID, EOC_ID
 
 # Sentinel returned by ``step`` after ``generation_done``; engine treats as stop.
 STOP_CODE = -1

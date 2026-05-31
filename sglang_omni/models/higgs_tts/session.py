@@ -63,8 +63,14 @@ class SessionState:
 
 
 class SessionStore:
-    """Thread-safe per-``session_id`` store. Bounded three ways so a vanished
-    client can't leak: explicit :meth:`evict`, idle TTL, and an LRU cap."""
+    """Thread-safe per-``session_id`` store keeping each session's **full**
+    committed history (so a barge-in can roll back to any heard chunk).
+
+    ``max_history_chunks`` is the **conditioning window** — how many trailing
+    chunks :meth:`history_for` feeds into the next prompt — NOT a storage cap.
+    Per-session segment count is unbounded by design; growth is bounded only so
+    a vanished client can't leak, three ways: explicit :meth:`evict` (serve
+    calls it on ``input.done``), idle TTL, and an LRU session cap."""
 
     def __init__(
         self,
@@ -100,8 +106,16 @@ class SessionStore:
         index: int = -1,
     ) -> None:
         """Append a generated chunk to the session. A chunk with no codes is
-        dropped; only the most-recent ``max_history_chunks`` are kept. ``index``
-        is the chunk's serve-side sentence index, recorded for :meth:`truncate_after`."""
+        dropped. ``index`` is the chunk's serve-side sentence index, recorded for
+        :meth:`truncate_after`.
+
+        The **full** committed history is retained (no per-commit eviction) so a
+        barge-in can roll back to *any* previously-heard chunk, even one older
+        than the ``max_history_chunks`` conditioning window — that window is
+        applied at read time in :meth:`history_for`, not here. Output is
+        unaffected: the prompt still sees only the last ``max_history_chunks``
+        chunks. Growth is bounded by idle TTL, the LRU session cap, and the
+        ``input.done`` evict, not by chunk count."""
         if not codes_delayed:
             return
         with self._lock:
@@ -116,10 +130,6 @@ class SessionStore:
                     index=index,
                 )
             )
-            if self.max_history_chunks > 0:
-                excess = len(state.segments) - self.max_history_chunks
-                if excess > 0:
-                    del state.segments[:excess]
             state.last_used_s = time.monotonic()
             self._enforce_capacity_locked()
 

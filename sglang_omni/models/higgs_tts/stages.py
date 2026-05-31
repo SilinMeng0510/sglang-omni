@@ -24,29 +24,29 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import torch
 import torchaudio.functional as F_audio
+from huggingface_hub import snapshot_download
 from tokenizers import Tokenizer
 from transformers import PreTrainedTokenizerFast
 
-from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
+from sglang_omni.models.higgs_tts.audio import HiggsAudioCodec
+from sglang_omni.models.higgs_tts.audio.utils import (
+    apply_delay_pattern,
+    get_or_load_codec,
+    load_audio_to_24k,
+    reverse_delay_pattern,
+    to_codes_TN,
+)
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.request_builders import make_higgs_scheduler_adapters
 from sglang_omni.models.higgs_tts.session import SessionStore
-from sglang_omni.models.higgs_tts.text_normalizer import normalize_punctuation
-from sglang_omni.models.higgs_tts.text_tokenizer import HiggsTokenizerAdapter
-from sglang_omni.models.higgs_tts.utils import (
-    apply_delay_pattern,
-    get_or_load_codec,
-    load_audio_to_24k,
-    resolve_checkpoint,
-    reverse_delay_pattern,
-    to_codes_TN,
-    truncate_rope_to_bf16,
-)
+from sglang_omni.models.higgs_tts.text.normalizer import normalize_punctuation
+from sglang_omni.models.higgs_tts.text.tokenizer import HiggsTokenizerAdapter
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
 from sglang_omni.scheduling.messages import OutgoingMessage
@@ -59,6 +59,23 @@ from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
 
 logger = logging.getLogger(__name__)
+
+
+def truncate_rope_to_bf16(model: torch.nn.Module) -> None:
+    """bf16-truncate sglang's fp32 ``cos_sin_cache`` in-place (stored as fp32)
+    to match Higgs's bf16 training-time RoPE."""
+    for module in model.modules():
+        if hasattr(module, "cos_sin_cache"):
+            module.cos_sin_cache.data = module.cos_sin_cache.data.to(
+                torch.bfloat16
+            ).to(torch.float32)
+
+
+def resolve_checkpoint(checkpoint: str) -> str:
+    """Local dir or HF repo id → local snapshot path."""
+    if Path(checkpoint).is_dir():
+        return checkpoint
+    return snapshot_download(checkpoint)
 
 
 # Reject ref audio past this many seconds

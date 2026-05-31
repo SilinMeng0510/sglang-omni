@@ -4,33 +4,50 @@ This guide uses [`boson-sglang/higgs-audio-v3-tts-4b-base`](https://huggingface.
 
 ## Prerequisites
 
-```bash
-docker pull frankleeeee/sglang-omni:dev
-docker run -it --shm-size 32g --gpus all frankleeeee/sglang-omni:dev /bin/zsh
-```
+Build the runtime image from the repo's Dockerfile. This is the recommended,
+reproducible path — it starts from the tuned CUDA / SGLang / FlashInfer base and
+installs `sglang-omni` on top **without** reinstalling the base's SGLang /
+FlashInfer build (reinstalling them from PyPI would replace the tuned build).
+The image's entrypoint is `sgl-omni`.
 
 ```bash
 git clone https://github.com/sgl-project/sglang-omni.git
 cd sglang-omni
-uv venv .venv -p 3.12 && source .venv/bin/activate
-uv pip install -v .
+docker build -f docker/Dockerfile.higgs-runtime -t sglang-omni:higgs .
+```
 
-# Higgs TTS model is private; export your HF token before downloading.
+The Higgs TTS model is private; download it on the host with your HF token (the
+cache is mounted into the container at launch):
+
+```bash
 export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 hf download boson-sglang/higgs-audio-v3-tts-4b-base
 ```
 
+> **Installing into an existing environment instead of building the image?** Use
+> the same exclude list the Dockerfile uses, so you don't overwrite the tuned
+> SGLang / FlashInfer stack:
+> ```bash
+> printf '%s\n' sglang torch torchvision flashinfer flashinfer-python \
+>   flashinfer-jit-cache > /tmp/excludes.txt
+> uv pip install -v -e . --excludes /tmp/excludes.txt
+> ```
+
 ## Launch the Server
 
 ```bash
-sgl-omni serve \
+docker run --gpus all --shm-size 32g -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  sglang-omni:higgs serve \
   --model-path boson-sglang/higgs-audio-v3-tts-4b-base \
   --config examples/configs/higgs_tts.yaml \
-  --port 8000
+  --host 0.0.0.0 --port 8000
 ```
 
-The audio codec is bundled in the TTS checkpoint and loads automatically from
-`--model-path`; it can't be swapped for a different codec.
+`serve` is passed to the image's `sgl-omni` entrypoint, and `--config` resolves
+against the image's working directory (`/workspace/sglang-omni`). The audio codec
+is bundled in the TTS checkpoint and loads automatically from `--model-path`; it
+can't be swapped for a different codec.
 
 ## Use Curl
 
@@ -66,6 +83,26 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   --output output.wav
 ```
 
+### Inline (base64) Reference Audio
+
+Besides `references[].audio_path` (local path or HTTP URL), reference audio can be
+passed inline with the top-level `ref_audio` field — useful when the client holds
+the audio in memory and there is no shared filesystem or URL. `ref_audio` accepts
+a `data:` URI, a raw base64 string, an `http(s)://` / `file://` URL, or a local
+path; pair it with `ref_text` for the transcript. This works on both the HTTP and
+WebSocket (`session.config`) paths.
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "Get the trust fund to the bank early.",
+    "ref_audio": "data:audio/wav;base64,UklGRiQAAABXQVZF...",
+    "ref_text": "We asked over twenty different people, and they all said it was his."
+  }' \
+  --output output.wav
+```
+
 ### Streaming
 
 Set `"stream": true` to receive audio chunks over Server-Sent Events (SSE).
@@ -96,8 +133,9 @@ Clients should not pass model-internal chunk sizing parameters for normal use.
 
 ### Streaming Text Input
 
-Use the WebSocket endpoint when text arrives incrementally and the server should
-start synthesizing completed sentences before the full text is available:
+Use the WebSocket endpoint when text arrives incrementally (e.g. token-by-token
+from an upstream LLM) and the server should start synthesizing completed
+sentences before the full text is available:
 
 ```python
 import asyncio
@@ -115,7 +153,7 @@ async def main():
                     "type": "session.config",
                     "response_format": "pcm",
                     "stream_audio": True,
-                    "split_granularity": "sentence",
+                    "fastout": True,  # release the first chunk early (see below)
                 }
             )
         )
@@ -133,19 +171,56 @@ async def main():
 asyncio.run(main())
 ```
 
-Protocol:
+**Client → server messages**
 
-- First message: `{"type": "session.config", ...}`
-- Text chunks: `{"type": "input.text", "text": "..."}`
-- End of text: `{"type": "input.done"}`
-- Server sends `audio.start`, binary audio frame(s), `audio.done`, then
-  `session.done`.
+| Message | Purpose |
+|---|---|
+| `{"type": "session.config", ...}` | First message; sets format, voice/reference, `fastout`, etc. Same fields as the HTTP request plus `stream_audio` and `fastout`. |
+| `{"type": "input.text", "text": "..."}` | Append incrementally-arriving text |
+| `{"type": "input.wait"}` | Flush and speak the buffered tail now (a clause with no terminator would otherwise wait for `input.done`); keeps the session open and re-arms `fastout` for the next turn |
+| `{"type": "input.stop", "chunk": K}` | Barge-in — see [Barge-in](#barge-in-inputstop) |
+| `{"type": "input.done"}` | End of text for this turn; speaks any buffered tail, then the engine evicts the session |
+
+**Server → client messages**
+
+| Message | Purpose |
+|---|---|
+| `{"type": "audio.start", "sentence_index": i, "sentence_text": "...", "format": ...}` | A chunk is starting; for PCM it also carries `sample_rate` |
+| binary frame(s) | Raw int16 PCM audio for the current chunk (when `stream_audio=true`) |
+| `{"type": "audio.done", "sentence_index": i, "total_bytes": n, "error": false}` | The chunk finished |
+| `{"type": "generation.stopped", "chunk": K}` | Acknowledges an `input.stop` |
+| `{"type": "session.done", "total_sentences": n}` | The session finished (after `input.done`) |
 
 Set `stream_audio` to `true` for progressive raw PCM binary frames. In that mode
 `response_format` must be `pcm` and `speed` must be `1.0`.
-Sentence splitting follows vLLM-Omni's streaming TTS rule: English `.`, `?`,
-and `!` split only when followed by whitespace; CJK `。！？` split immediately.
-With `split_granularity="clause"`, CJK `，；` are also split points.
+
+**Chunking.** Each chunk is one sentence (adjacent sentences are never merged, to
+preserve prosody). ASCII `.` `?` `!` split only when followed by whitespace (so
+`3.14` / `U.S.A` survive); CJK `。！？` split immediately. With `fastout=true`,
+the **first** chunk of a turn is released at the earliest *clause* boundary
+(`,` `;` `:` as well as the sentence enders) instead of waiting for a full
+sentence — this minimizes time-to-first-audio; subsequent chunks fall back to
+sentence splitting. `input.wait` and `input.stop` re-arm `fastout`, so the next
+turn's first chunk is again released early.
+
+#### Barge-in (`input.stop`)
+
+For voice agents where the user interrupts mid-utterance, send
+`{"type": "input.stop", "chunk": K}`, where `K` is the `sentence_index` of the
+last chunk the client actually finished **playing** (tracked from the
+`audio.start` / `audio.done` events). The server:
+
+1. aborts the in-flight chunk and drops everything still queued,
+2. rolls the engine's continuity history back to `≤ K` — chunks generated ahead
+   of playback but never heard are discarded,
+3. rewinds the chunk index so the next synthesized chunk is `K+1`.
+
+The contiguous index sequence lets the client discard the matching stale audio it
+already buffered; both ends realign on "next chunk is `K+1`". The session stays
+open, so the next `input.text` continues the same voice/session, and the server
+replies `{"type": "generation.stopped", "chunk": K}`. The engine retains the full
+per-session history, so `K` may be **any** previously-heard chunk — not only the
+most recent few.
 
 ### Text Normalization
 
@@ -254,6 +329,8 @@ with wave.open("output_stream.wav", "wb") as wav:
 | `response_format` | string | `"wav"` | Output audio format; use `"pcm"` for low-latency streaming playback |
 | `stream` | bool | `false` | Enable streaming via SSE; set to `true` to receive incremental audio chunks |
 | `references` | list | `null` | Reference audio for voice cloning; each item has `audio_path` (local path or HTTP URL) and `text` (transcript) |
+| `ref_audio` | string | `null` | Inline reference audio: `data:` URI, raw base64, `http(s)://` / `file://` URL, or local path (alternative to `references`) |
+| `ref_text` | string | `null` | Transcript of `ref_audio` |
 | `reference_codes` | list[list[int]] | `null` | Pre-encoded discrete codes, shape `[T, 8]` — alternative to `references[0].audio_path` |
 | `reference_text` | string | `null` | Transcript of reference audio when supplying `reference_codes` |
 | `max_new_tokens` | int | `2048` | Maximum number of generated multi-codebook steps |

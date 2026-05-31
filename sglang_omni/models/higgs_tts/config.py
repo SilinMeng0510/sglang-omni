@@ -10,7 +10,7 @@ from pydantic import Field
 from sglang_omni.config import PipelineConfig, StageConfig
 
 if TYPE_CHECKING:
-    from sglang_omni.models.higgs_tts.text_chunker import ChunkerOptions
+    from sglang_omni.models.higgs_tts.text.chunker import ChunkerOptions
 
 _PKG = "sglang_omni.models.higgs_tts"
 
@@ -84,8 +84,8 @@ class HiggsTtsPipelineConfig(PipelineConfig):
 
     def create_generate_orchestrator(self):
         """The chunking middleware the launcher plugs into the shared Client."""
-        from sglang_omni.models.higgs_tts.chunked_generate import HiggsChunkedGenerate
-        from sglang_omni.models.higgs_tts.text_chunker import HiggsTextChunker
+        from sglang_omni.models.higgs_tts.text.chunked_generate import HiggsChunkedGenerate
+        from sglang_omni.models.higgs_tts.text.chunker import HiggsTextChunker
 
         options = self._chunker_options()
         return HiggsChunkedGenerate(
@@ -96,8 +96,8 @@ class HiggsTtsPipelineConfig(PipelineConfig):
 
     def _chunker_options(self) -> "ChunkerOptions":
         """Chunker knobs from the top-level config fields."""
-        from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
-        from sglang_omni.models.higgs_tts.text_chunker import ChunkerOptions
+        from sglang_omni.models.higgs_tts.audio import HiggsAudioCodec
+        from sglang_omni.models.higgs_tts.text.chunker import ChunkerOptions
 
         return ChunkerOptions(
             max_seconds=self.chunker_max_seconds,

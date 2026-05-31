@@ -18,7 +18,7 @@ import pytest
 
 from sglang_omni.client.client import Client
 from sglang_omni.client.types import GenerateRequest
-from sglang_omni.models.higgs_tts.chunked_generate import HiggsChunkedGenerate
+from sglang_omni.models.higgs_tts.text.chunked_generate import HiggsChunkedGenerate
 
 
 class _FakeCoord:

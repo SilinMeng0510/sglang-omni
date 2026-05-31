@@ -2,7 +2,8 @@
 """Unit tests for the engine-side cross-chunk continuity store.
 
 Pure-Python — no sglang / GPU / torch. Covers the per-session radix key, the
-sliding window, and the store's eviction policies.
+read-time conditioning window, full-history retention for barge-in rollback,
+and the store's leak-guard eviction policies (TTL / LRU / explicit).
 """
 
 from __future__ import annotations
@@ -73,12 +74,30 @@ def test_store_commit_and_history_roundtrip() -> None:
     assert overlay == [[1, 1], [2, 2]]
 
 
-def test_store_sliding_window_drops_oldest() -> None:
+def test_history_conditioning_window_is_read_time_not_storage() -> None:
+    # max_history_chunks is the *conditioning* window: the prompt sees only the
+    # last 3, but the full history is retained in storage (not evicted on commit).
     store = SessionStore(max_history_chunks=3)
     for i in range(5):
-        store.commit("s", [i], [[i]])
+        store.commit("s", [i], [[i]], index=i)
     prompt_history, _ = store.history_for("s")
-    assert [t for t, _ in prompt_history] == [[2], [3], [4]]
+    assert [t for t, _ in prompt_history] == [[2], [3], [4]]  # windowed at read
+    assert len(store._sessions["s"].segments) == 5  # but all 5 kept in storage
+
+
+def test_full_history_retained_so_barge_in_can_reach_old_chunk() -> None:
+    # The whole point: server generated far ahead of playback (8 chunks) while
+    # the user only heard up to chunk 1. Barge-in must roll back to chunk 1 even
+    # though it's older than the 3-chunk conditioning window — which only works
+    # because commit() never evicted it.
+    store = SessionStore(max_history_chunks=3)
+    for i in range(8):
+        store.commit("s", [i], [[i]], index=i)
+    store.truncate_after("s", 1)  # keep 0,1; drop 2..7 (generated, never heard)
+    prompt_history, overlay = store.history_for("s")
+    assert [t for t, _ in prompt_history] == [[0], [1]]
+    assert overlay == [[0], [1]]
+    assert len(store._sessions["s"].segments) == 2
 
 
 def test_store_drops_chunk_without_codes() -> None:

@@ -25,8 +25,8 @@ from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.higgs_tts.sampler import STOP_CODE
-from sglang_omni.models.higgs_tts.text_tokenizer import AUDIO_PLACEHOLDER_ID
-from sglang_omni.models.higgs_tts.utils import EOC_ID
+from sglang_omni.models.higgs_tts.text.tokenizer import AUDIO_PLACEHOLDER_ID
+from sglang_omni.models.higgs_tts.audio.utils import EOC_ID
 
 logger = logging.getLogger(__name__)
 

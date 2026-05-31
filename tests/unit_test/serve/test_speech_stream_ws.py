@@ -21,7 +21,7 @@ class _FakeMiddleware:
     ``new_streaming_chunker`` to obtain a per-connection sentence splitter."""
 
     def new_streaming_chunker(self, *, fastout: bool = False):
-        from sglang_omni.models.higgs_tts.text_chunker import (
+        from sglang_omni.models.higgs_tts.text.chunker import (
             ChunkerOptions,
             HiggsTextChunker,
         )

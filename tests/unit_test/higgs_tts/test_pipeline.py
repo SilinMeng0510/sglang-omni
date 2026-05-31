@@ -6,7 +6,7 @@ import torch
 
 from sglang_omni.models.higgs_tts import stages
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
-from sglang_omni.models.higgs_tts.utils import EOC_ID
+from sglang_omni.models.higgs_tts.audio.utils import EOC_ID
 
 
 def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:

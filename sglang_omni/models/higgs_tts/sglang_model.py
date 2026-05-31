@@ -14,19 +14,15 @@ from dataclasses import dataclass, field
 from typing import Iterable, Tuple
 
 import torch
+import torch.nn.functional as F
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from torch import nn
 
 from sglang_omni.models.higgs_tts.hf_config import HiggsMultimodalQwen3Config
-from sglang_omni.models.higgs_tts.modeling import (
-    HiggsFusedMultiTextEmbedding,
-    HiggsFusedMultiTextHead,
-)
 from sglang_omni.models.higgs_tts.sampler import STOP_CODE, HiggsSamplerState
 from sglang_omni.models.higgs_tts.sampler import batched_step as sampler_batched_step
 from sglang_omni.models.higgs_tts.sampler import step as sampler_step
-from sglang_omni.models.higgs_tts.weight_loader import DiscreteWeightMapper
 
 # Higgs ckpt prefixes → sglang Qwen3ForCausalLM parameter tree (under ``backbone.``).
 _BACKBONE_PREFIX_MAP: dict[str, str] = {
@@ -35,6 +31,48 @@ _BACKBONE_PREFIX_MAP: dict[str, str] = {
     "body.norm.": "backbone.model.norm.",
     "tied.head.text_head.": "backbone.lm_head.",
 }
+
+
+@dataclass(frozen=True)
+class DiscreteWeightMapper:
+    """Checkpoint weight-name remapper for the discrete TTS path.
+
+    Higgs checkpoints use prefixes like ``tied.embedding.text_embedding.`` and
+    ``body.layers.``; sglang expects its own parameter-tree layout. Parameterised
+    by ``text_prefix_map`` (see :data:`_BACKBONE_PREFIX_MAP`) so different model
+    wrappers can supply their own layout. ``tie_modality`` must match the ckpt's
+    ``tie_word_embeddings`` flag; when True the modality_head shares the embedding
+    weight and the ckpt's head copy is dropped.
+    """
+
+    text_prefix_map: dict[str, str]
+    embedding_dest: str = "multimodal_embedding.modality_embedding_0."
+    head_dest: str = "modality_head."
+    tie_modality: bool = True
+
+    def _instance_prefix_map(self) -> dict[str, str]:
+        mapping = {
+            "tied.embedding.modality_embeddings.0.embedding.": self.embedding_dest,
+        }
+        if not self.tie_modality:
+            mapping["tied.head.modality_heads.0."] = self.head_dest
+        return mapping
+
+    def map(self, name: str) -> str | None:
+        """Map ckpt name to downstream name; ``None`` to skip the weight."""
+        for higgs_prefix, dest_prefix in self._instance_prefix_map().items():
+            if name.startswith(higgs_prefix):
+                return dest_prefix + name[len(higgs_prefix) :]
+
+        # Audio tokenizer backbone — frozen, not in the serving graph.
+        if name.startswith("tied.embedding.modality_embeddings.0.model."):
+            return None
+
+        for higgs_prefix, dest_prefix in self.text_prefix_map.items():
+            if name.startswith(higgs_prefix):
+                return dest_prefix + name[len(higgs_prefix) :]
+
+        return name
 
 
 @dataclass
@@ -52,6 +90,49 @@ class _RequestSlot:
 
     sampler: HiggsSamplerState
     output_codes: list[torch.Tensor] = field(default_factory=list)
+
+
+class HiggsFusedMultiTextEmbedding(nn.Module):
+    """Fused multi-codebook embedding: one ``[N*V, D]`` weight + offset lookup.
+
+    Equivalent to an ensemble of ``N`` per-codebook embeddings but stored
+    contiguously. ``codes_LN[..., N]`` → ``[..., D]`` summed across the
+    codebook axis.
+    """
+
+    def __init__(self, num_codebooks: int, vocab_size: int, hidden_size: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_codebooks * vocab_size, hidden_size))
+        self.num_codebooks = num_codebooks
+        self.vocab_size = vocab_size
+
+    def forward(self, codes_LN: torch.Tensor) -> torch.Tensor:
+        N = self.num_codebooks
+        V = self.vocab_size
+        offsets = torch.arange(N, device=codes_LN.device, dtype=codes_LN.dtype) * V
+        fused_ids = codes_LN + offsets
+        return F.embedding(fused_ids, self.weight).sum(dim=-2)
+
+
+class HiggsFusedMultiTextHead(nn.Module):
+    """Fused multi-codebook head: ``[L, D]`` → ``[L, N, V]`` via one linear.
+
+    Tied with :class:`HiggsFusedMultiTextEmbedding` when ``tie_word_embeddings``.
+    """
+
+    def __init__(self, num_codebooks: int, vocab_size: int, hidden_size: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_codebooks * vocab_size, hidden_size))
+        self.num_codebooks = num_codebooks
+        self.vocab_size = vocab_size
+
+    def generate(self, hidden_LD: torch.Tensor) -> torch.Tensor:
+        logits = F.linear(hidden_LD, self.weight)
+        return logits.reshape(
+            hidden_LD.shape[0],
+            self.num_codebooks,
+            self.vocab_size,
+        )
 
 
 class _HiggsMultimodalEmbedding(nn.Module):

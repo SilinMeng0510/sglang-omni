@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang_omni.models.higgs_tts.text_tokenizer import (
+from sglang_omni.models.higgs_tts.text.tokenizer import (
     AUDIO_PLACEHOLDER_ID,
     HiggsTokenizerAdapter,
 )

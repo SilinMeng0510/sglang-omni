@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang_omni.models.higgs_tts.text_chunker import (
+from sglang_omni.models.higgs_tts.text.chunker import (
     ChunkerOptions,
     HiggsTextChunker,
     estimate_seconds,

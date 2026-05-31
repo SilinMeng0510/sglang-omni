@@ -18,6 +18,7 @@ import base64
 import binascii
 import json
 import logging
+import re
 import time
 import uuid
 from contextlib import suppress
