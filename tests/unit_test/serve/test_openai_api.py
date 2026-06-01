@@ -21,7 +21,13 @@ from sglang_omni.serve.openai_api import (
     _speech_stream,
     build_speech_generate_request,
 )
-from sglang_omni.serve.protocol import ChatCompletionRequest, CreateSpeechRequest
+from sglang_omni.serve.protocol import (
+    MAX_REF_AUDIO_CHARS,
+    MAX_REQUEST_BODY_BYTES,
+    MAX_SPEECH_INPUT_CHARS,
+    ChatCompletionRequest,
+    CreateSpeechRequest,
+)
 from tests.unit_test.fixtures.pipeline_fakes import RecordingCoordinatorControlPlane
 
 MODEL_FAMILIES = {
@@ -119,6 +125,15 @@ class FailingSpeechClient:
         raise ClientError("stream failed")
 
 
+class RefAudioTooLongSpeechClient:
+    def health(self) -> dict[str, Any]:
+        return {"running": True}
+
+    async def speech(self, request: Any, **kwargs: Any):
+        del request, kwargs
+        raise ClientError("reference_audio is too long (2400.0s); cap at 30s.")
+
+
 @pytest.mark.parametrize("model_name", MODEL_FAMILIES)
 def test_non_streaming_http_faults_return_500(model_name: str) -> None:
     client = TestClient(create_app(_fault_client(model_name), model_name=model_name))
@@ -145,6 +160,59 @@ def test_non_streaming_http_faults_return_500(model_name: str) -> None:
     )
     assert speech_resp.status_code == 500
     assert "cuda out of memory" in speech_resp.json()["detail"]
+
+
+def test_non_streaming_speech_ref_audio_too_long_returns_400() -> None:
+    client = TestClient(
+        create_app(RefAudioTooLongSpeechClient(), model_name="higgs-tts")
+    )
+
+    resp = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "higgs-tts",
+            "input": "hello",
+            "response_format": "wav",
+            "ref_audio": "https://example.com/very-long.wav",
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "reference_audio is too long" in resp.json()["detail"]
+
+
+def test_speech_request_body_size_limit_returns_413() -> None:
+    client = TestClient(create_app(SuccessfulSpeechClient(), model_name="higgs-tts"))
+    big = "u" * (MAX_REQUEST_BODY_BYTES + 10)
+
+    resp = client.post("/v1/audio/speech", json={"input": "hi", "ref_audio": big})
+
+    assert resp.status_code == 413
+    assert "Request body exceeds" in resp.json()["error"]["message"]
+
+
+def test_speech_ref_audio_field_limit_returns_compact_422() -> None:
+    client = TestClient(create_app(SuccessfulSpeechClient(), model_name="higgs-tts"))
+    big = "u" * (MAX_REF_AUDIO_CHARS + 10)
+
+    resp = client.post("/v1/audio/speech", json={"input": "hi", "ref_audio": big})
+
+    assert resp.status_code == 422
+    assert "ref_audio exceeds" in resp.text
+    assert "uuu" not in resp.text
+    assert len(resp.content) < 10_000
+
+
+def test_speech_input_field_limit_returns_compact_422() -> None:
+    client = TestClient(create_app(SuccessfulSpeechClient(), model_name="higgs-tts"))
+    big = "x" * (MAX_SPEECH_INPUT_CHARS + 1)
+
+    resp = client.post("/v1/audio/speech", json={"input": big})
+
+    assert resp.status_code == 422
+    assert "input exceeds" in resp.text
+    assert "xxx" not in resp.text
+    assert len(resp.content) < 10_000
 
 
 def test_chat_stream_failure_closes_without_done_sentinel() -> None:

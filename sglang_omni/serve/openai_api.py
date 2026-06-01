@@ -25,7 +25,8 @@ from contextlib import suppress
 from dataclasses import replace
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
@@ -52,6 +53,7 @@ from sglang_omni.serve.protocol import (
     ChatCompletionStreamDelta,
     ChatCompletionStreamResponse,
     CreateSpeechRequest,
+    MAX_REQUEST_BODY_BYTES,
     ModelCard,
     ModelList,
     StreamingSpeechSessionConfig,
@@ -77,6 +79,8 @@ _SPEECH_STREAM_MAX_INPUT_BYTES = 128 * 1024
 _BAD_REQUEST_MARKERS = (
     "longer than the model's context length",
     "Requested token count exceeds the model's maximum context length",
+    "reference_audio is too long",
+    "reference_codes is too long",
 )
 
 
@@ -111,6 +115,41 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def _limit_request_body(request: Request, call_next):
+        if request.url.path == "/v1/audio/speech":
+            content_length = request.headers.get("content-length")
+            if content_length and content_length.isdigit():
+                if int(content_length) > MAX_REQUEST_BODY_BYTES:
+                    return JSONResponse(
+                        status_code=413,
+                        content={
+                            "error": {
+                                "message": (
+                                    f"Request body exceeds the "
+                                    f"{MAX_REQUEST_BODY_BYTES:,}-byte limit. For "
+                                    "voice cloning pass ref_audio as a URL or "
+                                    "file:// URI instead of inline base64, and keep "
+                                    "the reference to ~10-30s in a compact format "
+                                    "such as mp3 or flac."
+                                ),
+                                "type": "payload_too_large",
+                            }
+                        },
+                    )
+        return await call_next(request)
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        del request
+        detail = [
+            {"type": err.get("type"), "loc": err.get("loc"), "msg": err.get("msg")}
+            for err in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": detail})
 
     # Store references in app state for access from route handlers
     app.state.client = client
@@ -534,9 +573,13 @@ def _register_speech(app: FastAPI) -> None:
                 speed=req.speed,
             )
         except ClientError as exc:
+            if _is_bad_request_error(exc):
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         except Exception as exc:
             logger.exception("Error generating speech for request %s", request_id)
+            if _is_bad_request_error(exc):
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         headers = {
@@ -603,9 +646,7 @@ async def _handle_streaming_speech_ws(
         _middleware = getattr(client, "generate_middleware", None)
         _new_chunker = getattr(_middleware, "new_streaming_chunker", None)
         splitter = (
-            _new_chunker(fastout=config.fastout)
-            if _new_chunker is not None
-            else None
+            _new_chunker(fastout=config.fastout) if _new_chunker is not None else None
         )
         session = _SpeechStreamSession(
             websocket=websocket,
@@ -656,9 +697,7 @@ class _SpeechStreamSession:
         self._session_id = f"ws-{uuid.uuid4()}"
         self._sentence_index = 0
         # Chunks awaiting generation: (text, index, final, truncate_after).
-        self._queue: asyncio.Queue[tuple[str, int, bool, int | None]] = (
-            asyncio.Queue()
-        )
+        self._queue: asyncio.Queue[tuple[str, int, bool, int | None]] = asyncio.Queue()
         self._active_task: asyncio.Task | None = None
         self._active_request_id: str | None = None
         # Set by input.stop; rides on the next turn's first chunk, then clears.
@@ -1314,9 +1353,7 @@ def build_speech_generate_request(
     # ref_audio/ref_text convenience form -> a reference dict. ref_audio may be a
     # URL / local path / data: URI / raw base64 blob (see helper).
     if req.ref_audio is not None:
-        references.append(
-            _speech_reference_from_ref_audio(req.ref_audio, req.ref_text)
-        )
+        references.append(_speech_reference_from_ref_audio(req.ref_audio, req.ref_text))
 
     if references:
         prompt = {"text": req.input, "references": references}

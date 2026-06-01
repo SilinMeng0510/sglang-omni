@@ -5,7 +5,14 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 # ---------------------------------------------------------------------------
 # Shared / Common
@@ -159,6 +166,30 @@ class ChatCompletionStreamResponse(BaseModel):
 # Speech (TTS)
 # ---------------------------------------------------------------------------
 
+MAX_SPEECH_INPUT_CHARS = 50_000
+MAX_REF_AUDIO_CHARS = 10_000_000
+MAX_REQUEST_BODY_BYTES = 12_000_000
+
+
+def _check_speech_input_length(value: str) -> str:
+    if len(value) > MAX_SPEECH_INPUT_CHARS:
+        raise ValueError(
+            f"input exceeds the {MAX_SPEECH_INPUT_CHARS:,}-character limit. "
+            "Split long-form text into multiple requests."
+        )
+    return value
+
+
+def _check_inline_ref_audio_length(value: str | None) -> str | None:
+    if value is not None and len(value) > MAX_REF_AUDIO_CHARS:
+        raise ValueError(
+            f"ref_audio exceeds the {MAX_REF_AUDIO_CHARS:,}-character limit. "
+            "For long clips pass a URL or file:// URI instead of inline "
+            "base64/data: URI, and keep the reference to ~10-30s in a compact "
+            "format such as mp3 or flac."
+        )
+    return value
+
 
 class SpeechReference(BaseModel):
     """Reference item for voice cloning in /v1/audio/speech."""
@@ -168,6 +199,11 @@ class SpeechReference(BaseModel):
     vq_codes: list[list[int]] | list[int] | None = None
     base64: str | None = None
     media_type: str | None = None
+
+    @field_validator("base64")
+    @classmethod
+    def _validate_base64_length(cls, value: str | None) -> str | None:
+        return _check_inline_ref_audio_length(value)
 
 
 class CreateSpeechRequest(BaseModel):
@@ -210,6 +246,16 @@ class CreateSpeechRequest(BaseModel):
 
     # Per-stage overrides (sglang-omni specific)
     stage_params: dict[str, dict[str, Any]] | None = None
+
+    @field_validator("input")
+    @classmethod
+    def _validate_input_length(cls, value: str) -> str:
+        return _check_speech_input_length(value)
+
+    @field_validator("ref_audio")
+    @classmethod
+    def _validate_ref_audio_length(cls, value: str | None) -> str | None:
+        return _check_inline_ref_audio_length(value)
 
 
 class StreamingSpeechSessionConfig(BaseModel):
