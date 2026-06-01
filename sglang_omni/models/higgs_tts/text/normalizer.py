@@ -11,8 +11,8 @@ from __future__ import annotations
 # Single char → ASCII.
 _PUNCT_MAP = {
     "。": ". ",
-    "，": ", ",
-    '、': ', ',
+    "，": " ",
+    "、": " ",
     "！": "! ",
     "？": "? ",
     "；": "; ",
