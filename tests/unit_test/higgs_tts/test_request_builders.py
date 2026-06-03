@@ -44,3 +44,12 @@ def test_higgs_scheduler_adapters_clamp_cap_and_record_engine_time(
     assert result.data["completion_tokens"] == 1
     assert result.data["engine_time_s"] == 2.5
     assert reset_calls == ["req-higgs"]
+
+
+def test_seed_maps_to_sglang_sampling_seed() -> None:
+    # sglang's SamplingParams uses ``sampling_seed`` (not ``seed``); the request
+    # builder must map the user-facing ``seed`` onto it. Passing ``seed`` directly
+    # raises TypeError and 500s the request.
+    state = HiggsTtsState(prompt_token_ids=[1, 2, 3], seed=1234)
+    data = request_builders.build_sglang_higgs_request(state)
+    assert data.req.sampling_params.sampling_seed == 1234

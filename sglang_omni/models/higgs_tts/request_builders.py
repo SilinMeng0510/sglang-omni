@@ -85,7 +85,9 @@ def build_sglang_higgs_request(
     if state.top_k is not None:
         sp_kwargs["top_k"] = int(state.top_k)
     if state.seed is not None:
-        sp_kwargs["seed"] = int(state.seed)
+        # sglang's SamplingParams uses ``sampling_seed`` (not ``seed``); passing
+        # ``seed`` raises TypeError and 500s the request.
+        sp_kwargs["sampling_seed"] = int(state.seed)
     sampling_params = SamplingParams(**sp_kwargs)
     # tokenizer_manager.normalize() is bypassed in our custom pipeline;
     # without it stop_strs / stop_regex_strs stay None and the upstream
@@ -205,11 +207,7 @@ def make_higgs_scheduler_adapters(
         apply_higgs_result(state, data)
         if data.engine_start_s:
             state.engine_time_s = time.perf_counter() - data.engine_start_s
-        if (
-            session_store is not None
-            and data.session_id
-            and state.output_codes_delayed
-        ):
+        if session_store is not None and data.session_id and state.output_codes_delayed:
             # Codes stay engine-side — never written onto the payload serve sees.
             session_store.commit(
                 data.session_id,
