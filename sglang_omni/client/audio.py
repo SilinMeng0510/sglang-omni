@@ -129,6 +129,61 @@ def encode_pcm(audio: np.ndarray, sample_rate: int) -> bytes:
     return (audio * 32767.0).astype(np.int16).tobytes()
 
 
+# response_format -> (container format, codec name) for the PyAV encoder.
+_AV_FORMAT_SPEC: dict[str, tuple[str, str]] = {
+    "mp3": ("mp3", "mp3"),
+    "aac": ("adts", "aac"),
+    "opus": ("ogg", "libopus"),
+}
+# Opus only accepts these input sample rates; others are resampled to 48 kHz.
+_OPUS_SAMPLE_RATES = (8000, 12000, 16000, 24000, 48000)
+
+
+def _encode_with_av(audio: np.ndarray, sample_rate: int, fmt: str) -> bytes:
+    """Encode mono audio to a compressed format (mp3/aac/opus) using PyAV.
+
+    PyAV links the FFmpeg libraries directly, so this works without a system
+    ``ffmpeg`` binary (the previous pydub path shelled out to ffmpeg and failed
+    with FileNotFoundError when it was absent).
+    """
+    import av
+
+    container_fmt, codec_name = _AV_FORMAT_SPEC[fmt]
+
+    samples = np.clip(np.asarray(audio), -1.0, 1.0)
+    if samples.dtype.kind == "f":
+        samples = (samples * 32767.0).astype("<i2")
+    else:
+        samples = samples.astype("<i2")
+    samples = samples.reshape(1, -1)  # (channels=1, n_samples) for mono s16
+
+    out_rate = sample_rate
+    if fmt == "opus" and sample_rate not in _OPUS_SAMPLE_RATES:
+        out_rate = 48000
+
+    buf = io.BytesIO()
+    with av.open(buf, mode="w", format=container_fmt) as container:
+        stream = container.add_stream(codec_name, rate=out_rate)
+        stream.layout = "mono"
+
+        frame = av.AudioFrame.from_ndarray(samples, format="s16", layout="mono")
+        frame.rate = sample_rate
+
+        if out_rate != sample_rate:
+            resampler = av.AudioResampler(format="s16", layout="mono", rate=out_rate)
+            frames = list(resampler.resample(frame)) + list(resampler.resample(None))
+        else:
+            frames = [frame]
+
+        for fr in frames:
+            for packet in stream.encode(fr):
+                container.mux(packet)
+        for packet in stream.encode(None):  # flush encoder
+            container.mux(packet)
+
+    return buf.getvalue()
+
+
 def encode_audio(
     audio: Any,
     *,
@@ -173,34 +228,23 @@ def encode_audio(
     if fmt == "pcm":
         return encode_pcm(arr, sample_rate), mime
 
-    if fmt in ("mp3", "flac", "opus", "aac"):
-        # Try soundfile for FLAC
-        if fmt == "flac":
-            try:
-                import soundfile as sf
-
-                buf = io.BytesIO()
-                sf.write(buf, arr, sample_rate, format="FLAC")
-                return buf.getvalue(), mime
-            except ImportError:
-                logger.warning(
-                    "soundfile not installed; falling back to WAV for FLAC request"
-                )
-                return encode_wav(arr, sample_rate), FORMAT_MIME_TYPES["wav"]
-
-        # Try pydub for MP3/AAC/OPUS
+    if fmt == "flac":
         try:
-            from pydub import AudioSegment
+            import soundfile as sf
 
-            wav_bytes = encode_wav(arr, sample_rate)
-            seg = AudioSegment.from_wav(io.BytesIO(wav_bytes))
             buf = io.BytesIO()
-            export_fmt = {"aac": "adts", "opus": "opus"}.get(fmt, fmt)
-            seg.export(buf, format=export_fmt)
+            sf.write(buf, arr, sample_rate, format="FLAC")
             return buf.getvalue(), mime
-        except ImportError:
+        except Exception:  # pragma: no cover - depends on optional codec support
+            logger.warning("Failed to encode FLAC; falling back to WAV", exc_info=True)
+            return encode_wav(arr, sample_rate), FORMAT_MIME_TYPES["wav"]
+
+    if fmt in ("mp3", "aac", "opus"):
+        try:
+            return _encode_with_av(arr, sample_rate, fmt), mime
+        except Exception:  # pragma: no cover - depends on optional codec support
             logger.warning(
-                "pydub not installed; falling back to WAV for %s request", fmt
+                "Failed to encode %s; falling back to WAV", fmt, exc_info=True
             )
             return encode_wav(arr, sample_rate), FORMAT_MIME_TYPES["wav"]
 
