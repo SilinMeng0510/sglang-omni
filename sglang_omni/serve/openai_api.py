@@ -8,6 +8,7 @@ Provides the following endpoints:
 - GET  /v1/fs/list           — Browse filesystem directories
 - GET  /v1/fs/file           — Download a file
 - GET  /health               — Health check
+- GET  /metrics              — Prometheus metrics (HTTP request counters + latency)
 - WS   /v1/realtime          — OpenAI-compatible Realtime API (when enabled)
 """
 
@@ -29,6 +30,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import ValidationError
 
 from sglang_omni.client import (
@@ -87,6 +89,28 @@ _BAD_REQUEST_MARKERS = (
 def _is_bad_request_error(exc: Exception) -> bool:
     message = str(exc)
     return any(marker in message for marker in _BAD_REQUEST_MARKERS)
+
+
+# Prometheus HTTP-level metrics for the omni server's own FastAPI app (omni does
+# not run sglang's http_server, so it does not inherit sglang's /metrics route).
+# Labelled by the matched route template to keep cardinality bounded.
+_HTTP_REQUESTS = Counter(
+    "sglang_omni_http_requests_total",
+    "Total HTTP requests handled by the sglang-omni server.",
+    ["method", "path", "status"],
+)
+_HTTP_LATENCY = Histogram(
+    "sglang_omni_http_request_duration_seconds",
+    "HTTP request latency in seconds.",
+    ["method", "path"],
+)
+
+
+def _register_metrics(app: FastAPI) -> None:
+    @app.get("/metrics")
+    async def metrics() -> Response:
+        """Prometheus exposition for scraping (request counters + latency)."""
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 def create_app(
@@ -151,6 +175,24 @@ def create_app(
         ]
         return JSONResponse(status_code=422, content={"detail": detail})
 
+    @app.middleware("http")
+    async def _record_http_metrics(request: Request, call_next):
+        # The scrape endpoint itself is not counted.
+        if request.url.path == "/metrics":
+            return await call_next(request)
+        method = request.method
+        start = time.perf_counter()
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            return response
+        finally:
+            route = request.scope.get("route")
+            path = getattr(route, "path", None) or "__unmatched__"
+            _HTTP_LATENCY.labels(method, path).observe(time.perf_counter() - start)
+            _HTTP_REQUESTS.labels(method, path, str(status)).inc()
+
     # Store references in app state for access from route handlers
     app.state.client = client
     app.state.model_name = model_name or "sglang-omni"
@@ -161,6 +203,7 @@ def create_app(
     _register_models(app)
     _register_chat_completions(app)
     _register_speech(app)
+    _register_metrics(app)
     if enable_realtime:
         _register_realtime(app)
 
