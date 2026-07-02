@@ -4,6 +4,8 @@
 - Delay pattern: :func:`apply_delay_pattern` / :func:`reverse_delay_pattern`
   shift codebook ``c`` by ``c`` steps, BOC/EOC padding inside the codebook
   vocab (ids 1024 / 1025 for the default 1026 vocab).
+- Tail cleanup: :data:`TAIL_TRIM_FRAMES` / :func:`fade_out_tail` kill the
+  end-of-utterance click (see the constants' comment).
 - Codec cache + ref-codes coercion + ref-audio loading from path / URL /
   bytes / base64.
 """
@@ -24,6 +26,28 @@ from sglang_omni.preprocessing.resource_connector import global_http_connection
 # Codec-vocab specials (inside the [N*V] codebook space, NOT the text vocab).
 BOC_ID = 1024
 EOC_ID = 1025
+
+# End-of-utterance click suppression. Once cb0 emits EOC, the final data
+# frame's remaining codebooks (cb1..cbN-1) come from the delay-pattern
+# wind-down steps — the model's least-certain predictions — and the decoded
+# last codec frame (~40 ms) often carries an audible spike. Drop it, then
+# fade the last few ms of waveform to remove any residual discontinuity.
+TAIL_TRIM_FRAMES = 1
+TAIL_FADE_MS = 8.0
+
+
+def fade_out_tail(
+    audio: torch.Tensor, sample_rate: int, fade_ms: float = TAIL_FADE_MS
+) -> torch.Tensor:
+    """Linear fade over the last ``fade_ms`` of ``audio`` (last dim = samples)."""
+    n = min(int(sample_rate * fade_ms / 1000.0), int(audio.shape[-1]))
+    if n <= 0:
+        return audio
+    audio = audio.clone()
+    ramp = torch.linspace(1.0, 0.0, n, dtype=audio.dtype, device=audio.device)
+    audio[..., -n:] *= ramp
+    return audio
+
 
 # Shared between audio_encoder + vocoder; one codec load saves ~1 GB VRAM.
 _CODEC_CACHE: dict[tuple[str, str, str], HiggsAudioCodec] = {}
@@ -127,7 +151,10 @@ def load_audio_to_24k(reference_audio: Any) -> tuple[np.ndarray, int]:
 __all__ = [
     "BOC_ID",
     "EOC_ID",
+    "TAIL_FADE_MS",
+    "TAIL_TRIM_FRAMES",
     "apply_delay_pattern",
+    "fade_out_tail",
     "get_or_load_codec",
     "load_audio_to_24k",
     "reverse_delay_pattern",

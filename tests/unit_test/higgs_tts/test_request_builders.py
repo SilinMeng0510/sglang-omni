@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang_omni.models.higgs_tts import request_builders
+from sglang_omni.models.higgs_tts.audio.utils import TAIL_TRIM_FRAMES
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.proto import OmniRequest, StagePayload
 
@@ -44,6 +45,39 @@ def test_higgs_scheduler_adapters_clamp_cap_and_record_engine_time(
     assert result.data["completion_tokens"] == 1
     assert result.data["engine_time_s"] == 2.5
     assert reset_calls == ["req-higgs"]
+
+
+def test_apply_higgs_result_trims_tail_wind_down_frame() -> None:
+    # The last data frame before EOC is completed during the delay-pattern
+    # wind-down and decodes into an audible click; apply_higgs_result must drop
+    # it from the codes fed to the vocoder / committed to the session, while
+    # completion_tokens still counts every generated row.
+    state = HiggsTtsState(prompt_token_ids=[1, 2, 3])
+    data = request_builders.HiggsSGLangRequestData(
+        input_ids=torch.tensor([1, 2, 3], dtype=torch.long)
+    )
+    data.output_codes = [
+        torch.tensor([row, row, row], dtype=torch.long) for row in range(5)
+    ]
+
+    request_builders.apply_higgs_result(state, data)
+
+    assert state.completion_tokens == 5
+    assert len(state.output_codes_delayed) == 5 - TAIL_TRIM_FRAMES
+    assert state.output_codes_delayed[-1] == [3, 3, 3]
+
+
+def test_apply_higgs_result_trimmed_to_empty_yields_no_codes() -> None:
+    state = HiggsTtsState(prompt_token_ids=[1])
+    data = request_builders.HiggsSGLangRequestData(
+        input_ids=torch.tensor([1], dtype=torch.long)
+    )
+    data.output_codes = [torch.tensor([7, 7, 7], dtype=torch.long)]
+
+    request_builders.apply_higgs_result(state, data)
+
+    assert state.completion_tokens == 1
+    assert state.output_codes_delayed is None
 
 
 def test_seed_maps_to_sglang_sampling_seed() -> None:

@@ -24,6 +24,7 @@ from typing import Any
 
 import torch
 
+from sglang_omni.models.higgs_tts.audio.utils import TAIL_TRIM_FRAMES, fade_out_tail
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
@@ -150,7 +151,7 @@ def create_higgs_audio_chunk(
     emit_samples = max(int(audio_chunk_size), 0) * frame_length
     if finalize:
         next_fade_out = None
-        ready_audio = audio
+        ready_audio = fade_out_tail(audio, _codec_sample_rate(codec))
     else:
         next_fade_out = audio[emit_samples:].clone()
         ready_audio = audio[: min(emit_samples, int(audio.shape[-1]))]
@@ -250,24 +251,30 @@ def flush_higgs_stream_chunk(
     num_codebooks: int,
     audio_chunk_size: int,
 ) -> dict[str, Any] | None:
-    if state.delayed_tokens_cache.numel() == 0:
-        tail = state.fade_out_audio
-        state.fade_out_audio = None
-        state.is_first_chunk = True
-        if tail is None or tail.numel() == 0:
-            return None
-        return _build_audio_chunk_payload(tail, sample_rate=_codec_sample_rate(codec))
-
-    chunk, _ = create_higgs_audio_chunk(
-        state.delayed_tokens_cache,
-        int(audio_chunk_size),
-        state.fade_out_audio,
-        codec=codec,
-        finalize=True,
-    )
+    # Trim the click-prone wind-down frame(s) before the final decode: one
+    # trailing delayed row == one final data frame (see audio.utils).
+    cache = state.delayed_tokens_cache
+    cache = cache[: max(int(cache.shape[0]) - TAIL_TRIM_FRAMES, 0)]
+    fade_out_audio = state.fade_out_audio
     state.delayed_tokens_cache = torch.empty((0, num_codebooks), dtype=torch.long)
     state.fade_out_audio = None
     state.is_first_chunk = True
+
+    if cache.shape[0] < num_codebooks:
+        # Not enough rows left to decode; the utterance ends on the retained
+        # decoded-but-unreleased tail.
+        if fade_out_audio is None or fade_out_audio.numel() == 0:
+            return None
+        tail = fade_out_tail(fade_out_audio, _codec_sample_rate(codec))
+        return _build_audio_chunk_payload(tail, sample_rate=_codec_sample_rate(codec))
+
+    chunk, _ = create_higgs_audio_chunk(
+        cache,
+        int(audio_chunk_size),
+        fade_out_audio,
+        codec=codec,
+        finalize=True,
+    )
     return chunk
 
 
@@ -491,6 +498,8 @@ class HiggsVocoderScheduler:
 
         delayed = torch.tensor(delayed_rows, dtype=torch.long)
         audio = _decode_delayed_tokens(delayed, codec=self._codec)
+        if audio is not None:
+            audio = fade_out_tail(audio, _codec_sample_rate(self._codec))
         out_data["audio_data"] = [] if audio is None else audio.tolist()
         usage = _build_usage(state)
         if usage is not None:

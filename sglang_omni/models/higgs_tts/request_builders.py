@@ -12,6 +12,7 @@ import torch
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+from sglang_omni.models.higgs_tts.audio.utils import TAIL_TRIM_FRAMES
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.session import session_extra_key
 from sglang_omni.proto import StagePayload
@@ -131,8 +132,13 @@ def build_sglang_higgs_request(
 def apply_higgs_result(state: HiggsTtsState, data: HiggsSGLangRequestData) -> None:
     if data.output_codes:
         codes = torch.stack(data.output_codes, dim=0).to(torch.long)
-        state.output_codes_delayed = codes.tolist()
         state.completion_tokens = int(codes.shape[0])
+        # Dropping trailing delayed rows removes exactly that many final data
+        # frames (frame T-1's codes live in rows T-1..T+N-2). This trims the
+        # click-prone wind-down frame from both the vocoder input and the
+        # session history the next chunk conditions on.
+        codes = codes[: max(int(codes.shape[0]) - TAIL_TRIM_FRAMES, 0)]
+        state.output_codes_delayed = codes.tolist() or None
     else:
         state.output_codes_delayed = None
     state.prompt_tokens = len(data.input_ids)

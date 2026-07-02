@@ -36,6 +36,7 @@ from transformers import PreTrainedTokenizerFast
 from sglang_omni.models.higgs_tts.audio import HiggsAudioCodec
 from sglang_omni.models.higgs_tts.audio.utils import (
     apply_delay_pattern,
+    fade_out_tail,
     get_or_load_codec,
     load_audio_to_24k,
     reverse_delay_pattern,
@@ -460,6 +461,7 @@ def create_vocoder_executor(
             codes_TN >= codec_vocab, torch.zeros_like(codes_TN), codes_TN
         )
         waveform = codec.decode(codes_TN)
+        waveform = fade_out_tail(waveform, sample_rate)
         audio_np = waveform.detach().to(torch.float32).cpu().numpy()
 
         payload.data["audio_data"] = audio_np.tolist()

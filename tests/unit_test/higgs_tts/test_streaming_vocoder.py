@@ -198,6 +198,94 @@ def test_higgs_stream_flush_emits_remaining_cache_and_clears_tail() -> None:
     assert state.is_first_chunk is True
 
 
+def test_higgs_stream_flush_trims_tail_frame_and_fades_final_audio() -> None:
+    from sglang_omni.models.higgs_tts.streaming_vocoder import (
+        _HiggsStreamState,
+        build_higgs_stream_chunk,
+        flush_higgs_stream_chunk,
+    )
+
+    codec = _FakeHiggsCodec()
+    state = _HiggsStreamState()
+    raw_codes = torch.arange(8 * 3, dtype=torch.long).reshape(8, 3)
+    delayed = _apply_delay_pattern(raw_codes)
+
+    for row in delayed[:6]:
+        build_higgs_stream_chunk(
+            state,
+            row.reshape(1, 3),
+            codec=codec,
+            num_codebooks=3,
+            audio_chunk_size=4,
+            audio_chunk_overlap_size=4,
+        )
+
+    flush = flush_higgs_stream_chunk(
+        state,
+        codec=codec,
+        num_codebooks=3,
+        audio_chunk_size=4,
+    )
+
+    # Cache held 4 delayed rows; the click-prone wind-down frame is dropped, so
+    # the final decode sees 3 rows -> 1 data frame (2 without the trim).
+    assert codec.decode_calls[-1].shape == (1, 3)
+    assert flush is not None
+    assert flush["audio_data"][-1] == 0.0  # faded to silence
+
+
+def test_higgs_stream_flush_emits_retained_tail_when_cache_not_decodable() -> None:
+    from sglang_omni.models.higgs_tts.streaming_vocoder import (
+        _HiggsStreamState,
+        flush_higgs_stream_chunk,
+    )
+
+    # After the tail trim the cache is too short to reverse the delay pattern;
+    # the decoded-but-unreleased tail must still be emitted (it used to be
+    # silently dropped), faded out.
+    state = _HiggsStreamState()
+    state.delayed_tokens_cache = torch.ones((2, 3), dtype=torch.long)
+    state.fade_out_audio = torch.tensor([0.5, 0.5, 0.5, 0.5])
+
+    flush = flush_higgs_stream_chunk(
+        state,
+        codec=_FakeHiggsCodec(),
+        num_codebooks=3,
+        audio_chunk_size=4,
+    )
+
+    assert flush is not None
+    assert flush["audio_data"][0] == 0.5
+    assert flush["audio_data"][-1] == 0.0
+    assert state.delayed_tokens_cache.numel() == 0
+    assert state.fade_out_audio is None
+    assert state.is_first_chunk is True
+
+
+def test_higgs_non_streaming_full_decode_fades_tail() -> None:
+    from sglang_omni.models.higgs_tts.streaming_vocoder import HiggsVocoderScheduler
+
+    codec = _FakeHiggsCodec()
+    scheduler = HiggsVocoderScheduler(
+        codec,
+        device="cpu",
+        num_codebooks=3,
+        max_batch_wait_ms=1,
+    )
+    thread = threading.Thread(target=scheduler.start, daemon=True)
+    try:
+        thread.start()
+        scheduler.inbox.put(
+            IncomingMessage("req", "new_request", _payload("req", stream=False))
+        )
+        final = scheduler.outbox.get(timeout=2.0)
+        assert final.type == "result"
+        assert final.data.data["audio_data"][-1] == 0.0
+    finally:
+        scheduler.stop()
+        thread.join(timeout=2.0)
+
+
 def test_higgs_streaming_scheduler_emits_audio_before_terminal_result() -> None:
     from sglang_omni.models.higgs_tts.streaming_vocoder import HiggsVocoderScheduler
 
