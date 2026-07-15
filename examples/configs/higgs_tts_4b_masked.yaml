@@ -1,0 +1,17 @@
+config_cls: HiggsTtsPipelineConfig
+model_path: bosonai/higgs-tts-3-4b
+name: bosonai/higgs-tts-3-4b
+relay_backend: shm
+
+# Allow request-scoped `lora_adapter.path` adapters. Cached adapters stay in
+# SGLang's LoRA memory pool and are not reloaded on subsequent requests.
+enable_dynamic_lora: true
+lora_base_dir: /adapters
+lora_max_cached_adapters: 8
+lora_max_rank: 32
+
+# Keep autoregressive generation and waveform decoding in separate processes.
+separate_vocoder_process: true
+
+# The rebased upstream streaming vocoder supersedes the original masked-delay
+# tuning. Raw PCM requests select its one-frame startup path automatically.

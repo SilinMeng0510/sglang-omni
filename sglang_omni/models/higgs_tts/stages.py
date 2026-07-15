@@ -176,6 +176,20 @@ def create_preprocessing_executor(
         if isinstance(inputs, str):
             inputs = {"text": inputs}
 
+        metadata = payload.request.metadata
+        metadata = metadata if isinstance(metadata, dict) else {}
+        tts_params = metadata.get("tts_params")
+        tts_params = tts_params if isinstance(tts_params, dict) else {}
+        lora_adapter = tts_params.get("lora_adapter")
+        lora_adapter_path = None
+        if lora_adapter is not None:
+            if not isinstance(lora_adapter, dict):
+                raise ValueError("lora_adapter must be an object containing 'path'")
+            lora_adapter_path = lora_adapter.get("path")
+            if not isinstance(lora_adapter_path, str) or not lora_adapter_path.strip():
+                raise ValueError("lora_adapter.path must be a non-empty string")
+            lora_adapter_path = lora_adapter_path.strip()
+
         raw_refs = inputs.get("references")
         if raw_refs and isinstance(raw_refs, list):
             first = raw_refs[0]
@@ -285,6 +299,7 @@ def create_preprocessing_executor(
             reference_text=reference_text_for_encoder,
             uploaded_voice_name=uploaded_voice_name,
             uploaded_voice_created_at=uploaded_voice_created_at,
+            lora_adapter_path=lora_adapter_path,
             num_codebooks=num_codebooks,
             codebook_size=codebook_size,
             max_new_tokens=int(params.get("max_new_tokens", 2048)),
@@ -393,6 +408,12 @@ def create_sglang_tts_engine_executor(
     server_args_overrides: dict[str, Any] | None = None,
     enable_async_decode: bool = False,
     async_decode_min_batch_size: int = 2,
+    enable_dynamic_lora: bool = False,
+    lora_base_dir: str | None = None,
+    lora_backend: str = "triton",
+    lora_max_rank: int = 32,
+    lora_max_cached_adapters: int = 8,
+    serve_model_name: str | None = None,
 ):
     """sglang-backed AR engine for Higgs TTS."""
     from sglang_omni.models.higgs_tts.engine_builder import HiggsTtsEngineBuilder
@@ -403,6 +424,12 @@ def create_sglang_tts_engine_executor(
         cuda_graph_max_bs=cuda_graph_max_bs,
         enable_async_decode=enable_async_decode,
         async_decode_min_batch_size=async_decode_min_batch_size,
+        enable_dynamic_lora=enable_dynamic_lora,
+        lora_base_dir=lora_base_dir,
+        lora_backend=lora_backend,
+        lora_max_rank=lora_max_rank,
+        lora_max_cached_adapters=lora_max_cached_adapters,
+        serve_model_name=serve_model_name or model_path,
     ).build(
         model_path,
         device=device,

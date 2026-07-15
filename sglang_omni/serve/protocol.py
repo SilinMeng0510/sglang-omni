@@ -269,6 +269,12 @@ class SpeechReference(BaseModel):
     vq_codes: list[list[int]] | list[int] | None = None
 
 
+class LoRAAdapterConfig(BaseModel):
+    """Request-scoped LoRA adapter loaded from a server-visible directory."""
+
+    path: str = Field(min_length=1, max_length=4096)
+
+
 class CreateSpeechRequest(BaseModel):
     """OpenAI-compatible text-to-speech request.
 
@@ -302,6 +308,7 @@ class CreateSpeechRequest(BaseModel):
     token_count: int | None = None  # MOSS-TTS duration token target
     duration_tokens: int | None = None  # alias for token_count
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    lora_adapter: LoRAAdapterConfig | None = None
 
     # Generation parameters
     max_new_tokens: int | None = None

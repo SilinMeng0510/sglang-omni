@@ -293,8 +293,8 @@ class OmniScheduler:
         self.new_token_ratio = self.init_new_token_ratio
         self.prefill_delayer = None
 
-        # Feature flags (all disabled)
-        self.enable_lora = False
+        # Feature flags
+        self.enable_lora = bool(server_args.enable_lora)
         self.enable_pdmux = False
         self.enable_metrics = server_args.enable_metrics
         self.enable_trace = False

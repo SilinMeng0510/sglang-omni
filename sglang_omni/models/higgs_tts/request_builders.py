@@ -99,6 +99,7 @@ def build_sglang_higgs_request(
         sampling_params=sampling_params,
         vocab_size=151_936,
         extra_key=_ref_audio_fingerprint(state.reference_codes_delayed),
+        lora_id=state.lora_id,
     )
     # V1's prefill manager probes these attrs; absence triggers AttributeError.
     req._codec_suppress_tokens = None

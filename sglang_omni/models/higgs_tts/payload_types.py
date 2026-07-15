@@ -29,6 +29,10 @@ class HiggsTtsState(PipelineStateBase):
     reference_code_cache_key: str | None = None
     uploaded_voice_name: str | None = None
     uploaded_voice_created_at: int | None = None
+    # SGLang's deterministic adapter id. None selects the base model.
+    lora_id: str | None = None
+    # Server-visible PEFT adapter directory for request-scoped loading.
+    lora_adapter_path: str | None = None
 
     num_codebooks: int = 8
     codebook_size: int = 1026  # 1024 data + <|boc|> + <|eoc|>
@@ -73,6 +77,10 @@ class HiggsTtsState(PipelineStateBase):
             data["uploaded_voice_name"] = self.uploaded_voice_name
         if self.uploaded_voice_created_at is not None:
             data["uploaded_voice_created_at"] = self.uploaded_voice_created_at
+        if self.lora_id is not None:
+            data["lora_id"] = self.lora_id
+        if self.lora_adapter_path is not None:
+            data["lora_adapter_path"] = self.lora_adapter_path
         for key in ("top_p", "top_k", "seed"):
             value = getattr(self, key)
             if value is not None:
@@ -101,6 +109,8 @@ class HiggsTtsState(PipelineStateBase):
             reference_code_cache_key=data.get("reference_code_cache_key"),
             uploaded_voice_name=data.get("uploaded_voice_name"),
             uploaded_voice_created_at=data.get("uploaded_voice_created_at"),
+            lora_id=data.get("lora_id"),
+            lora_adapter_path=data.get("lora_adapter_path"),
             num_codebooks=data.get("num_codebooks", 8),
             codebook_size=data.get("codebook_size", 1026),
             max_new_tokens=data.get("max_new_tokens", 2048),

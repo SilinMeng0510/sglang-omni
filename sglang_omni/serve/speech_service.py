@@ -730,6 +730,8 @@ def _build_tts_params(
         tts_params[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = (
             request.initial_codec_chunk_frames
         )
+    if request.lora_adapter is not None:
+        tts_params["lora_adapter"] = request.lora_adapter.model_dump()
     if request.token_count is not None:
         tts_params["token_count"] = request.token_count
     if request.duration_tokens is not None:
