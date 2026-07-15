@@ -151,6 +151,8 @@ def inspect_dcp_lora(checkpoint_dir: str | Path) -> tuple[dict[str, Any], list[s
     metadata_path = checkpoint_dir / ".metadata"
     if not metadata_path.is_file():
         raise FileNotFoundError(f"DCP metadata not found: {metadata_path}")
+    # DCP metadata is a pickle produced by torch.distributed.checkpoint. Only
+    # inspect checkpoints from a trusted training pipeline.
     with metadata_path.open("rb") as handle:
         metadata = pickle.load(handle)
 
@@ -227,15 +229,7 @@ def export_dcp_lora_adapter(
         "lora_dropout": 0.0,
         "peft_type": "LORA",
         "r": rank,
-        "target_modules": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
+        "target_modules": list(HIGGS_LORA_TARGET_MODULES),
         "task_type": "CAUSAL_LM",
     }
     (output_dir / "adapter_config.json").write_text(

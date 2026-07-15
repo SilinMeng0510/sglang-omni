@@ -84,6 +84,8 @@ class HiggsTtsPipelineConfig(PipelineConfig):
 
     def model_post_init(self, __context: Any = None) -> None:
         super().model_post_init(__context)
+        if self.enable_dynamic_lora and not self.lora_base_dir:
+            raise ValueError("enable_dynamic_lora requires lora_base_dir")
         for stage in self.stages:
             if stage.name == "tts_engine":
                 stage.factory_args.update(

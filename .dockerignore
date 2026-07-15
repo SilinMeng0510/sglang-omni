@@ -7,3 +7,9 @@ __pycache__/
 .mypy_cache/
 .cache/
 results/
+benchmarks/higgs_tts/results/
+*.wav
+*.mp3
+*.flac
+*.pcm
+*.log
