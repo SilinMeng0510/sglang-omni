@@ -20,11 +20,12 @@ The Dockerfile pins the exact measured base-image digest instead of a mutable
 0.5.12.post1. The source tree is copied into the image, while model weights,
 LoRA adapters, Hugging Face cache, and benchmark outputs stay outside it.
 
-Start an endpoint with one GPU and server-visible model/adapter directories:
+For the 4B model, use `examples/configs/higgs_tts_4b_masked.yaml`. Start an
+endpoint with one GPU and server-visible model/adapter directories:
 
 ```bash
 export MODEL_PATH=/absolute/path/to/higgs-tts-3-4b
-export LORA_ROOT=/absolute/path/to/lora-adapters
+export LORA_ROOT=/hot-data/checkpoints/TTSDeepclone
 
 docker run --rm --name higgs-tts-sglang-omni \
   --gpus '"device=0"' \
@@ -40,14 +41,27 @@ docker run --rm --name higgs-tts-sglang-omni \
   --port 18043
 ```
 
-Use paths as seen inside the container in API requests, for example:
+The following LoRA checkpoints are available for testing. Their request paths
+are shown relative to the `/adapters` mount used above:
+
+| Name | Host checkpoint | Request path |
+| --- | --- | --- |
+| `ap2` | `/hot-data/checkpoints/TTSDeepclone/c552a632c2c944d3826c8eb0d94505b6/step_02000/peft` | `/adapters/c552a632c2c944d3826c8eb0d94505b6/step_02000/peft` |
+| `tpfp` | `/hot-data/checkpoints/TTSDeepclone/b640aed5d5e444f9b03642a88f348d3c/step_02000/peft` | `/adapters/b640aed5d5e444f9b03642a88f348d3c/step_02000/peft` |
+| `hmbm` | `/hot-data/checkpoints/TTSDeepclone/58b6ba5df6a347558200ec8f49f0364a/step_02000/peft` | `/adapters/58b6ba5df6a347558200ec8f49f0364a/step_02000/peft` |
+
+LoRA adapters must always be loaded dynamically: do not preload an adapter in
+the server configuration. Instead, include `lora_adapter` in every API request,
+using the path visible inside the container. For example, to use `ap2`:
 
 ```json
 {
   "input": "Dynamic adapter test.",
   "stream": true,
   "response_format": "pcm",
-  "lora_adapter": {"path": "/adapters/ap2_4b"}
+  "lora_adapter": {
+    "path": "/adapters/c552a632c2c944d3826c8eb0d94505b6/step_02000/peft"
+  }
 }
 ```
 
@@ -86,8 +100,20 @@ are reproducible. Use `--prompts /path/to/workload.jsonl` to override it; each
 JSONL row must contain a non-empty `text` or `prompt` field. `sample_text.txt`
 contains the fixed utterances used for generated-audio A/B listening tests.
 Pass `--lora-adapter-path /path/to/adapter` to benchmark request-scoped dynamic
-LoRA loading. The first request loads the adapter and later requests exercise
-the cache-hit path.
+LoRA loading. The benchmark includes the adapter path in every request; for
+example, to test `ap2` against the container setup above:
+
+```bash
+python benchmarks/higgs_tts/performance.py \
+  --base-url http://127.0.0.1:18043 \
+  --model higgs-tts-4b \
+  --voice default \
+  --lora-adapter-path \
+    /adapters/c552a632c2c944d3826c8eb0d94505b6/step_02000/peft \
+  --output-dir results/higgs_tts_ap2 \
+  --concurrencies 1,4,8 \
+  --duration 60
+```
 
 For a CPU-only plumbing check:
 

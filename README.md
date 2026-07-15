@@ -58,6 +58,7 @@ Additional model guides, including experimental and research-oriented paths, are
 - [MOSS-Transcribe-Diarize cookbook](https://sgl-project.github.io/sglang-omni/cookbook/moss_transcribe_diarize.html)
 - [Omni router](https://sgl-project.github.io/sglang-omni/basic_usage/omni_router.html)
 - [Developer reference](https://sgl-project.github.io/sglang-omni/developer_reference/main.html)
+- [Higgs TTS benchmark](./benchmarks/higgs_tts/README.md) — 4B configuration and dynamic LoRA performance testing
 
 ## Community & Support
 
