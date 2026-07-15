@@ -36,6 +36,7 @@ class _FakeHiggsCodec:
             )
         )
         self.decode_calls: list[torch.Tensor] = []
+        self.masked_decode_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     def decode(self, codes_TN: torch.Tensor) -> torch.Tensor:
         self.decode_calls.append(codes_TN.detach().clone())
@@ -46,6 +47,23 @@ class _FakeHiggsCodec:
             device=frame_values.device,
         )
         return (frame_values[:, None] * 10.0 + offsets[None, :]).reshape(-1)
+
+    def decode_batch(self, codes_BTN: torch.Tensor) -> torch.Tensor:
+        return torch.stack([self.decode(codes) for codes in codes_BTN])
+
+    def decode_masked_batch(
+        self, codes_BTN: torch.Tensor, counts_BT: torch.Tensor
+    ) -> torch.Tensor:
+        self.masked_decode_calls.append(
+            (codes_BTN.detach().clone(), counts_BT.detach().clone())
+        )
+        outputs = []
+        for codes, counts in zip(codes_BTN, counts_BT):
+            mask = torch.arange(codes.shape[1])[None, :] < counts[:, None]
+            values = torch.where(mask, codes, 0).to(torch.float32).sum(dim=1)
+            offsets = torch.arange(self.model.config.hop_length, dtype=torch.float32)
+            outputs.append((values[:, None] * 10 + offsets[None, :]).reshape(-1))
+        return torch.stack(outputs)
 
 
 def _payload(
@@ -457,6 +475,130 @@ def test_higgs_non_streaming_scheduler_uses_full_decode() -> None:
     finally:
         scheduler.stop()
         thread.join(timeout=2.0)
+
+
+def test_full_context_streaming_emits_only_center_from_complete_codebooks() -> None:
+    from sglang_omni.models.higgs_tts.streaming_vocoder import HiggsVocoderScheduler
+
+    codec = _FakeHiggsCodec()
+    scheduler = HiggsVocoderScheduler(
+        codec,
+        num_codebooks=3,
+        audio_chunk_size=4,
+        audio_chunk_overlap_size=4,
+        full_context_streaming=True,
+        context_frames=2,
+        startup_full_chunk_frames=2,
+        startup_full_chunk_count=1,
+    )
+    raw = torch.arange(1, 1 + 12 * 3, dtype=torch.long).reshape(12, 3)
+    delayed = _apply_delay_pattern(raw)
+
+    # Two target frames + two real future frames + the two delay rows.
+    for row in delayed[:5]:
+        scheduler._on_chunk_batch([_row(row)])
+    assert scheduler.outbox.empty()
+    scheduler._on_chunk_batch([_row(delayed[5])])
+
+    first = scheduler.outbox.get_nowait()
+    hop = codec.model.config.hop_length
+    assert len(first.data["audio_data"]) == 2 * hop
+    assert codec.masked_decode_calls == []
+    assert codec.decode_calls[-1].tolist() == raw[:4].tolist()
+    expected = codec.decode(raw[:2]).tolist()
+    assert first.data["audio_data"] == expected
+
+    # The next window has two real history, four target, and two future frames.
+    for row in delayed[6:10]:
+        scheduler._on_chunk_batch([_row(row)])
+    second = scheduler.outbox.get_nowait()
+    assert codec.decode_calls[-1].tolist() == raw[:8].tolist()
+    expected = codec.decode(raw[2:6]).tolist()
+    assert second.data["audio_data"] == expected
+
+
+def test_full_context_streaming_limits_reduced_context_to_startup() -> None:
+    from sglang_omni.models.higgs_tts.streaming_vocoder import HiggsVocoderScheduler
+
+    codec = _FakeHiggsCodec()
+    scheduler = HiggsVocoderScheduler(
+        codec,
+        num_codebooks=3,
+        audio_chunk_size=4,
+        audio_chunk_overlap_size=4,
+        full_context_streaming=True,
+        context_frames=2,
+        startup_reduced_context_frames=1,
+        startup_reduced_context_until_frames=4,
+        startup_full_chunk_frames=2,
+        startup_full_chunk_count=1,
+    )
+    raw = torch.arange(1, 1 + 12 * 3, dtype=torch.long).reshape(12, 3)
+    delayed = _apply_delay_pattern(raw)
+
+    # Reduced startup: two targets, one future frame, and two delay rows.
+    for row in delayed[:5]:
+        scheduler._on_chunk_batch([_row(row)])
+    first = scheduler.outbox.get_nowait()
+    assert len(first.data["audio_data"]) == 2 * codec.model.config.hop_length
+    assert codec.decode_calls[-1].tolist() == raw[:3].tolist()
+
+    for row in delayed[5:7]:
+        scheduler._on_chunk_batch([_row(row)])
+    second = scheduler.outbox.get_nowait()
+    assert len(second.data["audio_data"]) == 2 * codec.model.config.hop_length
+    assert codec.decode_calls[-1].tolist() == raw[:5].tolist()
+
+    # Once four frames are emitted, the configured two-frame context returns.
+    for row in delayed[7:10]:
+        scheduler._on_chunk_batch([_row(row)])
+    third = scheduler.outbox.get_nowait()
+    assert len(third.data["audio_data"]) == 2 * codec.model.config.hop_length
+    assert codec.decode_calls[-1].tolist() == raw[2:8].tolist()
+
+
+def test_full_context_streaming_masks_only_unready_startup_residuals() -> None:
+    from sglang_omni.models.higgs_tts.streaming_vocoder import HiggsVocoderScheduler
+
+    codec = _FakeHiggsCodec()
+    scheduler = HiggsVocoderScheduler(
+        codec,
+        num_codebooks=4,
+        audio_chunk_size=4,
+        audio_chunk_overlap_size=4,
+        full_context_streaming=True,
+        context_frames=2,
+        startup_masked_delay_rows=4,
+        startup_masked_emit_frames=2,
+        startup_masked_until_frames=4,
+        startup_full_chunk_frames=2,
+        startup_full_chunk_count=1,
+    )
+    raw = torch.arange(1, 1 + 16 * 4, dtype=torch.long).reshape(16, 4)
+    delayed = _apply_delay_pattern(raw)
+
+    for row in delayed[:4]:
+        scheduler._on_chunk_batch([_row(row)])
+    first = scheduler.outbox.get_nowait()
+    assert len(first.data["audio_data"]) == 2 * codec.model.config.hop_length
+    codes, counts = codec.masked_decode_calls[-1]
+    assert counts.tolist() == [[4, 3, 2, 1]]
+    assert codes[0, 0].tolist() == raw[0].tolist()
+
+    for row in delayed[4:6]:
+        scheduler._on_chunk_batch([_row(row)])
+    second = scheduler.outbox.get_nowait()
+    assert len(second.data["audio_data"]) == 2 * codec.model.config.hop_length
+    _, counts = codec.masked_decode_calls[-1]
+    assert counts.tolist() == [[4, 4, 4, 3, 2, 1]]
+
+    # Once the masked region is emitted, wait for complete RVQ frames plus
+    # real right context and return to the ordinary unmasked decoder.
+    for row in delayed[6:12]:
+        scheduler._on_chunk_batch([_row(row)])
+    third = scheduler.outbox.get_nowait()
+    assert len(third.data["audio_data"]) == 2 * codec.model.config.hop_length
+    assert codec.decode_calls[-1].tolist() == raw[2:8].tolist()
 
 
 def test_higgs_scheduler_done_before_payload_finalizes_after_new_request() -> None:

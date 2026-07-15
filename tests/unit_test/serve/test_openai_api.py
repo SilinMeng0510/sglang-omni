@@ -27,6 +27,7 @@ from sglang_omni.serve.protocol import (
     MAX_SPEECH_INPUT_CHARS,
     ChatCompletionRequest,
     CreateSpeechRequest,
+    LoRAAdapterConfig,
 )
 from tests.unit_test.fixtures.pipeline_fakes import RecordingCoordinatorControlPlane
 
@@ -123,6 +124,20 @@ class FailingSpeechClient:
             sample_rate=24000,
         )
         raise ClientError("stream failed")
+
+
+class LoRALoadFailureSpeechClient:
+    def health(self) -> dict[str, Any]:
+        return {"running": True}
+
+    async def generate(self, request: Any, request_id: str | None = None):
+        del request, request_id
+        if False:
+            yield
+        raise ClientError(
+            "Failed to load LoRA adapter /models/ap2: "
+            "adapter rank 64 exceeds max rank 32"
+        )
 
 
 class RefAudioTooLongSpeechClient:
@@ -266,6 +281,50 @@ def test_speech_stream_success_emits_done_sentinel() -> None:
     assert payload["finish_reason"] == "stop"
 
 
+def test_pcm_speech_stream_returns_raw_audio_bytes() -> None:
+    client = TestClient(create_app(SuccessfulSpeechClient(), model_name="higgs-tts"))
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "higgs-tts",
+            "input": "hello",
+            "stream": True,
+            "response_format": "pcm",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("audio/pcm")
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert response.headers["x-audio-sample-rate"] == "24000"
+    assert response.headers["x-audio-sample-format"] == "s16le"
+    assert response.headers["x-audio-channels"] == "1"
+    assert response.content == b"\x00\x00\xcc\x0c\x34\xf3\x00\x00"
+    assert not response.content.startswith(b"data:")
+
+
+def test_pcm_stream_returns_http_error_when_lora_load_fails() -> None:
+    client = TestClient(
+        create_app(LoRALoadFailureSpeechClient(), model_name="higgs-tts")
+    )
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "higgs-tts",
+            "input": "hello",
+            "stream": True,
+            "response_format": "pcm",
+            "lora_adapter": {"path": "/models/ap2"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "rank 64 exceeds max rank 32" in response.json()["detail"]
+
+
 def test_speech_stream_returns_error_event_after_chunk_failure() -> None:
     """Preserves deterministic SSE termination after a mid-stream client error."""
     client = TestClient(create_app(FailingSpeechClient(), model_name="s2-pro"))
@@ -324,6 +383,20 @@ def test_speech_request_records_explicit_generation_params() -> None:
         "temperature",
         "top_k",
     ]
+
+
+def test_speech_request_passes_request_scoped_lora_adapter() -> None:
+    request = build_speech_generate_request(
+        CreateSpeechRequest(
+            input="hello",
+            lora_adapter=LoRAAdapterConfig(path="/models/ap2/adapter"),
+        ),
+        "higgs-tts",
+    )
+
+    assert request.metadata["tts_params"]["lora_adapter"] == {
+        "path": "/models/ap2/adapter"
+    }
 
 
 def test_speech_request_uses_higgs_tts_sampling_defaults() -> None:

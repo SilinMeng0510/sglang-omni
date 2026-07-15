@@ -1,0 +1,30 @@
+config_cls: HiggsTtsPipelineConfig
+model_path: bosonai/higgs-tts-3-4b
+name: bosonai/higgs-tts-3-4b
+relay_backend: shm
+
+# Allow request-scoped `lora_adapter.path` adapters. Cached adapters stay in
+# SGLang's LoRA memory pool and are not reloaded on subsequent requests.
+enable_dynamic_lora: true
+lora_max_cached_adapters: 8
+lora_max_rank: 32
+
+# Keep autoregressive generation and waveform decoding in separate processes.
+separate_vocoder_process: true
+
+# Frames 0-7 use masked K8/M3 decoding, frames 8-10 transition with six
+# complete future-context frames, and later chunks use nine-frame context.
+vocoder_full_context_streaming: true
+vocoder_context_frames: 9
+vocoder_startup_masked_delay_rows: 8
+vocoder_startup_masked_emit_frames: 3
+vocoder_startup_masked_until_frames: 8
+vocoder_startup_reduced_context_frames: 6
+vocoder_startup_reduced_left_context_frames: 9
+vocoder_startup_reduced_context_until_frames: 11
+startup_full_chunk_frames: 8
+startup_full_chunk_count: 3
+
+vocoder_max_batch_size: 16
+vocoder_max_batch_wait_ms: 2
+vocoder_audio_chunk_size: 32

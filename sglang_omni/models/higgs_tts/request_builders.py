@@ -111,6 +111,7 @@ def build_sglang_higgs_request(
         sampling_params=sampling_params,
         vocab_size=151_936,
         extra_key=extra_key,
+        lora_id=state.lora_id,
     )
     # V1's prefill manager probes these attrs; absence triggers AttributeError.
     req._codec_suppress_tokens = None
@@ -193,7 +194,12 @@ def make_higgs_scheduler_adapters(
             ref_codes = list(state.reference_codes_delayed or [])
             ref_codes.extend(overlay_codes)
             state.reference_codes_delayed = ref_codes or None
-            extra_key_override = session_extra_key(session_id)
+            # The first chunk has no session-specific history, so namespace it
+            # by the fixed reference fingerprint. This lets independent
+            # requests for the same voice share their reference-prefix KV.
+            # Once continuity history exists, isolate by session as before.
+            if prompt_history:
+                extra_key_override = session_extra_key(session_id)
 
         data = build_sglang_higgs_request(
             state,

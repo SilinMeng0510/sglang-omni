@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from sglang_omni.models.higgs_tts.audio.utils import EOC_ID
 from sglang_omni.models.higgs_tts.sampler import (
     K_MAX,
     STOP_CODE,
@@ -18,7 +19,6 @@ from sglang_omni.models.higgs_tts.sampler import (
     batched_step,
     step,
 )
-from sglang_omni.models.higgs_tts.audio.utils import EOC_ID
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # top_k=1 forces greedy (only argmax stays finite after the filter), matching
@@ -60,6 +60,8 @@ def _snapshot_pool(pool: HiggsBatchedSamplerState) -> dict:
         "eoc_countdown": pool.eoc_countdown.clone(),
         "generation_done": pool.generation_done.clone(),
         "last_codes": pool.last_codes.clone(),
+        "sampling_seed": pool.sampling_seed.clone(),
+        "sampling_step": pool.sampling_step.clone(),
     }
 
 
@@ -282,3 +284,35 @@ def test_batched_step_mixed_top_k_per_row_filter():
             f"row 1 cb {cb} sampled {int(codes[1, cb].item())} "
             f"outside its own strong-set {row1_allowed}"
         )
+
+
+def test_sampling_seed_is_reproducible_and_request_local():
+    logits = torch.randn((2, N, V), device=DEVICE)
+    row_indices = torch.arange(2, device=DEVICE)
+    temperature = torch.ones(2, device=DEVICE)
+    top_k = torch.full((2,), 50, dtype=torch.long, device=DEVICE)
+
+    first = HiggsBatchedSamplerState(2, N, device=DEVICE)
+    second = HiggsBatchedSamplerState(2, N, device=DEVICE)
+    for pool in (first, second):
+        pool.sampling_seed.copy_(
+            torch.tensor([1234, 5678], device=DEVICE, dtype=torch.long)
+        )
+
+    first_codes = batched_step(
+        logits,
+        first,
+        row_indices,
+        temperature=temperature,
+        top_k_buf=top_k,
+    )
+    second_codes = batched_step(
+        logits.flip(0),
+        second,
+        row_indices.flip(0),
+        temperature=temperature,
+        top_k_buf=top_k,
+    ).flip(0)
+
+    assert torch.equal(first_codes, second_codes)
+    assert torch.equal(first.sampling_step, torch.ones_like(first.sampling_step))

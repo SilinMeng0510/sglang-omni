@@ -19,9 +19,9 @@ import base64
 import binascii
 import json
 import logging
-import re
 import time
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import replace
 from typing import Any
@@ -47,6 +47,7 @@ from sglang_omni.client.audio import (
     to_numpy,
 )
 from sglang_omni.serve.protocol import (
+    MAX_REQUEST_BODY_BYTES,
     ChatCompletionAudio,
     ChatCompletionChoice,
     ChatCompletionRequest,
@@ -55,7 +56,6 @@ from sglang_omni.serve.protocol import (
     ChatCompletionStreamDelta,
     ChatCompletionStreamResponse,
     CreateSpeechRequest,
-    MAX_REQUEST_BODY_BYTES,
     ModelCard,
     ModelList,
     StreamingSpeechSessionConfig,
@@ -83,6 +83,12 @@ _BAD_REQUEST_MARKERS = (
     "Requested token count exceeds the model's maximum context length",
     "reference_audio is too long",
     "reference_codes is too long",
+    "LoRA adapter path",
+    "LoRA adapter metadata",
+    "LoRA adapter model_name",
+    "Failed to load LoRA adapter",
+    "Dynamic LoRA cache is full",
+    "lora_adapter",
 )
 
 
@@ -597,6 +603,50 @@ def _register_speech(app: FastAPI) -> None:
 
         gen_req = build_speech_generate_request(req, default_model)
         if req.stream:
+            if req.response_format.lower().strip() == "pcm":
+                chunks = client.generate(gen_req, request_id=request_id)
+                try:
+                    first_chunk = await anext(chunks)
+                except StopAsyncIteration as exc:
+                    raise HTTPException(
+                        status_code=500, detail="No response from speech pipeline"
+                    ) from exc
+                except ClientError as exc:
+                    status_code = 400 if _is_bad_request_error(exc) else 500
+                    raise HTTPException(
+                        status_code=status_code, detail=str(exc)
+                    ) from exc
+                except Exception as exc:
+                    logger.exception(
+                        "Error starting streaming speech request %s", request_id
+                    )
+                    status_code = 400 if _is_bad_request_error(exc) else 500
+                    raise HTTPException(
+                        status_code=status_code, detail=str(exc)
+                    ) from exc
+
+                async def _prefetched_chunks():
+                    yield first_chunk
+                    async for chunk in chunks:
+                        yield chunk
+
+                return StreamingResponse(
+                    _streaming_speech_pcm_chunks(
+                        client=client,
+                        gen_req=gen_req,
+                        request_id=request_id,
+                        speed=req.speed,
+                        chunks=_prefetched_chunks(),
+                    ),
+                    media_type="audio/pcm",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                        "X-Audio-Sample-Rate": str(DEFAULT_SAMPLE_RATE),
+                        "X-Audio-Sample-Format": "s16le",
+                        "X-Audio-Channels": "1",
+                    },
+                )
             return StreamingResponse(
                 _speech_stream(
                     client=client,
@@ -1104,10 +1154,14 @@ async def _streaming_speech_pcm_chunks(
     client: Client,
     gen_req: GenerateRequest,
     request_id: str,
+    speed: float = 1.0,
+    chunks: AsyncIterator[Any] | None = None,
 ):
-    """Yield PCM byte deltas from a streaming TTS request."""
+    """Yield headerless, mono signed-16-bit little-endian PCM chunks."""
     emitted_samples = 0
-    async for chunk in client.generate(gen_req, request_id=request_id):
+    if chunks is None:
+        chunks = client.generate(gen_req, request_id=request_id)
+    async for chunk in chunks:
         if chunk.audio_data is None:
             continue
 
@@ -1124,7 +1178,7 @@ async def _streaming_speech_pcm_chunks(
             audio_data,
             response_format="pcm",
             sample_rate=sample_rate,
-            speed=1.0,
+            speed=speed,
         )
         if audio_bytes:
             yield audio_bytes
@@ -1356,6 +1410,8 @@ def build_speech_generate_request(
         tts_params["speaker_embedding"] = req.speaker_embedding
     if req.initial_codec_chunk_frames is not None:
         tts_params["initial_codec_chunk_frames"] = req.initial_codec_chunk_frames
+    if req.lora_adapter is not None:
+        tts_params["lora_adapter"] = req.lora_adapter.model_dump()
     if req.seed is not None:
         tts_params["seed"] = req.seed
 

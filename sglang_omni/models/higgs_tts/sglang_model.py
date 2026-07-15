@@ -82,6 +82,7 @@ class HiggsGenParams:
     temperature: float = 1.0
     top_p: float | None = None
     top_k: int | None = None
+    seed: int = 0
 
 
 @dataclass
@@ -312,6 +313,16 @@ class HiggsTTSModel(nn.Module):
             persistent=False,
         )
         self.register_buffer(
+            "_graph_sampling_seed",
+            torch.zeros(max_batch_size, dtype=torch.long, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_graph_sampling_step",
+            torch.zeros(max_batch_size, dtype=torch.long, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
             "_graph_output_codes",
             torch.full(
                 (max_batch_size, self._num_codebooks),
@@ -351,6 +362,8 @@ class HiggsTTSModel(nn.Module):
         for b in range(batch_size):
             slot = self.get_slot(req_ids[b])
             params = gen_params[b]
+            if slot.sampler.sampling_step == 0:
+                slot.sampler.sampling_seed = params.seed
             codes_N = sampler_step(
                 logits_BNV[b],
                 slot.sampler,
@@ -393,6 +406,8 @@ class HiggsTTSModel(nn.Module):
             temperature=self._graph_temperature,
             top_p=self._graph_top_p,
             top_k=self._graph_top_k,
+            sampling_seed=self._graph_sampling_seed,
+            sampling_step=self._graph_sampling_step,
         )
         self._graph_output_codes[:batch_size].copy_(codes_BN)
 
@@ -501,6 +516,7 @@ class HiggsTTSModel(nn.Module):
             temperature=_pick("temperatures", 1.0),
             top_p=_pick("top_ps", None),
             top_k=int(_pick("top_ks", 0)) or None,
+            seed=int(_pick("sampling_seed", 0)),
         )
 
     @staticmethod
