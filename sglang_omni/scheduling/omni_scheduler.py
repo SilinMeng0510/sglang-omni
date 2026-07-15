@@ -295,6 +295,11 @@ class OmniScheduler:
 
         # Feature flags
         self.enable_lora = bool(server_args.enable_lora)
+        self.max_loras_per_batch = server_args.max_loras_per_batch
+        # Fair-drain and overlap-loading are optional upstream LoRA features.
+        # Dynamic Higgs adapters use the synchronous model-runner loader, so
+        # the scheduler only needs the disabled-state compatibility members.
+        self.lora_drainer = None
         self.enable_pdmux = False
         self.enable_metrics = server_args.enable_metrics
         self.enable_trace = False

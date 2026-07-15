@@ -15,3 +15,5 @@ separate_vocoder_process: true
 
 # The rebased upstream streaming vocoder supersedes the original masked-delay
 # tuning. Raw PCM requests select its one-frame startup path automatically.
+vocoder_stream_stride: 32
+vocoder_stream_followup_stride: 32

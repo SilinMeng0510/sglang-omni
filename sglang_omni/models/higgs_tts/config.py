@@ -41,6 +41,8 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     lora_max_rank: int = Field(default=32, ge=1)
     lora_max_cached_adapters: int = Field(default=8, ge=1)
     separate_vocoder_process: bool = False
+    vocoder_stream_stride: int = Field(default=75, ge=1)
+    vocoder_stream_followup_stride: int = Field(default=75, ge=1)
     stages: list[StageConfig] = Field(
         default_factory=lambda: [
             StageConfig(
@@ -86,7 +88,16 @@ class HiggsTtsPipelineConfig(PipelineConfig):
         super().model_post_init(__context)
         if self.enable_dynamic_lora and not self.lora_base_dir:
             raise ValueError("enable_dynamic_lora requires lora_base_dir")
+        colocated_fractions = {
+            "audio_encoder": 0.01,
+            "tts_engine": 0.90,
+            "vocoder": 0.09,
+        }
         for stage in self.stages:
+            if self.separate_vocoder_process and stage.name in colocated_fractions:
+                resources = stage.runtime.resources
+                if resources.total_gpu_memory_fraction is None:
+                    resources.total_gpu_memory_fraction = colocated_fractions[stage.name]
             if stage.name == "tts_engine":
                 stage.factory_args.update(
                     enable_dynamic_lora=self.enable_dynamic_lora,
@@ -98,6 +109,11 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                 )
             elif stage.name == "vocoder" and self.separate_vocoder_process:
                 stage.process = "vocoder"
+            if stage.name == "vocoder":
+                stage.factory_args.update(
+                    stream_stride=self.vocoder_stream_stride,
+                    stream_followup_stride=self.vocoder_stream_followup_stride,
+                )
 
     def requires_uploaded_voice_for_named_voice(self) -> bool:
         return True
