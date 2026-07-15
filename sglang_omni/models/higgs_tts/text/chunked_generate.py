@@ -61,9 +61,7 @@ class HiggsChunkedGenerate:
         # Reuse the caller's session id when present (WS) so cross-sentence and
         # cross-chunk share one engine session; else mint one from request_id.
         session_id = caller_session_id or request_id
-        session_final = (
-            bool(caller_session.get("final")) if caller_session_id else True
-        )
+        session_final = bool(caller_session.get("final")) if caller_session_id else True
         async for chunk in self._generate_chunked(
             client, request, chunks, request_id, session_id, session_final
         ):
@@ -89,7 +87,9 @@ class HiggsChunkedGenerate:
         text = self._extract_chunkable_text(request)
         if not text:
             return None
-        return self._text_chunker.chunk(text, cps=self._compute_cps_from_request(request))
+        return self._text_chunker.chunk(
+            text, cps=self._compute_cps_from_request(request)
+        )
 
     @staticmethod
     def _extract_chunkable_text(request: GenerateRequest) -> str | None:
@@ -117,8 +117,11 @@ class HiggsChunkedGenerate:
                 first = refs[0]
                 ref_text = ref_text or first.get("text")
                 vq = first.get("vq_codes")
-                if codec_frame_rate and isinstance(vq, list) and vq and isinstance(
-                    vq[0], list
+                if (
+                    codec_frame_rate
+                    and isinstance(vq, list)
+                    and vq
+                    and isinstance(vq[0], list)
                 ):
                     ref_dur_s = len(vq) / codec_frame_rate
 

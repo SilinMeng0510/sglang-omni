@@ -29,6 +29,7 @@ htmlcov/
 # Logs
 *.log
 *.txt
+!benchmarks/higgs_tts/sample_text.txt
 output.wav
 
 # OS
@@ -43,5 +44,9 @@ results/
 .tune-runs/
 .eval-runs/
 benchmarks/eval/*.edit.lock
+
+# Local Higgs TTS evaluation inputs and generated reports
+benchmarks/HIGGS_TTS_*.md
+benchmarks/higgs_tts/results/
 .claude/*
 !.claude/skills/

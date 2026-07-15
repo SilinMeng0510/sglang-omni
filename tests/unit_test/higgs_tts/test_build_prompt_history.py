@@ -15,7 +15,6 @@ from sglang_omni.models.higgs_tts.text.tokenizer import (
     HiggsTokenizerAdapter,
 )
 
-
 # Distinct, easy-to-spot specials for assertion readability.
 _SPECIALS = {
     "<|tts|>": 100,
@@ -54,21 +53,27 @@ def test_zero_shot_no_history(adapter: HiggsTokenizerAdapter) -> None:
     ids = adapter.build_prompt("AB", num_ref_tokens=0)
     assert ids == [
         _SPECIALS["<|tts|>"],
-        _SPECIALS["<|text|>"], 1065, 1066,
+        _SPECIALS["<|text|>"],
+        1065,
+        1066,
         _SPECIALS["<|audio|>"],
     ]
 
 
 def test_ref_only_no_history(adapter: HiggsTokenizerAdapter) -> None:
-    ids = adapter.build_prompt(
-        "AB", num_ref_tokens=3, reference_text="X"
-    )
+    ids = adapter.build_prompt("AB", num_ref_tokens=3, reference_text="X")
     P = AUDIO_PLACEHOLDER_ID
     assert ids == [
         _SPECIALS["<|tts|>"],
-        _SPECIALS["<|ref_text|>"], 1088,
-        _SPECIALS["<|ref_audio|>"], P, P, P,
-        _SPECIALS["<|text|>"], 1065, 1066,
+        _SPECIALS["<|ref_text|>"],
+        1088,
+        _SPECIALS["<|ref_audio|>"],
+        P,
+        P,
+        P,
+        _SPECIALS["<|text|>"],
+        1065,
+        1066,
         _SPECIALS["<|audio|>"],
     ]
 
@@ -86,17 +91,25 @@ def test_empty_history_list_matches_no_history(adapter: HiggsTokenizerAdapter) -
 
 def test_one_history_segment(adapter: HiggsTokenizerAdapter) -> None:
     hist = [([1077, 1078], 2)]  # "MN"-ish tokens + 2 audio placeholder rows
-    ids = adapter.build_prompt(
-        "AB", num_ref_tokens=3, reference_text="X", history=hist
-    )
+    ids = adapter.build_prompt("AB", num_ref_tokens=3, reference_text="X", history=hist)
     P = AUDIO_PLACEHOLDER_ID
     assert ids == [
         _SPECIALS["<|tts|>"],
-        _SPECIALS["<|ref_text|>"], 1088,                # ref_text + tok('X')
-        _SPECIALS["<|ref_audio|>"], P, P, P,            # ref_audio + 3 -100s
-        _SPECIALS["<|text|>"], 1077, 1078,              # history block
-        _SPECIALS["<|audio|>"], P, P,
-        _SPECIALS["<|text|>"], 1065, 1066,              # final text(AB)
+        _SPECIALS["<|ref_text|>"],
+        1088,  # ref_text + tok('X')
+        _SPECIALS["<|ref_audio|>"],
+        P,
+        P,
+        P,  # ref_audio + 3 -100s
+        _SPECIALS["<|text|>"],
+        1077,
+        1078,  # history block
+        _SPECIALS["<|audio|>"],
+        P,
+        P,
+        _SPECIALS["<|text|>"],
+        1065,
+        1066,  # final text(AB)
         _SPECIALS["<|audio|>"],
     ]
 
@@ -107,11 +120,27 @@ def test_many_history_segments(adapter: HiggsTokenizerAdapter) -> None:
     P = AUDIO_PLACEHOLDER_ID
     assert ids == [
         _SPECIALS["<|tts|>"],
-        _SPECIALS["<|ref_audio|>"], P, P,
-        _SPECIALS["<|text|>"], 1001, _SPECIALS["<|audio|>"], P,
-        _SPECIALS["<|text|>"], 1002, 1003, _SPECIALS["<|audio|>"], P, P,
-        _SPECIALS["<|text|>"], 1004, _SPECIALS["<|audio|>"], P, P, P,
-        _SPECIALS["<|text|>"], 1090,
+        _SPECIALS["<|ref_audio|>"],
+        P,
+        P,
+        _SPECIALS["<|text|>"],
+        1001,
+        _SPECIALS["<|audio|>"],
+        P,
+        _SPECIALS["<|text|>"],
+        1002,
+        1003,
+        _SPECIALS["<|audio|>"],
+        P,
+        P,
+        _SPECIALS["<|text|>"],
+        1004,
+        _SPECIALS["<|audio|>"],
+        P,
+        P,
+        P,
+        _SPECIALS["<|text|>"],
+        1090,
         _SPECIALS["<|audio|>"],
     ]
 
@@ -124,8 +153,12 @@ def test_zero_shot_with_history(adapter: HiggsTokenizerAdapter) -> None:
     P = AUDIO_PLACEHOLDER_ID
     assert ids == [
         _SPECIALS["<|tts|>"],
-        _SPECIALS["<|text|>"], 1001, _SPECIALS["<|audio|>"], P,
-        _SPECIALS["<|text|>"], 1090,
+        _SPECIALS["<|text|>"],
+        1001,
+        _SPECIALS["<|audio|>"],
+        P,
+        _SPECIALS["<|text|>"],
+        1090,
         _SPECIALS["<|audio|>"],
     ]
 

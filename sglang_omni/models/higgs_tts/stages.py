@@ -22,8 +22,10 @@ Pipeline shape::
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,10 @@ from sglang_omni.models.higgs_tts.audio.utils import (
     load_audio_to_24k,
     reverse_delay_pattern,
     to_codes_TN,
+)
+from sglang_omni.models.higgs_tts.lora import (
+    HIGGS_LORA_TARGET_MODULES,
+    validate_lora_adapter_model,
 )
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
@@ -67,9 +73,9 @@ def truncate_rope_to_bf16(model: torch.nn.Module) -> None:
     to match Higgs's bf16 training-time RoPE."""
     for module in model.modules():
         if hasattr(module, "cos_sin_cache"):
-            module.cos_sin_cache.data = module.cos_sin_cache.data.to(
-                torch.bfloat16
-            ).to(torch.float32)
+            module.cos_sin_cache.data = module.cos_sin_cache.data.to(torch.bfloat16).to(
+                torch.float32
+            )
 
 
 def resolve_checkpoint(checkpoint: str) -> str:
@@ -81,6 +87,149 @@ def resolve_checkpoint(checkpoint: str) -> str:
 
 # Reject ref audio past this many seconds
 _MAX_REF_AUDIO_SEC = 30
+
+
+def _resolve_voice(params: Any, metadata: Any) -> str:
+    """Resolve the speech voice from public-API metadata or legacy params."""
+    params = params if isinstance(params, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    tts_params = metadata.get("tts_params")
+    tts_params = tts_params if isinstance(tts_params, dict) else {}
+    return str(tts_params.get("voice") or params.get("voice") or "default")
+
+
+def _resolve_lora_adapter_path(metadata: Any) -> str | None:
+    """Read the request-scoped LoRA adapter path from speech metadata."""
+    metadata = metadata if isinstance(metadata, dict) else {}
+    tts_params = metadata.get("tts_params")
+    tts_params = tts_params if isinstance(tts_params, dict) else {}
+    config = tts_params.get("lora_adapter")
+    if config is None:
+        return None
+    if not isinstance(config, dict):
+        raise ValueError("lora_adapter must be an object containing 'path'")
+    path = config.get("path")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("lora_adapter.path must be a non-empty string")
+    return path.strip()
+
+
+class DynamicLoraCache:
+    """Load each adapter path once and reuse SGLang's GPU-resident weights."""
+
+    def __init__(
+        self,
+        load_adapter: Any,
+        *,
+        max_cached_adapters: int,
+        serve_model_name: str,
+        allowed_base_dir: str | Path,
+        initial_refs: Any = (),
+    ) -> None:
+        self._load_adapter = load_adapter
+        self._max_cached_adapters = int(max_cached_adapters)
+        self._serve_model_name = serve_model_name
+        try:
+            self._allowed_base_dir = (
+                Path(allowed_base_dir).expanduser().resolve(strict=True)
+            )
+        except OSError as exc:
+            raise ValueError(
+                f"LoRA base directory does not exist: {allowed_base_dir}"
+            ) from exc
+        if not self._allowed_base_dir.is_dir():
+            raise ValueError(
+                f"LoRA base directory is not a directory: {self._allowed_base_dir}"
+            )
+        self._refs_by_path: dict[str, Any] = {}
+        self._lock = threading.Lock()
+        self._capacity_warning_emitted = False
+        for ref in initial_refs:
+            path = getattr(ref, "lora_path", None)
+            if path:
+                resolved = str(Path(path).expanduser().resolve())
+                validate_lora_adapter_model(resolved, self._serve_model_name)
+                self._refs_by_path[resolved] = ref
+        self._warn_if_near_capacity()
+
+    def _warn_if_near_capacity(self) -> None:
+        warning_threshold = max(1, (self._max_cached_adapters * 4 + 4) // 5)
+        if (
+            not self._capacity_warning_emitted
+            and len(self._refs_by_path) >= warning_threshold
+        ):
+            logger.warning(
+                "Dynamic LoRA cache is at %d/%d adapters; new adapter paths "
+                "will fail when the cache is full",
+                len(self._refs_by_path),
+                self._max_cached_adapters,
+            )
+            self._capacity_warning_emitted = True
+
+    def get_or_load(self, path: str) -> str:
+        try:
+            resolved = Path(path).expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"LoRA adapter path does not exist: {path}") from exc
+        if not resolved.is_dir():
+            raise ValueError(f"LoRA adapter path is not a directory: {resolved}")
+        if not resolved.is_relative_to(self._allowed_base_dir):
+            raise ValueError(
+                f"LoRA adapter path {resolved} is outside allowed base directory "
+                f"{self._allowed_base_dir}"
+            )
+        cache_key = str(resolved)
+        # Request builders normally run on one scheduler thread, but keep the
+        # check/load/store transaction synchronized for alternate runtimes and
+        # future parallel request-building paths.
+        with self._lock:
+            cached = self._refs_by_path.get(cache_key)
+            if cached is not None:
+                logger.info("Dynamic LoRA cache hit: %s", cache_key)
+                return cached.lora_id
+            validate_lora_adapter_model(resolved, self._serve_model_name)
+            if len(self._refs_by_path) >= self._max_cached_adapters:
+                raise ValueError(
+                    "Dynamic LoRA cache is full "
+                    f"({self._max_cached_adapters} adapters); restart with a larger "
+                    "lora_max_cached_adapters value"
+                )
+
+            from sglang.srt.lora.lora_registry import LoRARef
+
+            digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:16]
+            name = f"dynamic-{digest}"
+            ref = LoRARef(
+                lora_id=LoRARef.deterministic_id(name, cache_key),
+                lora_name=name,
+                lora_path=cache_key,
+                pinned=False,
+            )
+            logger.info("Dynamic LoRA cache miss; loading adapter: %s", cache_key)
+            result = self._load_adapter(ref)
+            if not getattr(result, "success", False):
+                message = getattr(result, "error_message", "unknown loading error")
+                raise ValueError(f"Failed to load LoRA adapter {cache_key}: {message}")
+            self._refs_by_path[cache_key] = ref
+            self._warn_if_near_capacity()
+            logger.info("Dynamic LoRA adapter cached: %s", cache_key)
+            return ref.lora_id
+
+
+def _with_dynamic_lora_cache(request_builder: Any, cache: DynamicLoraCache | None):
+    def _build(payload: StagePayload):
+        state = HiggsTtsState.from_dict(payload.data)
+        if state.lora_adapter_path is not None:
+            if cache is None:
+                raise ValueError(
+                    "Request specifies lora_adapter, but dynamic LoRA loading is "
+                    "disabled; set enable_dynamic_lora=true"
+                )
+            state.lora_id = cache.get_or_load(state.lora_adapter_path)
+            payload.data = state.to_dict()
+        return request_builder(payload)
+
+    return _build
 
 
 def _build_higgs_audio_code_stream_outputs(
@@ -117,6 +266,7 @@ def create_preprocessing_executor(
     num_codebooks: int = 8,
     codebook_size: int = 1026,
     max_concurrency: int = 8,
+    lora_voices: dict[str, str] | None = None,
 ):
     """CPU stage: text tokenize + optional ref-audio file IO.
 
@@ -132,6 +282,23 @@ def create_preprocessing_executor(
     raw = Tokenizer.from_file(os.path.join(checkpoint_dir, "tokenizer.json"))
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=raw)
     adapter = HiggsTokenizerAdapter(tokenizer)
+
+    # ServerArgs assigns initial adapters stable UUID5 ids from name + path.
+    # The tokenizer manager normally performs this lookup, but the Omni TTS
+    # pipeline intentionally bypasses it, so preprocessing carries the same id
+    # through StagePayload instead.
+    lora_voice_ids: dict[str, str] = {}
+    if lora_voices:
+        from sglang.srt.lora.lora_registry import LoRARef
+
+        for lora_name, lora_path in lora_voices.items():
+            if not lora_name or not lora_path:
+                raise ValueError("Higgs LoRA voice names and paths must be non-empty")
+            if not Path(lora_path).is_dir():
+                raise FileNotFoundError(
+                    f"Higgs LoRA voice {lora_name!r} does not exist: {lora_path}"
+                )
+            lora_voice_ids[lora_name] = LoRARef.deterministic_id(lora_name, lora_path)
 
     def _preprocess(payload: StagePayload) -> StagePayload:
         inputs = payload.request.inputs or {}
@@ -153,6 +320,12 @@ def create_preprocessing_executor(
                         inputs["reference_audio"] = first.get(
                             "audio_path"
                         ) or first.get("path")
+
+        # The OpenAI speech API carries speech-only options in
+        # metadata["tts_params"]. Keep params as a fallback for internal and
+        # legacy callers that construct GenerateRequest directly.
+        voice = _resolve_voice(params, payload.request.metadata)
+        dynamic_lora_adapter_path = _resolve_lora_adapter_path(payload.request.metadata)
 
         # Continuity session tag (set by serve for chunked utterances); the
         # engine accumulates the audio and rebuilds the prompt. Unset = single-shot.
@@ -228,6 +401,8 @@ def create_preprocessing_executor(
             session_truncate_after=session_truncate_after,
             target_text_token_ids=target_text_token_ids,
             reference_text_token_ids=reference_text_token_ids,
+            lora_id=None if dynamic_lora_adapter_path else lora_voice_ids.get(voice),
+            lora_adapter_path=dynamic_lora_adapter_path,
             num_codebooks=num_codebooks,
             codebook_size=codebook_size,
             max_new_tokens=int(params.get("max_new_tokens", 1024)),
@@ -262,14 +437,17 @@ def create_audio_encoder_executor(
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=raw)
     adapter = HiggsTokenizerAdapter(tokenizer)
 
-    codec = get_or_load_codec(checkpoint_dir, device, dtype)
+    codec = None
 
     def _encode(payload: StagePayload) -> StagePayload:
+        nonlocal codec
         state = HiggsTtsState.from_dict(payload.data)
         waveform = state.reference_waveform
         if waveform is None:
             return payload
 
+        if codec is None:
+            codec = get_or_load_codec(checkpoint_dir, device, dtype)
         ref_codes_TN = codec.encode_reference(waveform, sample_rate=24000).to(
             torch.long
         )
@@ -304,6 +482,13 @@ def create_sglang_tts_engine_executor(
     max_new_tokens: int | None = 1024,
     max_history_chunks: int = 4,
     server_args_overrides: dict[str, Any] | None = None,
+    lora_voices: dict[str, str] | None = None,
+    lora_backend: str = "triton",
+    lora_max_rank: int = 32,
+    enable_dynamic_lora: bool = False,
+    lora_max_cached_adapters: int = 8,
+    lora_base_dir: str | None = None,
+    serve_model_name: str | None = None,
 ):
     """sglang-backed AR engine for Higgs TTS.
 
@@ -312,6 +497,11 @@ def create_sglang_tts_engine_executor(
     top-level ``max_history_chunks`` (yaml or CLI ``max_history_chunks=N``),
     which routes it here.
     """
+    serve_model_name = serve_model_name or model_path
+    if enable_dynamic_lora and not lora_base_dir:
+        raise ValueError("enable_dynamic_lora requires lora_base_dir")
+    for adapter_path in (lora_voices or {}).values():
+        validate_lora_adapter_model(adapter_path, serve_model_name)
     checkpoint_dir = resolve_checkpoint(model_path)
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
@@ -328,12 +518,38 @@ def create_sglang_tts_engine_executor(
     }
     if server_args_overrides:
         overrides.update(server_args_overrides)
+    if lora_voices or enable_dynamic_lora:
+        initial_lora_count = len(lora_voices or {})
+        max_loras_per_batch = (
+            max(lora_max_cached_adapters, initial_lora_count) + 1
+            if enable_dynamic_lora
+            else initial_lora_count + 1
+        )
+        # SGLang loads only the small adapter tensors and applies them per
+        # request, so base and multiple voices can safely share one batch.
+        overrides.update(
+            enable_lora=True,
+            lora_paths=dict(lora_voices or {}),
+            max_lora_rank=lora_max_rank,
+            max_loaded_loras=max_loras_per_batch,
+            max_loras_per_batch=max_loras_per_batch,
+            lora_backend=lora_backend,
+        )
+        if enable_dynamic_lora:
+            # With no initial adapter, SGLang cannot auto-detect which modules
+            # need LoRA buffers. Higgs training targets these seven projections.
+            overrides["lora_target_modules"] = list(HIGGS_LORA_TARGET_MODULES)
 
     server_args = build_sglang_server_args(
         checkpoint_dir,
         context_length=4096,
         **overrides,
     )
+    # ``build_sglang_server_args`` constructs the dataclass directly rather
+    # than going through SGLang's CLI parser.  Normalize name/path mappings to
+    # LoRARef objects here; LoRAManager intentionally accepts only LoRARef.
+    if isinstance(getattr(server_args, "lora_paths", None), dict):
+        server_args.check_lora_server_args()
     server_args.disable_overlap_schedule = True
 
     want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))
@@ -382,6 +598,23 @@ def create_sglang_tts_engine_executor(
         adapter=engine_adapter,
         session_store=session_store,
     )
+    dynamic_lora_cache = None
+    if enable_dynamic_lora:
+        lora_manager = model_worker.model_runner.lora_manager
+        dynamic_lora_cache = DynamicLoraCache(
+            model_worker.model_runner.load_lora_adapter,
+            max_cached_adapters=max(
+                lora_max_cached_adapters,
+                len(lora_manager.lora_refs),
+            ),
+            serve_model_name=serve_model_name,
+            allowed_base_dir=lora_base_dir,
+            initial_refs=lora_manager.lora_refs.values(),
+        )
+    request_builder = _with_dynamic_lora_cache(
+        request_builder,
+        dynamic_lora_cache,
+    )
 
     return OmniScheduler(
         tp_worker=model_worker,
@@ -410,6 +643,16 @@ def create_vocoder_executor(
     streaming: bool = False,
     audio_chunk_size: int | None = None,
     audio_chunk_overlap_size: int | None = None,
+    startup_full_chunk_frames: int = 8,
+    startup_full_chunk_count: int = 8,
+    full_context_streaming: bool = False,
+    context_frames: int = 9,
+    startup_reduced_context_frames: int | None = None,
+    startup_reduced_left_context_frames: int | None = None,
+    startup_reduced_context_until_frames: int = 0,
+    startup_masked_delay_rows: int | None = None,
+    startup_masked_emit_frames: int = 2,
+    startup_masked_until_frames: int = 0,
     num_codebooks: int = 8,
 ):
     """Decode Higgs delayed codes to a mono 24 kHz waveform.
@@ -433,6 +676,16 @@ def create_vocoder_executor(
             num_codebooks=num_codebooks,
             audio_chunk_size=audio_chunk_size,
             audio_chunk_overlap_size=audio_chunk_overlap_size,
+            startup_full_chunk_frames=startup_full_chunk_frames,
+            startup_full_chunk_count=startup_full_chunk_count,
+            full_context_streaming=full_context_streaming,
+            context_frames=context_frames,
+            startup_reduced_context_frames=startup_reduced_context_frames,
+            startup_reduced_left_context_frames=(startup_reduced_left_context_frames),
+            startup_reduced_context_until_frames=(startup_reduced_context_until_frames),
+            startup_masked_delay_rows=startup_masked_delay_rows,
+            startup_masked_emit_frames=startup_masked_emit_frames,
+            startup_masked_until_frames=startup_masked_until_frames,
             max_batch_size=max_batch_size,
             max_batch_wait_ms=max_batch_wait_ms,
         )

@@ -206,6 +206,12 @@ class SpeechReference(BaseModel):
         return _check_inline_ref_audio_length(value)
 
 
+class LoRAAdapterConfig(BaseModel):
+    """Request-scoped LoRA adapter loaded from a server-visible directory."""
+
+    path: str = Field(min_length=1, max_length=4096)
+
+
 class CreateSpeechRequest(BaseModel):
     """OpenAI-compatible text-to-speech request.
 
@@ -235,6 +241,7 @@ class CreateSpeechRequest(BaseModel):
     x_vector_only_mode: bool | None = None
     speaker_embedding: list[float] | None = Field(default=None, max_length=8192)
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    lora_adapter: LoRAAdapterConfig | None = None
 
     # Generation parameters
     max_new_tokens: int | None = None

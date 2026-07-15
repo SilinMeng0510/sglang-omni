@@ -8,7 +8,7 @@ Per-request algorithm each step (codebook logits ``[N, V]`` in, codes
 
 1. If ``generation_done``: return ``[-1, ..., -1]`` (stop signal).
 2. Sample ``N`` codebooks independently from the logits (temperature / top-k /
-   top-p / multinomial; or argmax when temperature <= 0).
+   top-p / categorical inverse CDF; or argmax when temperature <= 0).
 3. **Delay window** (``delay_count < N``): force codebooks at indices
    ``> delay_count`` to :data:`BOC_ID`. Increment ``delay_count``.
 4. **Wind-down** (``eoc_countdown is not None``): free sampling, decrement.
@@ -41,6 +41,8 @@ class HiggsSamplerState:
     eoc_countdown: int | None = None
     generation_done: bool = False
     last_codes: torch.Tensor | None = None
+    sampling_seed: int = 0
+    sampling_step: int = 0
 
 
 class HiggsBatchedSamplerState:
@@ -70,12 +72,20 @@ class HiggsBatchedSamplerState:
             dtype=torch.long,
             device=self.device,
         )
+        self.sampling_seed = torch.zeros(
+            self.max_batch_size, dtype=torch.long, device=self.device
+        )
+        self.sampling_step = torch.zeros(
+            self.max_batch_size, dtype=torch.long, device=self.device
+        )
 
     def reset_row(self, row: int) -> None:
         self.delay_count[row] = 0
         self.eoc_countdown[row] = -1
         self.generation_done[row] = False
         self.last_codes[row].zero_()
+        self.sampling_seed[row] = 0
+        self.sampling_step[row] = 0
 
     def view_row(self, row: int) -> HiggsSamplerState:
         delay = int(self.delay_count[row].item())
@@ -86,6 +96,8 @@ class HiggsBatchedSamplerState:
             eoc_countdown=None if eoc < 0 else eoc,
             generation_done=bool(self.generation_done[row].item()),
             last_codes=None if delay == 0 else self.last_codes[row],
+            sampling_seed=int(self.sampling_seed[row].item()),
+            sampling_step=int(self.sampling_step[row].item()),
         )
 
     def write_row(self, row: int, state: HiggsSamplerState) -> None:
@@ -96,9 +108,38 @@ class HiggsBatchedSamplerState:
         self.generation_done[row] = state.generation_done
         if state.last_codes is not None:
             self.last_codes[row].copy_(state.last_codes.to(self.last_codes.dtype))
+        self.sampling_seed[row] = state.sampling_seed
+        self.sampling_step[row] = state.sampling_step
 
 
 _GREEDY_TEMP_THRESHOLD = 1e-5
+
+
+def _deterministic_uniforms(
+    sampling_seed: torch.Tensor,
+    sampling_step: torch.Tensor,
+    num_codebooks: int,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Graph-safe per-request uniforms derived from seed, step, and codebook.
+
+    A 31-bit modular LCG is sufficient here: inverse-CDF sampling consumes one
+    uniform per codebook, and unlike ``torch.multinomial`` this is independent
+    of request batching/order and reproducible under CUDA graph replay.
+    """
+    prime = 2_147_483_647
+    codebooks = torch.arange(
+        num_codebooks, device=sampling_seed.device, dtype=torch.long
+    ).view(1, num_codebooks)
+    value = torch.remainder(
+        sampling_seed.view(-1, 1)
+        + sampling_step.view(-1, 1) * 1_103_515_245
+        + codebooks * 12_345,
+        prime,
+    )
+    value = torch.remainder(value * 48_271, prime)
+    return (value.to(dtype) + 0.5) / float(prime)
 
 
 def _sample_independent(
@@ -107,6 +148,8 @@ def _sample_independent(
     temperature: float,
     top_p: float | None,
     top_k: int | None,
+    sampling_seed: int = 0,
+    sampling_step: int = 0,
 ) -> torch.Tensor:
     # Short-circuit greedy to dodge the inf/NaN from logits / tiny_temperature.
     if temperature <= _GREEDY_TEMP_THRESHOLD:
@@ -131,7 +174,17 @@ def _sample_independent(
         logits = torch.where(scatter, float("-inf"), logits)
 
     probs = logits.softmax(dim=-1)
-    return probs.multinomial(num_samples=1).squeeze(-1)
+    uniforms = _deterministic_uniforms(
+        torch.tensor([sampling_seed], device=logits.device, dtype=torch.long),
+        torch.tensor([sampling_step], device=logits.device, dtype=torch.long),
+        logits.shape[0],
+        dtype=probs.dtype,
+    )[0]
+    return (
+        (probs.cumsum(dim=-1) < uniforms.unsqueeze(-1))
+        .sum(dim=-1)
+        .clamp(max=logits.shape[-1] - 1)
+    )
 
 
 def _batched_sample_independent(
@@ -140,6 +193,8 @@ def _batched_sample_independent(
     temperature: torch.Tensor,
     top_p: torch.Tensor,
     top_k: torch.Tensor,
+    sampling_seed: torch.Tensor,
+    sampling_step: torch.Tensor,
 ) -> torch.Tensor:
     """Graph-safe batched variant of :func:`_sample_independent`.
 
@@ -174,8 +229,11 @@ def _batched_sample_independent(
     sorted_logits = sorted_logits.masked_fill(top_p_remove, -float("inf"))
 
     probs = sorted_logits.softmax(dim=-1)
-    sampled_rank = torch.multinomial(probs.reshape(B * N, V), num_samples=1).reshape(
-        B, N
+    uniforms = _deterministic_uniforms(
+        sampling_seed[:B], sampling_step[:B], N, dtype=probs.dtype
+    )
+    sampled_rank = (
+        (probs.cumsum(dim=-1) < uniforms.unsqueeze(-1)).sum(dim=-1).clamp(max=V - 1)
     )
     sampled_codes = sorted_indices.gather(-1, sampled_rank.unsqueeze(-1)).squeeze(-1)
 
@@ -195,6 +253,8 @@ def _batched_step_direct_inplace(
     temperature: torch.Tensor,
     top_p: torch.Tensor,
     top_k: torch.Tensor,
+    sampling_seed: torch.Tensor,
+    sampling_step: torch.Tensor,
     boc_id: int = BOC_ID,
     eoc_id: int = EOC_ID,
 ) -> torch.Tensor:
@@ -216,10 +276,15 @@ def _batched_step_direct_inplace(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        sampling_seed=sampling_seed,
+        sampling_step=sampling_step,
     )
 
     was_done = generation_done[:B].clone()
     active = ~was_done
+    sampling_step[:B].copy_(
+        torch.where(active, sampling_step[:B] + 1, sampling_step[:B])
+    )
 
     delay_active = active & (delay_count[:B] < N)
     next_cb = delay_count[:B] + 1
@@ -277,6 +342,8 @@ def batched_step(
     top_p: torch.Tensor | None = None,
     top_k: torch.Tensor | None = None,
     top_k_buf: torch.Tensor | None = None,
+    sampling_seed: torch.Tensor | None = None,
+    sampling_step: torch.Tensor | None = None,
     boc_id: int = BOC_ID,
     eoc_id: int = EOC_ID,
 ) -> torch.Tensor:
@@ -294,6 +361,8 @@ def batched_step(
         local_generation_done = state.generation_done[row_indices].clone()
         local_last_codes = state.last_codes[row_indices].clone()
         local_has_last_codes = local_delay_count > 0
+        local_sampling_seed = state.sampling_seed[row_indices].clone()
+        local_sampling_step = state.sampling_step[row_indices].clone()
         codes = _batched_step_direct_inplace(
             logits_BNV,
             delay_count=local_delay_count,
@@ -304,6 +373,8 @@ def batched_step(
             temperature=temperature,
             top_p=top_p if top_p is not None else torch.ones_like(temperature),
             top_k=top_k_buf if top_k_buf is not None else top_k,
+            sampling_seed=local_sampling_seed,
+            sampling_step=local_sampling_step,
             boc_id=boc_id,
             eoc_id=eoc_id,
         )
@@ -313,6 +384,8 @@ def batched_step(
         )
         state.generation_done[row_indices] = local_generation_done
         state.last_codes[row_indices] = local_last_codes
+        state.sampling_seed[row_indices] = local_sampling_seed
+        state.sampling_step[row_indices] = local_sampling_step
         return codes
 
     if (
@@ -321,6 +394,8 @@ def batched_step(
         or generation_done is None
         or last_codes is None
         or has_last_codes is None
+        or sampling_seed is None
+        or sampling_step is None
     ):
         raise ValueError("direct state tensors are required when state is not provided")
     if top_p is None:
@@ -335,6 +410,8 @@ def batched_step(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k if top_k is not None else top_k_buf,
+        sampling_seed=sampling_seed,
+        sampling_step=sampling_step,
         boc_id=boc_id,
         eoc_id=eoc_id,
     )
@@ -377,7 +454,10 @@ def step(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        sampling_seed=state.sampling_seed,
+        sampling_step=state.sampling_step,
     ).to(torch.long)
+    state.sampling_step += 1
 
     if state.delay_count < N:
         next_cb = state.delay_count + 1

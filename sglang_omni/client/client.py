@@ -41,9 +41,7 @@ class Client:
         stream_builder: Callable[[str, StreamMessage], GenerateChunk] | None = None,
         *,
         generate_middleware: (
-            Callable[
-                ["Client", GenerateRequest, str], AsyncIterator[GenerateChunk]
-            ]
+            Callable[["Client", GenerateRequest, str], AsyncIterator[GenerateChunk]]
             | None
         ) = None,
     ) -> None:

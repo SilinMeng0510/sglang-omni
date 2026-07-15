@@ -24,9 +24,9 @@ import torch
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.higgs_tts.audio.utils import EOC_ID
 from sglang_omni.models.higgs_tts.sampler import STOP_CODE
 from sglang_omni.models.higgs_tts.text.tokenizer import AUDIO_PLACEHOLDER_ID
-from sglang_omni.models.higgs_tts.audio.utils import EOC_ID
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +170,8 @@ class HiggsTTSModelRunner(ModelRunner):
         temperatures: list[float] = []
         top_ps: list[float] = []
         top_ks: list[int] = []
+        sampling_seeds: list[int] = []
+        sampling_steps: list[int] = []
 
         model._graph_has_last_codes[:batch_size].fill_(False)
         model._graph_last_codes[:batch_size].zero_()
@@ -198,6 +200,14 @@ class HiggsTTSModelRunner(ModelRunner):
             temperatures.append(temperature)
             top_ps.append(top_p)
             top_ks.append(top_k)
+            seed_value = getattr(sampling_info, "sampling_seed", None)
+            if sampler.sampling_step == 0 and seed_value is not None:
+                item = seed_value[row_idx]
+                sampler.sampling_seed = int(
+                    item.item() if hasattr(item, "item") else item
+                )
+            sampling_seeds.append(int(sampler.sampling_seed))
+            sampling_steps.append(int(sampler.sampling_step))
 
         model._graph_delay_count[:batch_size].copy_(
             torch.tensor(
@@ -226,6 +236,20 @@ class HiggsTTSModelRunner(ModelRunner):
         )
         model._graph_top_k[:batch_size].copy_(
             torch.tensor(top_ks, device=device, dtype=model._graph_top_k.dtype)
+        )
+        model._graph_sampling_seed[:batch_size].copy_(
+            torch.tensor(
+                sampling_seeds,
+                device=device,
+                dtype=model._graph_sampling_seed.dtype,
+            )
+        )
+        model._graph_sampling_step[:batch_size].copy_(
+            torch.tensor(
+                sampling_steps,
+                device=device,
+                dtype=model._graph_sampling_step.dtype,
+            )
         )
 
     def _collect_step_outputs(self, result: Any, requests: list) -> None:
@@ -308,6 +332,8 @@ class HiggsTTSModelRunner(ModelRunner):
         eoc_countdown = int(model._graph_eoc_countdown[row_idx].item())
         sampler.eoc_countdown = None if eoc_countdown < 0 else eoc_countdown
         sampler.generation_done = bool(model._graph_generation_done[row_idx].item())
+        sampler.sampling_seed = int(model._graph_sampling_seed[row_idx].item())
+        sampler.sampling_step = int(model._graph_sampling_step[row_idx].item())
         if bool(model._graph_has_last_codes[row_idx].item()):
             sampler.last_codes = (
                 model._graph_last_codes[row_idx].detach().clone().to(torch.long)

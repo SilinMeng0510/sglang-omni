@@ -22,6 +22,10 @@ class HiggsTtsState:
     reference_waveform: Any | None = None
     target_text_token_ids: list[int] | None = None
     reference_text_token_ids: list[int] | None = None
+    # SGLang's deterministic adapter id.  ``None`` selects the base model.
+    lora_id: str | None = None
+    # Server-visible PEFT adapter directory for request-scoped dynamic loading.
+    lora_adapter_path: str | None = None
 
     # Cross-chunk continuity
     session_id: str | None = None
@@ -71,6 +75,10 @@ class HiggsTtsState:
             data["target_text_token_ids"] = self.target_text_token_ids
         if self.reference_text_token_ids is not None:
             data["reference_text_token_ids"] = self.reference_text_token_ids
+        if self.lora_id is not None:
+            data["lora_id"] = self.lora_id
+        if self.lora_adapter_path is not None:
+            data["lora_adapter_path"] = self.lora_adapter_path
         for key in ("top_p", "top_k", "seed"):
             value = getattr(self, key)
             if value is not None:
@@ -98,6 +106,8 @@ class HiggsTtsState:
             session_truncate_after=data.get("session_truncate_after"),
             target_text_token_ids=data.get("target_text_token_ids"),
             reference_text_token_ids=data.get("reference_text_token_ids"),
+            lora_id=data.get("lora_id"),
+            lora_adapter_path=data.get("lora_adapter_path"),
             num_codebooks=data.get("num_codebooks", 8),
             codebook_size=data.get("codebook_size", 1026),
             max_new_tokens=data.get("max_new_tokens", 1024),

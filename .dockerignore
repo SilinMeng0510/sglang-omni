@@ -11,6 +11,7 @@ dist
 *.egg-info
 playground/tts-web
 tests/data
+benchmarks/higgs_tts/results
 *.wav
 *.mp3
 *.flac

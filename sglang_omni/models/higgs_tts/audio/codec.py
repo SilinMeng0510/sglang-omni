@@ -31,9 +31,7 @@ _CODEC_IN_TTS_CKPT_PREFIX = "tied.embedding.modality_embeddings.0.model."
 # Codec architecture config, vendored byte-for-byte from
 # https://huggingface.co/bosonai/higgs-audio-v2-tokenizer/blob/main/config.json.
 # Read once here; reused for the class constants below and in from_pretrained.
-_BUNDLED_CODEC_CONFIG = json.loads(
-    (Path(__file__).parent / "config.json").read_text()
-)
+_BUNDLED_CODEC_CONFIG = json.loads((Path(__file__).parent / "config.json").read_text())
 
 
 def _codec_hop_length(cfg: dict) -> int:
@@ -205,6 +203,58 @@ class HiggsAudioCodec:
             .to(device=self.device, dtype=torch.long)
         )
         return self.model.decode(codes_BNT).audio_values.squeeze(0).squeeze(0).cpu()
+
+    @torch.no_grad()
+    def decode_batch(self, codes_BTN: torch.Tensor) -> torch.Tensor:
+        """Equal-length ``[B, T, N]`` codes → mono waveforms ``[B, L]``."""
+        if codes_BTN.ndim != 3:
+            raise ValueError(
+                f"codes must be 3-D [B, T, N], got {tuple(codes_BTN.shape)}"
+            )
+        codes_BNT = codes_BTN.transpose(1, 2).to(device=self.device, dtype=torch.long)
+        return self.model.decode(codes_BNT).audio_values.squeeze(1).cpu()
+
+    @torch.no_grad()
+    def decode_masked_batch(
+        self, codes_BTN: torch.Tensor, codebook_counts_BT: torch.Tensor
+    ) -> torch.Tensor:
+        """Decode ragged leading RVQ codebooks without fake token-id padding.
+
+        ``codebook_counts_BT[b, t]`` says how many leading residual
+        quantizers are genuinely available at each frame. Missing residuals
+        contribute the additive identity instead of the learned embedding for
+        token id zero.
+        """
+        if codes_BTN.ndim != 3:
+            raise ValueError(
+                f"codes must be 3-D [B, T, N], got {tuple(codes_BTN.shape)}"
+            )
+        if codebook_counts_BT.shape != codes_BTN.shape[:2]:
+            raise ValueError(
+                "codebook counts must have shape [B, T], got "
+                f"{tuple(codebook_counts_BT.shape)} for codes "
+                f"{tuple(codes_BTN.shape)}"
+            )
+        codes_BTN = codes_BTN.to(device=self.device, dtype=torch.long)
+        counts = codebook_counts_BT.to(device=self.device, dtype=torch.long)
+        num_codebooks = int(codes_BTN.shape[2])
+        if torch.any(counts < 1) or torch.any(counts > num_codebooks):
+            raise ValueError(f"codebook counts must be within [1, {num_codebooks}]")
+
+        quantized = None
+        quantizers = self.model.quantizer.quantizers
+        if num_codebooks > len(quantizers):
+            raise ValueError(
+                f"got {num_codebooks} codebooks but codec has {len(quantizers)}"
+            )
+        max_available_codebooks = int(counts.max().item())
+        for codebook in range(max_available_codebooks):
+            contribution = quantizers[codebook].decode(codes_BTN[:, :, codebook])
+            mask = (counts > codebook).to(contribution.dtype).unsqueeze(1)
+            contribution = contribution * mask
+            quantized = contribution if quantized is None else quantized + contribution
+        quantized_acoustic = self.model.fc2(quantized.transpose(1, 2)).transpose(1, 2)
+        return self.model.acoustic_decoder(quantized_acoustic).squeeze(1).cpu()
 
 
 __all__ = ["HiggsAudioCodec"]
