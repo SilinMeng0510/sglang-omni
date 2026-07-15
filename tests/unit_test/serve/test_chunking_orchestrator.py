@@ -247,7 +247,10 @@ def test_cps_audio_path_never_loads_audio() -> None:
     # A raw audio_path (no codes) must NOT trigger any audio I/O — duration is
     # unknown so CPS is left to the chunker. (vq_codes is the only source.)
     req = GenerateRequest(
-        prompt={"text": "x", "references": [{"text": "AB", "audio_path": "/local.wav"}]},
+        prompt={
+            "text": "x",
+            "references": [{"text": "AB", "audio_path": "/local.wav"}],
+        },
         metadata={"task": "tts"},
     )
     orch = _orch()

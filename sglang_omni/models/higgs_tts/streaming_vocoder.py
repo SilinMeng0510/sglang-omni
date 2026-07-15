@@ -495,7 +495,9 @@ class HiggsVocoderScheduler:
         self._request_params: dict[str, dict[str, Any]] = {}
         self._stream_states: dict[str, _HiggsStreamState] = {}
         self._pending_done: set[str] = set()
-        self._aborted_request_ids: set[str] = set()
+        self._aborted_request_ids: collections.OrderedDict[str, None] = (
+            collections.OrderedDict()
+        )
 
     def start(self) -> None:
         self._running = True
@@ -529,11 +531,12 @@ class HiggsVocoderScheduler:
         self._running = False
 
     def abort(self, request_id: str) -> None:
-        self._aborted_request_ids.add(request_id)
+        self._aborted_request_ids[request_id] = None
+        self._aborted_request_ids.move_to_end(request_id)
         if len(self._aborted_request_ids) > _ABORTED_REQUEST_ID_LIMIT:
             excess = len(self._aborted_request_ids) - _ABORTED_REQUEST_ID_RETAINED
-            for rid in list(self._aborted_request_ids)[:excess]:
-                self._aborted_request_ids.discard(rid)
+            for _ in range(excess):
+                self._aborted_request_ids.popitem(last=False)
         self._clear_request_state(request_id, keep_aborted=True)
 
     def _next_message(self) -> IncomingMessage | None:
@@ -545,7 +548,7 @@ class HiggsVocoderScheduler:
             return None
 
     def _handle_new_request(self, request_id: str, payload: StagePayload) -> None:
-        self._aborted_request_ids.discard(request_id)
+        self._aborted_request_ids.pop(request_id, None)
         if not self._is_streaming_payload(payload):
             self._clear_request_state(request_id)
             result = self._vocode_full(payload)
@@ -1002,7 +1005,7 @@ class HiggsVocoderScheduler:
         self._stream_states.pop(request_id, None)
         self._pending_done.discard(request_id)
         if not keep_aborted:
-            self._aborted_request_ids.discard(request_id)
+            self._aborted_request_ids.pop(request_id, None)
 
     @staticmethod
     def _is_streaming_payload(payload: StagePayload) -> bool:

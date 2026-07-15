@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +44,10 @@ from sglang_omni.models.higgs_tts.audio.utils import (
     reverse_delay_pattern,
     to_codes_TN,
 )
-from sglang_omni.models.higgs_tts.lora import validate_lora_adapter_model
+from sglang_omni.models.higgs_tts.lora import (
+    HIGGS_LORA_TARGET_MODULES,
+    validate_lora_adapter_model,
+)
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.request_builders import make_higgs_scheduler_adapters
@@ -83,15 +87,6 @@ def resolve_checkpoint(checkpoint: str) -> str:
 
 # Reject ref audio past this many seconds
 _MAX_REF_AUDIO_SEC = 30
-_HIGGS_LORA_TARGET_MODULES = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-]
 
 
 def _resolve_voice(params: Any, metadata: Any) -> str:
@@ -128,18 +123,48 @@ class DynamicLoraCache:
         *,
         max_cached_adapters: int,
         serve_model_name: str,
+        allowed_base_dir: str | Path,
         initial_refs: Any = (),
     ) -> None:
         self._load_adapter = load_adapter
         self._max_cached_adapters = int(max_cached_adapters)
         self._serve_model_name = serve_model_name
+        try:
+            self._allowed_base_dir = (
+                Path(allowed_base_dir).expanduser().resolve(strict=True)
+            )
+        except OSError as exc:
+            raise ValueError(
+                f"LoRA base directory does not exist: {allowed_base_dir}"
+            ) from exc
+        if not self._allowed_base_dir.is_dir():
+            raise ValueError(
+                f"LoRA base directory is not a directory: {self._allowed_base_dir}"
+            )
         self._refs_by_path: dict[str, Any] = {}
+        self._lock = threading.Lock()
+        self._capacity_warning_emitted = False
         for ref in initial_refs:
             path = getattr(ref, "lora_path", None)
             if path:
                 resolved = str(Path(path).expanduser().resolve())
                 validate_lora_adapter_model(resolved, self._serve_model_name)
                 self._refs_by_path[resolved] = ref
+        self._warn_if_near_capacity()
+
+    def _warn_if_near_capacity(self) -> None:
+        warning_threshold = max(1, (self._max_cached_adapters * 4 + 4) // 5)
+        if (
+            not self._capacity_warning_emitted
+            and len(self._refs_by_path) >= warning_threshold
+        ):
+            logger.warning(
+                "Dynamic LoRA cache is at %d/%d adapters; new adapter paths "
+                "will fail when the cache is full",
+                len(self._refs_by_path),
+                self._max_cached_adapters,
+            )
+            self._capacity_warning_emitted = True
 
     def get_or_load(self, path: str) -> str:
         try:
@@ -148,37 +173,47 @@ class DynamicLoraCache:
             raise ValueError(f"LoRA adapter path does not exist: {path}") from exc
         if not resolved.is_dir():
             raise ValueError(f"LoRA adapter path is not a directory: {resolved}")
-        cache_key = str(resolved)
-        cached = self._refs_by_path.get(cache_key)
-        if cached is not None:
-            logger.info("Dynamic LoRA cache hit: %s", cache_key)
-            return cached.lora_id
-        validate_lora_adapter_model(resolved, self._serve_model_name)
-        if len(self._refs_by_path) >= self._max_cached_adapters:
+        if not resolved.is_relative_to(self._allowed_base_dir):
             raise ValueError(
-                "Dynamic LoRA cache is full "
-                f"({self._max_cached_adapters} adapters); restart with a larger "
-                "lora_max_cached_adapters value"
+                f"LoRA adapter path {resolved} is outside allowed base directory "
+                f"{self._allowed_base_dir}"
             )
+        cache_key = str(resolved)
+        # Request builders normally run on one scheduler thread, but keep the
+        # check/load/store transaction synchronized for alternate runtimes and
+        # future parallel request-building paths.
+        with self._lock:
+            cached = self._refs_by_path.get(cache_key)
+            if cached is not None:
+                logger.info("Dynamic LoRA cache hit: %s", cache_key)
+                return cached.lora_id
+            validate_lora_adapter_model(resolved, self._serve_model_name)
+            if len(self._refs_by_path) >= self._max_cached_adapters:
+                raise ValueError(
+                    "Dynamic LoRA cache is full "
+                    f"({self._max_cached_adapters} adapters); restart with a larger "
+                    "lora_max_cached_adapters value"
+                )
 
-        from sglang.srt.lora.lora_registry import LoRARef
+            from sglang.srt.lora.lora_registry import LoRARef
 
-        digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:16]
-        name = f"dynamic-{digest}"
-        ref = LoRARef(
-            lora_id=LoRARef.deterministic_id(name, cache_key),
-            lora_name=name,
-            lora_path=cache_key,
-            pinned=False,
-        )
-        logger.info("Dynamic LoRA cache miss; loading adapter: %s", cache_key)
-        result = self._load_adapter(ref)
-        if not getattr(result, "success", False):
-            message = getattr(result, "error_message", "unknown loading error")
-            raise ValueError(f"Failed to load LoRA adapter {cache_key}: {message}")
-        self._refs_by_path[cache_key] = ref
-        logger.info("Dynamic LoRA adapter cached: %s", cache_key)
-        return ref.lora_id
+            digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:16]
+            name = f"dynamic-{digest}"
+            ref = LoRARef(
+                lora_id=LoRARef.deterministic_id(name, cache_key),
+                lora_name=name,
+                lora_path=cache_key,
+                pinned=False,
+            )
+            logger.info("Dynamic LoRA cache miss; loading adapter: %s", cache_key)
+            result = self._load_adapter(ref)
+            if not getattr(result, "success", False):
+                message = getattr(result, "error_message", "unknown loading error")
+                raise ValueError(f"Failed to load LoRA adapter {cache_key}: {message}")
+            self._refs_by_path[cache_key] = ref
+            self._warn_if_near_capacity()
+            logger.info("Dynamic LoRA adapter cached: %s", cache_key)
+            return ref.lora_id
 
 
 def _with_dynamic_lora_cache(request_builder: Any, cache: DynamicLoraCache | None):
@@ -452,6 +487,7 @@ def create_sglang_tts_engine_executor(
     lora_max_rank: int = 32,
     enable_dynamic_lora: bool = False,
     lora_max_cached_adapters: int = 8,
+    lora_base_dir: str | None = None,
     serve_model_name: str | None = None,
 ):
     """sglang-backed AR engine for Higgs TTS.
@@ -462,6 +498,8 @@ def create_sglang_tts_engine_executor(
     which routes it here.
     """
     serve_model_name = serve_model_name or model_path
+    if enable_dynamic_lora and not lora_base_dir:
+        raise ValueError("enable_dynamic_lora requires lora_base_dir")
     for adapter_path in (lora_voices or {}).values():
         validate_lora_adapter_model(adapter_path, serve_model_name)
     checkpoint_dir = resolve_checkpoint(model_path)
@@ -500,7 +538,7 @@ def create_sglang_tts_engine_executor(
         if enable_dynamic_lora:
             # With no initial adapter, SGLang cannot auto-detect which modules
             # need LoRA buffers. Higgs training targets these seven projections.
-            overrides["lora_target_modules"] = list(_HIGGS_LORA_TARGET_MODULES)
+            overrides["lora_target_modules"] = list(HIGGS_LORA_TARGET_MODULES)
 
     server_args = build_sglang_server_args(
         checkpoint_dir,
@@ -570,6 +608,7 @@ def create_sglang_tts_engine_executor(
                 len(lora_manager.lora_refs),
             ),
             serve_model_name=serve_model_name,
+            allowed_base_dir=lora_base_dir,
             initial_refs=lora_manager.lora_refs.values(),
         )
     request_builder = _with_dynamic_lora_cache(

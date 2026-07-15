@@ -237,9 +237,7 @@ def test_streaming_speech_ws_input_wait_flushes_unterminated_tail() -> None:
         ws.send_json({"type": "input.text", "text": "See you guys tomorrow night!"})
         # Nothing emitted yet — the whole sentence is held in the chunker buffer.
         ws.send_json({"type": "input.wait"})
-        assert (
-            ws.receive_json()["sentence_text"] == "See you guys tomorrow night!"
-        )
+        assert ws.receive_json()["sentence_text"] == "See you guys tomorrow night!"
         assert ws.receive_bytes() == "audio:See you guys tomorrow night!".encode()
         assert ws.receive_json()["type"] == "audio.done"
         # Session still open: a second turn (also unterminated) flushes on done.

@@ -160,9 +160,7 @@ def test_streaming_flush_drains_remaining_buffer() -> None:
 def test_fastout_releases_first_clause_then_sentences() -> None:
     # First chunk cuts at the earliest clause boundary (CJK comma); every later
     # chunk uses sentence boundaries, so the comma in "三，四。" does NOT split.
-    c = HiggsTextChunker(
-        ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True)
-    )
+    c = HiggsTextChunker(ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True))
     assert c.add_text("一，二。三，四。") == ["一，", "二。", "三，四。"]
     assert c.flush() == []
 
@@ -170,9 +168,7 @@ def test_fastout_releases_first_clause_then_sentences() -> None:
 def test_fastout_first_chunk_cuts_at_ascii_comma() -> None:
     # ASCII "," before whitespace is a clause boundary too (not just CJK "，"),
     # so an English opening clause is released early for low first-audio latency.
-    c = HiggsTextChunker(
-        ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True)
-    )
+    c = HiggsTextChunker(ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True))
     out = c.add_text("Hello everyone, welcome to the show!") + list(c.flush())
     assert out == ["Hello everyone,", "welcome to the show!"]
 
@@ -180,17 +176,13 @@ def test_fastout_first_chunk_cuts_at_ascii_comma() -> None:
 def test_fastout_first_chunk_never_splits_inside_a_number() -> None:
     # The comma in "1,288" has no following space, so even as the first fastout
     # chunk it stays intact; the cut lands on the clause comma after "yuan".
-    c = HiggsTextChunker(
-        ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True)
-    )
+    c = HiggsTextChunker(ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True))
     out = c.add_text("Original price 1,288 yuan, going fast!") + list(c.flush())
     assert out == ["Original price 1,288 yuan,", "going fast!"]
 
 
 def test_fastout_only_affects_the_first_chunk() -> None:
-    c = HiggsTextChunker(
-        ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True)
-    )
+    c = HiggsTextChunker(ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True))
     # Earliest clause boundary releases chunk 1 right away.
     assert c.add_text("第一句，") == ["第一句，"]
     # Now in sentence mode: a clause comma alone is NOT a cut point.
@@ -202,9 +194,7 @@ def test_fastout_only_affects_the_first_chunk() -> None:
 def test_reset_drops_buffer_and_state_for_barge_in() -> None:
     # input.stop: the interrupted turn's buffered tail + propagated tag state are
     # abandoned; the next turn starts clean and fastout-armed.
-    c = HiggsTextChunker(
-        ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True)
-    )
+    c = HiggsTextChunker(ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True))
     # A state tag propagates and an unterminated tail is buffered.
     c.add_text("<|emotion:joy|>Half a sentence with no")
     c.reset()
@@ -214,9 +204,7 @@ def test_reset_drops_buffer_and_state_for_barge_in() -> None:
     assert list(c.flush()) == ["here we go!"]
     # rearm_fastout (input.wait) makes the next turn open at a clause boundary
     # again — without it, the post-first sentence mode would keep "三，四。" whole.
-    c = HiggsTextChunker(
-        ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True)
-    )
+    c = HiggsTextChunker(ChunkerOptions(max_seconds=8.0, cps=10.0, fastout=True))
     assert c.add_text("一，二。") == ["一，", "二。"]
     c.rearm_fastout()
     assert c.add_text("三，四。") == ["三，", "四。"]
@@ -325,7 +313,9 @@ def test_realistic_phone_stays_in_one_chunk() -> None:
     # In real text a phone number is short and under budget, so it never even
     # reaches refine — no special handling needed for the common case.
     c = HiggsTextChunker(ChunkerOptions(max_seconds=8.0, cps=10.0))
-    assert c.chunk("请拨打510-320-7725联系我们", cps=10.0) == ["请拨打510-320-7725联系我们"]
+    assert c.chunk("请拨打510-320-7725联系我们", cps=10.0) == [
+        "请拨打510-320-7725联系我们"
+    ]
 
 
 def test_refine_keeps_cjk_clause_split() -> None:

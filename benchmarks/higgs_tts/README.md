@@ -11,7 +11,7 @@ Build a fresh image for each code revision from the repository root:
 
 ```bash
 docker build --pull \
-  -f tests/e2e/higgs_tts/Dockerfile \
+  -f benchmarks/higgs_tts/Dockerfile \
   -t higgs-tts-sglang-omni:local .
 ```
 
@@ -65,14 +65,14 @@ at build time and record the resulting digest with the benchmark output:
 ```bash
 docker build --pull \
   --build-arg BASE_IMAGE=registry/image@sha256:... \
-  -f tests/e2e/higgs_tts/Dockerfile \
+  -f benchmarks/higgs_tts/Dockerfile \
   -t higgs-tts-sglang-omni:experiment .
 ```
 
 Start a server with one of the example configurations, then run:
 
 ```bash
-python tests/e2e/higgs_tts/performance.py \
+python benchmarks/higgs_tts/performance.py \
   --base-url http://127.0.0.1:18043 \
   --model higgs-tts-4b \
   --voice default \
@@ -92,8 +92,8 @@ the cache-hit path.
 For a CPU-only plumbing check:
 
 ```bash
-python tests/e2e/higgs_tts/mock_server.py --port 18999
-python tests/e2e/higgs_tts/performance.py \
+python benchmarks/higgs_tts/mock_server.py --port 18999
+python benchmarks/higgs_tts/performance.py \
   --base-url http://127.0.0.1:18999 \
   --model mock \
   --output-dir results/higgs_tts_mock \
@@ -108,5 +108,5 @@ the requested output directory and are ignored by Git.
 Run the local helper tests with:
 
 ```bash
-python tests/e2e/higgs_tts/test_suite.py
+python -m pytest -q tests/unit_test/higgs_tts/test_benchmark_helpers.py
 ```

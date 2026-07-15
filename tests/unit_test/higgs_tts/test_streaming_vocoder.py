@@ -304,6 +304,21 @@ def test_higgs_non_streaming_full_decode_fades_tail() -> None:
         thread.join(timeout=2.0)
 
 
+def test_aborted_request_ids_evict_oldest_first(monkeypatch) -> None:
+    from sglang_omni.models.higgs_tts import streaming_vocoder
+
+    monkeypatch.setattr(streaming_vocoder, "_ABORTED_REQUEST_ID_LIMIT", 3)
+    monkeypatch.setattr(streaming_vocoder, "_ABORTED_REQUEST_ID_RETAINED", 2)
+    scheduler = streaming_vocoder.HiggsVocoderScheduler(
+        _FakeHiggsCodec(), device="cpu", num_codebooks=3
+    )
+
+    for request_id in ("oldest", "older", "newer", "newest"):
+        scheduler.abort(request_id)
+
+    assert list(scheduler._aborted_request_ids) == ["newer", "newest"]
+
+
 def test_higgs_streaming_scheduler_emits_audio_before_terminal_result() -> None:
     from sglang_omni.models.higgs_tts.streaming_vocoder import HiggsVocoderScheduler
 

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -48,7 +50,10 @@ def test_dynamic_lora_cache_loads_each_path_once(tmp_path) -> None:
         return SimpleNamespace(success=True, error_message="")
 
     cache = stages.DynamicLoraCache(
-        load, max_cached_adapters=2, serve_model_name=_TEST_MODEL_NAME
+        load,
+        max_cached_adapters=2,
+        serve_model_name=_TEST_MODEL_NAME,
+        allowed_base_dir=tmp_path,
     )
 
     first_id = cache.get_or_load(str(adapter))
@@ -59,7 +64,65 @@ def test_dynamic_lora_cache_loads_each_path_once(tmp_path) -> None:
     assert loads[0].lora_path == str(adapter.resolve())
 
 
-def test_dynamic_lora_cache_rejects_new_path_when_full(tmp_path) -> None:
+def test_dynamic_lora_cache_serializes_concurrent_loads(tmp_path) -> None:
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    _write_lora_metadata(adapter)
+    load_started = threading.Event()
+    release_load = threading.Event()
+    second_started = threading.Event()
+    loads = []
+
+    def load(ref):
+        loads.append(ref)
+        load_started.set()
+        assert release_load.wait(timeout=2)
+        return SimpleNamespace(success=True, error_message="")
+
+    cache = stages.DynamicLoraCache(
+        load,
+        max_cached_adapters=2,
+        serve_model_name=_TEST_MODEL_NAME,
+        allowed_base_dir=tmp_path,
+    )
+
+    def second_request():
+        second_started.set()
+        return cache.get_or_load(str(adapter))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(cache.get_or_load, str(adapter))
+        assert load_started.wait(timeout=2)
+        second = executor.submit(second_request)
+        assert second_started.wait(timeout=2)
+        release_load.set()
+        assert first.result(timeout=2) == second.result(timeout=2)
+
+    assert len(loads) == 1
+
+
+def test_dynamic_lora_cache_rejects_paths_outside_allowed_base(tmp_path) -> None:
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "outside"
+    allowed.mkdir()
+    outside.mkdir()
+    _write_lora_metadata(outside)
+    symlink = allowed / "escape"
+    symlink.symlink_to(outside, target_is_directory=True)
+    cache = stages.DynamicLoraCache(
+        lambda _ref: SimpleNamespace(success=True, error_message=""),
+        max_cached_adapters=2,
+        serve_model_name=_TEST_MODEL_NAME,
+        allowed_base_dir=allowed,
+    )
+
+    with pytest.raises(ValueError, match="outside allowed base directory"):
+        cache.get_or_load(str(outside))
+    with pytest.raises(ValueError, match="outside allowed base directory"):
+        cache.get_or_load(str(symlink))
+
+
+def test_dynamic_lora_cache_rejects_new_path_when_full(tmp_path, caplog) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
     first.mkdir()
@@ -72,9 +135,12 @@ def test_dynamic_lora_cache_rejects_new_path_when_full(tmp_path) -> None:
         or SimpleNamespace(success=True, error_message=""),
         max_cached_adapters=1,
         serve_model_name=_TEST_MODEL_NAME,
+        allowed_base_dir=tmp_path,
     )
 
-    cache.get_or_load(str(first))
+    with caplog.at_level("WARNING"):
+        cache.get_or_load(str(first))
+    assert "cache is at 1/1 adapters" in caplog.text
     with pytest.raises(ValueError, match="cache is full"):
         cache.get_or_load(str(second))
 
@@ -92,6 +158,7 @@ def test_dynamic_lora_cache_surfaces_loader_failure(tmp_path) -> None:
         ),
         max_cached_adapters=1,
         serve_model_name=_TEST_MODEL_NAME,
+        allowed_base_dir=tmp_path,
     )
 
     with pytest.raises(ValueError, match="rank 64 exceeds max rank 32"):
@@ -108,6 +175,7 @@ def test_request_builder_loads_dynamic_lora_before_inference(tmp_path) -> None:
         or SimpleNamespace(success=True, error_message=""),
         max_cached_adapters=2,
         serve_model_name=_TEST_MODEL_NAME,
+        allowed_base_dir=tmp_path,
     )
     payload = StagePayload(
         request_id="req",
@@ -219,15 +287,16 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch, tmp_path) -
     monkeypatch.setattr(stages, "HiggsTokenizerAdapter", lambda _tok: object())
     monkeypatch.setattr(stages, "SessionStore", lambda **kwargs: object())
 
-    adapter = tmp_path / "laura-a"
+    adapter = tmp_path / "adapter-a"
     adapter.mkdir()
     _write_lora_metadata(adapter)
     stages.create_sglang_tts_engine_executor(
         "boson-sglang/higgs-audio-v3-tts-4b-base",
-        lora_voices={"Laura A": str(adapter)},
+        lora_voices={"adapter-a": str(adapter)},
         serve_model_name=_TEST_MODEL_NAME,
         enable_dynamic_lora=True,
         lora_max_cached_adapters=3,
+        lora_base_dir=str(tmp_path),
     )
 
     assert captured["checkpoint_dir"] == "boson-sglang/higgs-audio-v3-tts-4b-base"
@@ -237,7 +306,7 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch, tmp_path) -
     assert captured["overrides"]["cuda_graph_max_bs"] == 32
     assert captured["overrides"]["max_running_requests"] == 16
     assert captured["overrides"]["enable_lora"] is True
-    assert captured["overrides"]["lora_paths"] == {"Laura A": str(adapter)}
+    assert captured["overrides"]["lora_paths"] == {"adapter-a": str(adapter)}
     assert captured["overrides"]["max_lora_rank"] == 32
     assert captured["overrides"]["max_loaded_loras"] == 4
     assert captured["overrides"]["max_loras_per_batch"] == 4
@@ -341,11 +410,12 @@ def test_higgs_performance_config_routes_lora_and_vocoder_batching() -> None:
 
     cfg = HiggsTtsPipelineConfig(
         model_path="test-model",
-        lora_voices={"Laura A": "/models/laura-a"},
+        lora_voices={"adapter-a": "/models/adapter-a"},
         lora_backend="csgmv",
         lora_max_rank=64,
         enable_dynamic_lora=True,
         lora_max_cached_adapters=6,
+        lora_base_dir="/models",
         separate_vocoder_process=True,
         vocoder_max_batch_size=16,
         vocoder_audio_chunk_size=32,
@@ -354,15 +424,16 @@ def test_higgs_performance_config_routes_lora_and_vocoder_batching() -> None:
     stages_by_name = {stage.name: stage for stage in cfg.stages}
 
     assert stages_by_name["preprocessing"].factory_args["lora_voices"] == {
-        "Laura A": "/models/laura-a"
+        "adapter-a": "/models/adapter-a"
     }
     assert stages_by_name["tts_engine"].factory_args["lora_voices"] == {
-        "Laura A": "/models/laura-a"
+        "adapter-a": "/models/adapter-a"
     }
     assert stages_by_name["tts_engine"].factory_args["lora_backend"] == "csgmv"
     assert stages_by_name["tts_engine"].factory_args["lora_max_rank"] == 64
     assert stages_by_name["tts_engine"].factory_args["enable_dynamic_lora"] is True
     assert stages_by_name["tts_engine"].factory_args["lora_max_cached_adapters"] == 6
+    assert stages_by_name["tts_engine"].factory_args["lora_base_dir"] == "/models"
     assert stages_by_name["tts_engine"].factory_args["serve_model_name"] == "test-model"
     assert stages_by_name["vocoder"].factory_args["max_batch_size"] == 16
     assert stages_by_name["vocoder"].factory_args["audio_chunk_size"] == 32
@@ -375,6 +446,16 @@ def test_higgs_performance_config_routes_lora_and_vocoder_batching() -> None:
         )
         == 1.0
     )
+
+
+def test_dynamic_lora_config_requires_allowed_base_directory() -> None:
+    from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
+
+    with pytest.raises(ValueError, match="requires lora_base_dir"):
+        HiggsTtsPipelineConfig(
+            model_path="test-model",
+            enable_dynamic_lora=True,
+        )
 
 
 def test_separate_vocoder_preserves_explicit_memory_fractions() -> None:

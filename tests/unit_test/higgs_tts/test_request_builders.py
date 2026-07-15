@@ -96,7 +96,7 @@ def test_lora_id_is_attached_to_sglang_request() -> None:
 
     assert data.req.lora_id == "stable-adapter-id"
     # Req includes the adapter id in the radix-cache namespace, preventing a
-    # base-model prefix from being reused for Laura A (or vice versa).
+    # base-model prefix from being reused for a LoRA adapter (or vice versa).
     assert "stable-adapter-id" in data.req.extra_key
 
 

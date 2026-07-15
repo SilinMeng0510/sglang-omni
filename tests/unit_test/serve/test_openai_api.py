@@ -19,6 +19,7 @@ from sglang_omni.serve.openai_api import (
     _build_speech_generate_request,
     _chat_stream,
     _speech_stream,
+    _streaming_speech_pcm_chunks,
     build_speech_generate_request,
 )
 from sglang_omni.serve.protocol import (
@@ -323,6 +324,23 @@ def test_pcm_stream_returns_http_error_when_lora_load_fails() -> None:
 
     assert response.status_code == 400
     assert "rank 64 exceeds max rank 32" in response.json()["detail"]
+
+
+def test_pcm_stream_logs_failure_after_response_start(caplog) -> None:
+    async def consume() -> None:
+        stream = _streaming_speech_pcm_chunks(
+            client=FailingSpeechClient(),
+            gen_req=object(),
+            request_id="speech-midstream-failure",
+        )
+        with pytest.raises(ClientError, match="stream failed"):
+            async for _ in stream:
+                pass
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(consume())
+
+    assert "PCM speech stream failed after response start" in caplog.text
 
 
 def test_speech_stream_returns_error_event_after_chunk_failure() -> None:

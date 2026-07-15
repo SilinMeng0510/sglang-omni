@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
-from common import request_speech, speech_payload, stats, write_json
+
+try:
+    from .common import request_speech, speech_payload, stats, write_json
+except ImportError:  # Direct execution: python benchmarks/higgs_tts/performance.py
+    from common import request_speech, speech_payload, stats, write_json
 
 
 def load_prompts(path: Path, seed: int) -> list[str]:

@@ -20,6 +20,15 @@ _BACKBONE_PREFIX = "body.layers."
 _LORA_SUFFIXES = (".lora_A", ".lora_B")
 _EXPORT_METADATA_FILE = "export_metadata.json"
 _SUPPORTED_EXPORT_DTYPES = {torch.bfloat16, torch.float32}
+HIGGS_LORA_TARGET_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
 
 
 def validate_lora_adapter_model(
@@ -70,6 +79,9 @@ def inspect_dcp_lora(checkpoint_dir: str | Path) -> tuple[dict[str, Any], list[s
     metadata_path = checkpoint_dir / ".metadata"
     if not metadata_path.is_file():
         raise FileNotFoundError(f"DCP metadata not found: {metadata_path}")
+    # DCP metadata is a pickle produced by torch.distributed.checkpoint. Only
+    # inspect checkpoints from a trusted training pipeline; pickle can execute
+    # arbitrary code while deserializing an untrusted file.
     with metadata_path.open("rb") as handle:
         metadata = pickle.load(handle)
 
@@ -146,15 +158,7 @@ def export_dcp_lora_adapter(
         "lora_dropout": 0.0,
         "peft_type": "LORA",
         "r": rank,
-        "target_modules": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
+        "target_modules": list(HIGGS_LORA_TARGET_MODULES),
         "task_type": "CAUSAL_LM",
     }
     (output_dir / "adapter_config.json").write_text(
@@ -181,6 +185,7 @@ def export_dcp_lora_adapter(
 
 
 __all__ = [
+    "HIGGS_LORA_TARGET_MODULES",
     "dcp_name_to_peft",
     "export_dcp_lora_adapter",
     "inspect_dcp_lora",

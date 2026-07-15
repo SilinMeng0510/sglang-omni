@@ -6,6 +6,7 @@ relay_backend: shm
 # Allow request-scoped `lora_adapter.path` adapters. Cached adapters stay in
 # SGLang's LoRA memory pool and are not reloaded on subsequent requests.
 enable_dynamic_lora: true
+lora_base_dir: /adapters
 lora_max_cached_adapters: 8
 lora_max_rank: 32
 

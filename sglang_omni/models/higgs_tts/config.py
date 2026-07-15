@@ -42,6 +42,7 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     lora_max_rank: int = Field(default=32, ge=1)
     enable_dynamic_lora: bool = False
     lora_max_cached_adapters: int = Field(default=8, ge=1)
+    lora_base_dir: str | None = None
     startup_full_chunk_frames: int = Field(default=8, ge=1)
     startup_full_chunk_count: int = Field(default=8, ge=0)
     vocoder_full_context_streaming: bool = False
@@ -126,6 +127,8 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                     "serve_model_name": self.name,
                 }
                 if self.lora_voices or self.enable_dynamic_lora:
+                    if self.enable_dynamic_lora and not self.lora_base_dir:
+                        raise ValueError("enable_dynamic_lora requires lora_base_dir")
                     stage.factory_args["lora_voices"] = dict(self.lora_voices)
                     stage.factory_args["lora_backend"] = self.lora_backend
                     stage.factory_args["lora_max_rank"] = self.lora_max_rank
@@ -133,6 +136,8 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                     stage.factory_args["lora_max_cached_adapters"] = (
                         self.lora_max_cached_adapters
                     )
+                    if self.enable_dynamic_lora:
+                        stage.factory_args["lora_base_dir"] = self.lora_base_dir
             if stage.name == "vocoder":
                 if self.separate_vocoder_process:
                     stage.process = "vocoder"

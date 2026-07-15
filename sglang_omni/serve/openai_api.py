@@ -1161,27 +1161,36 @@ async def _streaming_speech_pcm_chunks(
     emitted_samples = 0
     if chunks is None:
         chunks = client.generate(gen_req, request_id=request_id)
-    async for chunk in chunks:
-        if chunk.audio_data is None:
-            continue
+    try:
+        async for chunk in chunks:
+            if chunk.audio_data is None:
+                continue
 
-        sample_rate = chunk.sample_rate or DEFAULT_SAMPLE_RATE
-        audio_data, emitted_samples = _select_speech_audio_delta(
-            chunk.audio_data,
-            emitted_samples=emitted_samples,
-            is_terminal=chunk.finish_reason is not None,
-        )
-        if audio_data is None:
-            continue
+            sample_rate = chunk.sample_rate or DEFAULT_SAMPLE_RATE
+            audio_data, emitted_samples = _select_speech_audio_delta(
+                chunk.audio_data,
+                emitted_samples=emitted_samples,
+                is_terminal=chunk.finish_reason is not None,
+            )
+            if audio_data is None:
+                continue
 
-        audio_bytes, _ = encode_audio(
-            audio_data,
-            response_format="pcm",
-            sample_rate=sample_rate,
-            speed=speed,
+            audio_bytes, _ = encode_audio(
+                audio_data,
+                response_format="pcm",
+                sample_rate=sample_rate,
+                speed=speed,
+            )
+            if audio_bytes:
+                yield audio_bytes
+    except Exception:
+        # HTTP headers are already committed after the prefetched first chunk,
+        # so the only wire-level signal is a truncated stream. Keep the full
+        # server-side traceback for diagnosis and propagate to close the body.
+        logger.exception(
+            "PCM speech stream failed after response start: %s", request_id
         )
-        if audio_bytes:
-            yield audio_bytes
+        raise
 
 
 async def _send_streaming_speech_error(websocket: WebSocket, message: str) -> None:

@@ -19,16 +19,18 @@ from dataclasses import dataclass, field
 def session_extra_key(session_id: str) -> str:
     """Radix-cache namespace: stable per session (prefix KV reuse), distinct
     across sessions (no KV bleed between differing overlaid embeddings)."""
-    return "sess-" + hashlib.blake2b(
-        session_id.encode("utf-8"), digest_size=12
-    ).hexdigest()
+    return (
+        "sess-"
+        + hashlib.blake2b(session_id.encode("utf-8"), digest_size=12).hexdigest()
+    )
 
 
 @dataclass
 class Segment:
     """One committed prior chunk: its text tokens + delayed audio codes, tagged
     with the chunk's ``index`` (serve's per-session sentence index) so a barge-in
-    can roll history back to a specific chunk via :meth:`SessionStore.truncate_after`."""
+    can roll history back to a specific chunk via :meth:`SessionStore.truncate_after`.
+    """
 
     text_token_ids: list[int]
     codes_delayed: list[list[int]]
