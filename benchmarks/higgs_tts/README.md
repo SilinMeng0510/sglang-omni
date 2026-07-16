@@ -142,6 +142,35 @@ The default gate permits at most 3% paired WER, 2.5 percentage points of WER
 regression against the source text, 25% p85 duration drift, and requires
 Wav2Vec2 cosine similarity of at least 0.97 on average and 0.94 per sample.
 
+## “Run sample audio” convention
+
+When asked to “run sample audio”, use the 4B K8/M3 config and all ten lines in
+`sample_text.txt`. Generate each line with the same per-line seed for these
+three request-scoped dynamic LoRAs: `ap2`, `tpfp`, and `hmbm`. Do not preload
+an adapter or change the K8/M3 startup settings. The review artifact must be an
+HTML page arranged by sentence, with the three voices side by side. Each voice
+card must contain the WAV player, waveform, average 0–12 kHz spectrum, duration,
+and generation latency. Also save a JSON manifest containing the adapter path,
+seed, relative artifact paths, and audio SHA256 for every sample.
+
+Serve listening galleries with the range-aware helper below. Python 3.10's
+standard `python -m http.server` ignores byte-range requests and prevents
+reliable seeking in browser audio controls.
+
+```bash
+python benchmarks/higgs_tts/gallery_server.py \
+  --port 22222 \
+  --directory /path/containing/the/gallery
+```
+
+Verify seeking support by checking for `206 Partial Content`, `Accept-Ranges`,
+and `Content-Range`:
+
+```bash
+curl -I -H 'Range: bytes=0-1023' \
+  http://127.0.0.1:22222/gallery/ap2/00.wav
+```
+
 For a CPU-only plumbing check:
 
 ```bash
