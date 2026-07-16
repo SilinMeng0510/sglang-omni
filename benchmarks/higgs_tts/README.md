@@ -149,7 +149,7 @@ When asked to “run sample audio”, use the 4B K8/M3 config and all ten lines 
 three request-scoped dynamic LoRAs: `ap2`, `tpfp`, and `hmbm`. Do not preload
 an adapter or change the K8/M3 startup settings. The review artifact must be an
 HTML page arranged by sentence, with the three voices side by side. Each voice
-card must contain the WAV player, waveform, average 0–12 kHz spectrum, duration,
+card must contain the WAV player, waveform, 0–12 kHz spectrogram, duration,
 and generation latency. Also save a JSON manifest containing the adapter path,
 seed, relative artifact paths, and audio SHA256 for every sample.
 
