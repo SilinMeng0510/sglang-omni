@@ -40,16 +40,16 @@ def test_higgs_masked_startup_config_reaches_vocoder_factory() -> None:
     config = HiggsTtsPipelineConfig(
         model_path="fake-model",
         vocoder_full_context_streaming=True,
-        vocoder_startup_masked_delay_rows=3,
+        vocoder_startup_masked_delay_rows=8,
         vocoder_startup_masked_emit_frames=3,
-        vocoder_startup_masked_until_frames=18,
+        vocoder_startup_masked_until_frames=8,
     )
     vocoder = next(stage for stage in config.stages if stage.name == "vocoder")
 
     assert vocoder.factory_args["full_context_streaming"] is True
-    assert vocoder.factory_args["startup_masked_delay_rows"] == 3
+    assert vocoder.factory_args["startup_masked_delay_rows"] == 8
     assert vocoder.factory_args["startup_masked_emit_frames"] == 3
-    assert vocoder.factory_args["startup_masked_until_frames"] == 18
+    assert vocoder.factory_args["startup_masked_until_frames"] == 8
 
 
 def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
@@ -1197,26 +1197,25 @@ def test_higgs_masked_startup_coalesces_ready_requests() -> None:
     )
 
 
-def test_higgs_masked_startup_ramps_lookahead_one_row_per_chunk() -> None:
+def test_higgs_masked_startup_keeps_configured_lookahead() -> None:
     scheduler = HiggsStreamingVocoderScheduler(
         _FakeMaskedHiggsStreamingCodec(),
         full_context_streaming=True,
-        startup_masked_delay_rows=3,
+        startup_masked_delay_rows=8,
         startup_masked_emit_frames=3,
-        startup_masked_until_frames=18,
+        startup_masked_until_frames=8,
     )
     state = scheduler.create_stream_state("req")
     state.num_codebooks = 8
     state.codebook_size = 64
-    state.next_emit_frame = 3
-    state.delayed_rows = [torch.arange(8) for _ in range(7)]
+    state.delayed_rows = [torch.arange(8) for _ in range(8)]
 
     task = scheduler._prepare_context_task("req", state)
 
     assert task is not None
     assert task.emit_frames == 3
-    assert task.codes_TN.shape == (7, 8)
-    assert task.counts_T.tolist() == [7, 6, 5, 4, 3, 2, 1]
+    assert task.codes_TN.shape == (8, 8)
+    assert task.counts_T.tolist() == [8, 7, 6, 5, 4, 3, 2, 1]
 
 
 def test_higgs_streaming_vocoder_matches_full_decode_with_codec_tail() -> None:

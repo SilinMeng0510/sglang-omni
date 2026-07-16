@@ -368,16 +368,8 @@ class HiggsStreamingVocoderScheduler(
                 self._startup_masked_emit_frames,
                 self._startup_masked_until_frames - next_frame,
             )
-            # When startup begins with fewer than all RVQ codebooks, grow the
-            # lookahead by one row per emitted chunk instead of paying the
-            # missing lookahead as one large transition stall.  K8 remains
-            # unchanged because the value is capped at ``num_codebooks``.
-            ramp_steps = next_frame // self._startup_masked_emit_frames
-            active_delay_rows = min(
-                num_codebooks, self._startup_masked_delay_rows + ramp_steps
-            )
             frame_start = max(0, next_frame - self._context_frames)
-            frame_end = next_frame + active_delay_rows
+            frame_end = next_frame + self._startup_masked_delay_rows
             if cache_len < frame_end:
                 return None
             phase = "partial_masked_delay"

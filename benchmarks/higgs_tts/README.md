@@ -23,6 +23,14 @@ LoRA adapters, Hugging Face cache, and benchmark outputs stay outside it.
 For the 4B model, use `examples/configs/higgs_tts_4b_masked.yaml`. Start an
 endpoint with one GPU and server-visible model/adapter directories:
 
+The masked startup settings in that config are deliberately conservative and
+must remain `K8/M3`: eight delayed rows before masked decode, emitting three
+frames per startup chunk. Listening tests found K8/M3 audio quality acceptable,
+while more aggressive masking caused audible degradation. K8/M4 was tested as
+well, but its latency benefit was too small to justify further work. Treat
+K8/M3 as an audio-quality invariant and optimize request handling, generation,
+batching, vocoder execution, or transport instead of reducing K.
+
 ```bash
 export MODEL_PATH=/absolute/path/to/higgs-tts-3-4b
 export LORA_ROOT=/hot-data/checkpoints/TTSDeepclone
