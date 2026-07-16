@@ -20,11 +20,25 @@ The Dockerfile pins the exact measured base-image digest instead of a mutable
 0.5.12.post1. The source tree is copied into the image, while model weights,
 LoRA adapters, Hugging Face cache, and benchmark outputs stay outside it.
 
-Start an endpoint with one GPU and server-visible model/adapter directories:
+For the 4B model, use `examples/configs/higgs_tts_4b_masked.yaml`. Start an
+endpoint with one GPU and server-visible model/adapter directories:
+
+The masked startup settings in that config are deliberately conservative and
+must remain `K8/M3`: eight delayed rows before masked decode, emitting three
+frames per startup chunk. Listening tests found K8/M3 audio quality acceptable,
+while more aggressive masking caused audible degradation. K8/M4 was tested as
+well, but its latency benefit was too small to justify further work. Treat
+K8/M3 as an audio-quality invariant and optimize request handling, generation,
+batching, vocoder execution, or transport instead of reducing K.
+
+Final vocoder output drops the EOC-adjacent last recovered raw codec frame and
+clips decoded audio to the exact remaining frame boundary. This is the default
+tail behavior selected by the sample-audio listening A/B; keep it consistent
+between performance and listening tests.
 
 ```bash
 export MODEL_PATH=/absolute/path/to/higgs-tts-3-4b
-export LORA_ROOT=/absolute/path/to/lora-adapters
+export LORA_ROOT=/hot-data/checkpoints/TTSDeepclone
 
 docker run --rm --name higgs-tts-sglang-omni \
   --gpus '"device=0"' \
@@ -40,14 +54,27 @@ docker run --rm --name higgs-tts-sglang-omni \
   --port 18043
 ```
 
-Use paths as seen inside the container in API requests, for example:
+The following LoRA checkpoints are available for testing. Their request paths
+are shown relative to the `/adapters` mount used above:
+
+| Name | Host checkpoint | Request path |
+| --- | --- | --- |
+| `ap2` | `/hot-data/checkpoints/TTSDeepclone/c552a632c2c944d3826c8eb0d94505b6/step_02000/peft` | `/adapters/c552a632c2c944d3826c8eb0d94505b6/step_02000/peft` |
+| `tpfp` | `/hot-data/checkpoints/TTSDeepclone/b640aed5d5e444f9b03642a88f348d3c/step_02000/peft` | `/adapters/b640aed5d5e444f9b03642a88f348d3c/step_02000/peft` |
+| `hmbm` | `/hot-data/checkpoints/TTSDeepclone/58b6ba5df6a347558200ec8f49f0364a/step_02000/peft` | `/adapters/58b6ba5df6a347558200ec8f49f0364a/step_02000/peft` |
+
+LoRA adapters must always be loaded dynamically: do not preload an adapter in
+the server configuration. Instead, include `lora_adapter` in every API request,
+using the path visible inside the container. For example, to use `ap2`:
 
 ```json
 {
   "input": "Dynamic adapter test.",
   "stream": true,
   "response_format": "pcm",
-  "lora_adapter": {"path": "/adapters/ap2_4b"}
+  "lora_adapter": {
+    "path": "/adapters/c552a632c2c944d3826c8eb0d94505b6/step_02000/peft"
+  }
 }
 ```
 
@@ -86,8 +113,68 @@ are reproducible. Use `--prompts /path/to/workload.jsonl` to override it; each
 JSONL row must contain a non-empty `text` or `prompt` field. `sample_text.txt`
 contains the fixed utterances used for generated-audio A/B listening tests.
 Pass `--lora-adapter-path /path/to/adapter` to benchmark request-scoped dynamic
-LoRA loading. The first request loads the adapter and later requests exercise
-the cache-hit path.
+LoRA loading. The benchmark includes the adapter path in every request; for
+example, to test `ap2` against the container setup above:
+
+```bash
+python benchmarks/higgs_tts/performance.py \
+  --base-url http://127.0.0.1:18043 \
+  --model higgs-tts-4b \
+  --voice default \
+  --lora-adapter-path \
+    /adapters/c552a632c2c944d3826c8eb0d94505b6/step_02000/peft \
+  --output-dir results/higgs_tts_ap2 \
+  --concurrencies 1,4,8 \
+  --duration 60
+```
+
+For generated-audio regression checks, generate WAV files named `00.wav`,
+`01.wav`, and so on from every line in `sample_text.txt`, using the same seed
+and ap2 adapter on both revisions. The comparison gate uses Whisper content
+WER, Wav2Vec2 acoustic embeddings, and duration drift:
+
+```bash
+python benchmarks/higgs_tts/compare_audio.py \
+  --baseline-dir results/audio_ab/pre_rebase_ap2 \
+  --candidate-dir results/audio_ab/candidate_ap2 \
+  --texts benchmarks/higgs_tts/sample_text.txt \
+  --whisper-model /models/whisper-small \
+  --embedding-model /models/wav2vec2-base \
+  --output results/audio_ab/comparison.json
+```
+
+The default gate permits at most 3% paired WER, 2.5 percentage points of WER
+regression against the source text, 25% p85 duration drift, and requires
+Wav2Vec2 cosine similarity of at least 0.97 on average and 0.94 per sample.
+
+## “Run sample audio” convention
+
+When asked to “run sample audio”, use the 4B K8/M3 config and all ten lines in
+`sample_text.txt`. Generate each line with the same per-line seed for these
+three request-scoped dynamic LoRAs: `ap2`, `tpfp`, and `hmbm`. Do not preload
+an adapter or change the K8/M3 startup settings. The review artifact must be an
+HTML page arranged by sentence, with the three voices side by side. Each voice
+card must contain the WAV player, waveform, 0–12 kHz spectrogram, duration,
+and generation latency. Also save a JSON manifest containing the adapter path,
+seed, relative artifact paths, and audio SHA256 for every sample.
+
+Serve listening galleries with the range-aware helper below. Python 3.10's
+standard `python -m http.server` ignores byte-range requests and prevents
+reliable seeking in browser audio controls.
+
+```bash
+python benchmarks/higgs_tts/gallery_server.py \
+  --port 22222 \
+  --directory /path/containing/the/gallery
+```
+
+Verify seeking support by checking for `206 Partial Content`, `Accept-Ranges`,
+and `Content-Range`:
+
+```bash
+curl -I -H 'Range: bytes=0-1023' \
+  http://127.0.0.1:22222/gallery/ap2/00.wav
+```
 
 For a CPU-only plumbing check:
 

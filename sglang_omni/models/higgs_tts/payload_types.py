@@ -9,49 +9,51 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from sglang_omni.scheduling.pipeline_state import PipelineStateBase
+
 
 @dataclass
-class HiggsTtsState:
+class HiggsTtsState(PipelineStateBase):
     """Per-request state threaded through preprocessing → audio_encoder →
     tts_engine → vocoder. Fields populate lazily so a deserialised state is
     valid at any stage boundary."""
 
+    sample_rate: int = 24000
+
     # preprocessing / audio_encoder
     prompt_token_ids: list[int] = field(default_factory=list)
     reference_codes_delayed: list[list[int]] | None = None
-    reference_waveform: Any | None = None
-    target_text_token_ids: list[int] | None = None
-    reference_text_token_ids: list[int] | None = None
-    # SGLang's deterministic adapter id.  ``None`` selects the base model.
+    target_text: str | None = None
+    reference_text: str | None = None
+    reference_waveform: Any | None = None  # mono 24 kHz [1, 1, L] torch.Tensor
+    reference_code_cache_key: str | None = None
+    uploaded_voice_name: str | None = None
+    uploaded_voice_created_at: int | None = None
+    # SGLang's deterministic adapter id. None selects the base model.
     lora_id: str | None = None
-    # Server-visible PEFT adapter directory for request-scoped dynamic loading.
+    # Server-visible PEFT adapter directory for request-scoped loading.
     lora_adapter_path: str | None = None
-
-    # Cross-chunk continuity
-    session_id: str | None = None
-    session_final: bool = False
-    session_index: int = -1  # chunk's serve sentence index (barge-in rollback)
-    session_truncate_after: int | None = None  # input.stop: drop history past this
 
     num_codebooks: int = 8
     codebook_size: int = 1026  # 1024 data + <|boc|> + <|eoc|>
 
     # generation params
-    max_new_tokens: int = 1024
+    max_new_tokens: int = 2048
     temperature: float = 1.0
     top_p: float | None = None
     top_k: int | None = None
     seed: int | None = None
 
+    # RL rollout controls
+    return_logprob: bool = False
+    return_omni_rollout: bool = False
+
     # tts_engine
     output_codes_delayed: list[list[int]] | None = None
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    engine_time_s: float = 0.0
+    omni_rollout: dict[str, Any] | None = None
 
     # vocoder
     audio_samples: Any | None = None
-    sample_rate: int = 24000
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -63,18 +65,18 @@ class HiggsTtsState:
         }
         if self.reference_codes_delayed is not None:
             data["reference_codes_delayed"] = self.reference_codes_delayed
+        if self.target_text is not None:
+            data["target_text"] = self.target_text
+        if self.reference_text is not None:
+            data["reference_text"] = self.reference_text
         if self.reference_waveform is not None:
             data["reference_waveform"] = self.reference_waveform
-        if self.session_id is not None:
-            data["session_id"] = self.session_id
-            data["session_final"] = self.session_final
-            data["session_index"] = self.session_index
-            if self.session_truncate_after is not None:
-                data["session_truncate_after"] = self.session_truncate_after
-        if self.target_text_token_ids is not None:
-            data["target_text_token_ids"] = self.target_text_token_ids
-        if self.reference_text_token_ids is not None:
-            data["reference_text_token_ids"] = self.reference_text_token_ids
+        if self.reference_code_cache_key is not None:
+            data["reference_code_cache_key"] = self.reference_code_cache_key
+        if self.uploaded_voice_name is not None:
+            data["uploaded_voice_name"] = self.uploaded_voice_name
+        if self.uploaded_voice_created_at is not None:
+            data["uploaded_voice_created_at"] = self.uploaded_voice_created_at
         if self.lora_id is not None:
             data["lora_id"] = self.lora_id
         if self.lora_adapter_path is not None:
@@ -83,12 +85,14 @@ class HiggsTtsState:
             value = getattr(self, key)
             if value is not None:
                 data[key] = value
+        for key in ("return_logprob", "return_omni_rollout"):
+            if getattr(self, key):
+                data[key] = True
         if self.output_codes_delayed is not None:
             data["output_codes_delayed"] = self.output_codes_delayed
-        for key in ("prompt_tokens", "completion_tokens", "engine_time_s"):
-            value = getattr(self, key)
-            if value:
-                data[key] = value
+        if self.omni_rollout is not None:
+            data["omni_rollout"] = self.omni_rollout
+        self.append_usage_fields(data)
         if self.audio_samples is not None:
             data["audio_samples"] = self.audio_samples
             data["sample_rate"] = self.sample_rate
@@ -99,23 +103,25 @@ class HiggsTtsState:
         return cls(
             prompt_token_ids=list(data.get("prompt_token_ids", [])),
             reference_codes_delayed=data.get("reference_codes_delayed"),
+            target_text=data.get("target_text"),
+            reference_text=data.get("reference_text"),
             reference_waveform=data.get("reference_waveform"),
-            session_id=data.get("session_id"),
-            session_final=data.get("session_final", False),
-            session_index=data.get("session_index", -1),
-            session_truncate_after=data.get("session_truncate_after"),
-            target_text_token_ids=data.get("target_text_token_ids"),
-            reference_text_token_ids=data.get("reference_text_token_ids"),
+            reference_code_cache_key=data.get("reference_code_cache_key"),
+            uploaded_voice_name=data.get("uploaded_voice_name"),
+            uploaded_voice_created_at=data.get("uploaded_voice_created_at"),
             lora_id=data.get("lora_id"),
             lora_adapter_path=data.get("lora_adapter_path"),
             num_codebooks=data.get("num_codebooks", 8),
             codebook_size=data.get("codebook_size", 1026),
-            max_new_tokens=data.get("max_new_tokens", 1024),
+            max_new_tokens=data.get("max_new_tokens", 2048),
             temperature=data.get("temperature", 1.0),
             top_p=data.get("top_p"),
             top_k=data.get("top_k"),
             seed=data.get("seed"),
+            return_logprob=data.get("return_logprob", False),
+            return_omni_rollout=data.get("return_omni_rollout", False),
             output_codes_delayed=data.get("output_codes_delayed"),
+            omni_rollout=data.get("omni_rollout"),
             prompt_tokens=data.get("prompt_tokens", 0),
             completion_tokens=data.get("completion_tokens", 0),
             engine_time_s=data.get("engine_time_s", 0.0),

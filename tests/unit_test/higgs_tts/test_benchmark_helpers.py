@@ -9,6 +9,8 @@ from benchmarks.higgs_tts.common import (
     speech_payload,
     stats,
 )
+from benchmarks.higgs_tts.compare_audio import normalized_words, word_errors
+from benchmarks.higgs_tts.gallery_server import RangeRequestHandler
 from benchmarks.higgs_tts.performance import load_prompts
 
 HERE = Path(__file__).resolve().parents[3] / "benchmarks" / "higgs_tts"
@@ -30,6 +32,12 @@ def test_continuity_detects_underrun() -> None:
 
     assert jitter == pytest.approx(0.15)
     assert speed == pytest.approx(0.8)
+
+
+def test_audio_comparison_word_errors_normalize_case_and_punctuation() -> None:
+    assert normalized_words("HTTPS, ParseJSON!") == ["https", "parsejson"]
+    assert word_errors("That sounds good.", "that sounds good") == (0, 3)
+    assert word_errors("one two three", "one four three extra") == (2, 3)
 
 
 def test_bundled_prompts_are_valid() -> None:
@@ -59,3 +67,24 @@ def test_performance_payload_supports_dynamic_lora() -> None:
     )
 
     assert payload["lora_adapter"] == {"path": "/models/ap2/adapter"}
+
+
+@pytest.mark.parametrize(
+    ("header", "size", "expected"),
+    [
+        (None, 100, None),
+        ("bytes=0-9", 100, (0, 9)),
+        ("bytes=90-", 100, (90, 99)),
+        ("bytes=-10", 100, (90, 99)),
+        ("bytes=0-999", 100, (0, 99)),
+        ("bytes=100-", 100, False),
+        ("bytes=20-10", 100, False),
+        ("items=0-9", 100, False),
+    ],
+)
+def test_gallery_server_parses_byte_ranges(
+    header: str | None,
+    size: int,
+    expected: tuple[int, int] | None | bool,
+) -> None:
+    assert RangeRequestHandler._parse_range(header, size) == expected

@@ -8,7 +8,9 @@ tensors selectively avoids materialising the 10+ GB base model or optimizer.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import pickle
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,75 @@ HIGGS_LORA_TARGET_MODULES = (
     "up_proj",
     "down_proj",
 )
+
+logger = logging.getLogger(__name__)
+
+
+class DynamicLoraCache:
+    """Load each request-scoped adapter once into SGLang's LoRA pool."""
+
+    def __init__(
+        self,
+        load_adapter: Any,
+        *,
+        max_cached_adapters: int,
+        serve_model_name: str,
+        base_dir: str | Path | None = None,
+    ) -> None:
+        self._load_adapter = load_adapter
+        self._max_cached_adapters = int(max_cached_adapters)
+        self._serve_model_name = serve_model_name
+        self._base_dir = (
+            Path(base_dir).expanduser().resolve(strict=True)
+            if base_dir is not None
+            else None
+        )
+        self._refs_by_path: dict[str, Any] = {}
+
+    def _resolve(self, path: str) -> Path:
+        try:
+            resolved = Path(path).expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"LoRA adapter path does not exist: {path}") from exc
+        if not resolved.is_dir():
+            raise ValueError(f"LoRA adapter path is not a directory: {resolved}")
+        if self._base_dir is not None and not resolved.is_relative_to(self._base_dir):
+            raise ValueError(
+                f"LoRA adapter path {resolved} is outside lora_base_dir "
+                f"{self._base_dir}"
+            )
+        return resolved
+
+    def get_or_load(self, path: str) -> str:
+        resolved = self._resolve(path)
+        cache_key = str(resolved)
+        cached = self._refs_by_path.get(cache_key)
+        if cached is not None:
+            logger.info("Dynamic LoRA cache hit: %s", cache_key)
+            return cached.lora_id
+        validate_lora_adapter_model(resolved, self._serve_model_name)
+        if len(self._refs_by_path) >= self._max_cached_adapters:
+            raise ValueError(
+                "Dynamic LoRA cache is full " f"({self._max_cached_adapters} adapters)"
+            )
+
+        from sglang.srt.lora.lora_registry import LoRARef
+
+        digest = hashlib.sha256(cache_key.encode()).hexdigest()[:16]
+        name = f"dynamic-{digest}"
+        ref = LoRARef(
+            lora_id=LoRARef.deterministic_id(name, cache_key),
+            lora_name=name,
+            lora_path=cache_key,
+            pinned=False,
+        )
+        result = self._load_adapter(ref)
+        if not getattr(result, "success", False):
+            message = getattr(result, "error_message", "unknown loading error")
+            raise ValueError(f"Failed to load LoRA adapter {cache_key}: {message}")
+        self._refs_by_path[cache_key] = ref
+        logger.info("Dynamic LoRA adapter cached: %s", cache_key)
+        return ref.lora_id
 
 
 def validate_lora_adapter_model(
@@ -80,8 +151,7 @@ def inspect_dcp_lora(checkpoint_dir: str | Path) -> tuple[dict[str, Any], list[s
     if not metadata_path.is_file():
         raise FileNotFoundError(f"DCP metadata not found: {metadata_path}")
     # DCP metadata is a pickle produced by torch.distributed.checkpoint. Only
-    # inspect checkpoints from a trusted training pipeline; pickle can execute
-    # arbitrary code while deserializing an untrusted file.
+    # inspect checkpoints from a trusted training pipeline.
     with metadata_path.open("rb") as handle:
         metadata = pickle.load(handle)
 
@@ -185,6 +255,7 @@ def export_dcp_lora_adapter(
 
 
 __all__ = [
+    "DynamicLoraCache",
     "HIGGS_LORA_TARGET_MODULES",
     "dcp_name_to_peft",
     "export_dcp_lora_adapter",

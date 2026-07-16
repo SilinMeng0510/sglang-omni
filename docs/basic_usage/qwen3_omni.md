@@ -4,17 +4,7 @@ This guide uses [Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Inst
 
 ## Prerequisites
 
-```bash
-docker pull frankleeeee/sglang-omni:dev
-docker run -it --shm-size 32g --gpus all frankleeeee/sglang-omni:dev /bin/zsh
-```
-
-```bash
-git clone https://github.com/sgl-project/sglang-omni.git
-cd sglang-omni
-uv venv .venv -p 3.12 && source .venv/bin/activate
-uv pip install -v .
-```
+Install `sglang-omni` by following [Installation](../get_started/installation.md).
 
 ## Text-Only Mode
 
@@ -278,6 +268,31 @@ SGLANG_JIT_DEEPGEMM_PRECOMPILE=1 sgl-omni serve \
   --port 8008
 ```
 
+## Single-GPU AutoRound INT4 Thinker on H100/H20
+
+SGLang-Omni also supports AutoRound INT4 quantized Qwen3-Omni checkpoints.
+AutoRound uses a 4-bit quantization scheme with group size 128, significantly
+reducing memory footprint compared to BF16 or FP8.
+
+The public AutoRound checkpoint quantizes the thinker transformer layers. In
+speech mode, the talker and code2wav stages load as BF16 from the same
+checkpoint. For one-GPU H100/H20 colocated launch, use the colocated config
+with the AutoRound checkpoint:
+
+```bash
+sgl-omni serve \
+  --config examples/configs/qwen3_omni_colocated_h20.yaml \
+  --colocate \
+  --model-name qwen3-omni \
+  --model-path Intel/Qwen3-Omni-30B-A3B-Instruct-int4-AutoRound \
+  --port 8008
+```
+
+AutoRound quantization provides:
+- **~50% memory reduction** compared to BF16 (from ~60GB to ~30GB)
+- **~25% memory reduction** compared to FP8 (from ~40GB to ~30GB)
+- **Accuracy at ultra-low bit widths**: maintains high accuracy even at 2–4 bits, requiring minimal tuning effort thanks to its sign-gradient descent optimization.
+
 ### Image and Text Input
 
 Send an image with a text question to get both text and audio responses. Set `"modalities": ["text", "audio"]` to enable audio output.
@@ -430,11 +445,12 @@ The table below lists all parameters accepted by the `/v1/chat/completions` endp
 | `audios` | list | `null` | List of audio file paths (local paths or URLs) |
 | `videos` | list | `null` | List of video file paths (local paths or URLs) |
 | `max_tokens` | int | `null` | Maximum number of tokens to generate |
+| `max_completion_tokens` | int | `null` | OpenAI-compatible alias for `max_tokens` |
 | `temperature` | float | `null` | Sampling temperature |
 | `top_p` | float | `null` | Top-p sampling |
 | `top_k` | int | `null` | Top-k sampling |
 | `repetition_penalty` | float | `null` | Repetition penalty |
 | `seed` | int | `null` | Random seed for reproducibility |
 | `stream` | bool | `false` | Enable streaming via SSE |
-| `audio` | dict | `null` | Audio output configuration, e.g. `{"voice": "default", "format": "wav"}` |
+| `audio` | dict | `null` | Speech response format configuration, e.g. `{"format": "wav"}` |
 | `stage_sampling` | dict | `null` | Per-stage sampling overrides, e.g. `{"thinker": {"temperature": 0.8}}` |

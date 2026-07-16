@@ -1,211 +1,75 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import json
-import threading
-from concurrent.futures import ThreadPoolExecutor
+import base64
+import queue
 from types import SimpleNamespace
+from typing import Any
 
+import numpy as np
 import pytest
 import torch
+import typer
 
+from sglang_omni.cli.serve import apply_mem_fraction_cli_overrides
 from sglang_omni.models.higgs_tts import stages
-from sglang_omni.models.higgs_tts.audio.utils import EOC_ID
+from sglang_omni.models.higgs_tts import utils as higgs_utils
+from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
+from sglang_omni.models.higgs_tts.request_builders import build_higgs_stream_metadata
+from sglang_omni.models.higgs_tts.sampler import K_MAX
+from sglang_omni.models.higgs_tts.utils import EOC_ID, apply_delay_pattern
+from sglang_omni.models.higgs_tts.vocoder_scheduler import (
+    HiggsStreamingVocoderScheduler,
+)
+from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.scheduling.speaker_cache import get_speaker_artifact_cache
 
-_TEST_MODEL_NAME = "bosonai/higgs-tts-3-4b"
+
+def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
+    config = HiggsTtsPipelineConfig(model_path="fake-model")
+    stages_by_name = {stage.name: stage for stage in config.stages}
+
+    assert stages_by_name["tts_engine"].stream_to == ["vocoder"]
+    assert "server_args_overrides" not in stages_by_name["tts_engine"].factory_args
+    assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
 
 
-def _write_lora_metadata(adapter, model_name: str = _TEST_MODEL_NAME) -> None:
-    (adapter / "export_metadata.json").write_text(
-        json.dumps({"model_name": model_name}), encoding="utf-8"
+def test_higgs_masked_startup_config_reaches_vocoder_factory() -> None:
+    config = HiggsTtsPipelineConfig(
+        model_path="fake-model",
+        vocoder_full_context_streaming=True,
+        vocoder_startup_masked_delay_rows=8,
+        vocoder_startup_masked_emit_frames=3,
+        vocoder_startup_masked_until_frames=8,
     )
+    vocoder = next(stage for stage in config.stages if stage.name == "vocoder")
+
+    assert vocoder.factory_args["full_context_streaming"] is True
+    assert vocoder.factory_args["startup_masked_delay_rows"] == 8
+    assert vocoder.factory_args["startup_masked_emit_frames"] == 3
+    assert vocoder.factory_args["startup_masked_until_frames"] == 8
 
 
-def test_voice_uses_public_speech_api_metadata() -> None:
-    assert (
-        stages._resolve_voice({"voice": "legacy"}, {"tts_params": {"voice": "chloe"}})
-        == "chloe"
-    )
-    assert stages._resolve_voice({"voice": "legacy"}, {}) == "legacy"
-    assert stages._resolve_voice({}, {"tts_params": "invalid"}) == "default"
+def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
+    from sglang_omni.models.higgs_tts import model_runner as model_runner_mod
+    from sglang_omni.models.higgs_tts import request_builders
+    from sglang_omni.scheduling import bootstrap, omni_scheduler, sglang_backend
 
-
-def test_request_scoped_lora_adapter_path_uses_speech_metadata() -> None:
-    metadata = {"tts_params": {"lora_adapter": {"path": " /models/ap2 "}}}
-
-    assert stages._resolve_lora_adapter_path(metadata) == "/models/ap2"
-    assert stages._resolve_lora_adapter_path({}) is None
-
-
-def test_dynamic_lora_cache_loads_each_path_once(tmp_path) -> None:
-    adapter = tmp_path / "adapter"
-    adapter.mkdir()
-    _write_lora_metadata(adapter)
-    loads = []
-
-    def load(ref):
-        loads.append(ref)
-        return SimpleNamespace(success=True, error_message="")
-
-    cache = stages.DynamicLoraCache(
-        load,
-        max_cached_adapters=2,
-        serve_model_name=_TEST_MODEL_NAME,
-        allowed_base_dir=tmp_path,
-    )
-
-    first_id = cache.get_or_load(str(adapter))
-    second_id = cache.get_or_load(str(adapter / "."))
-
-    assert first_id == second_id
-    assert len(loads) == 1
-    assert loads[0].lora_path == str(adapter.resolve())
-
-
-def test_dynamic_lora_cache_serializes_concurrent_loads(tmp_path) -> None:
-    adapter = tmp_path / "adapter"
-    adapter.mkdir()
-    _write_lora_metadata(adapter)
-    load_started = threading.Event()
-    release_load = threading.Event()
-    second_started = threading.Event()
-    loads = []
-
-    def load(ref):
-        loads.append(ref)
-        load_started.set()
-        assert release_load.wait(timeout=2)
-        return SimpleNamespace(success=True, error_message="")
-
-    cache = stages.DynamicLoraCache(
-        load,
-        max_cached_adapters=2,
-        serve_model_name=_TEST_MODEL_NAME,
-        allowed_base_dir=tmp_path,
-    )
-
-    def second_request():
-        second_started.set()
-        return cache.get_or_load(str(adapter))
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(cache.get_or_load, str(adapter))
-        assert load_started.wait(timeout=2)
-        second = executor.submit(second_request)
-        assert second_started.wait(timeout=2)
-        release_load.set()
-        assert first.result(timeout=2) == second.result(timeout=2)
-
-    assert len(loads) == 1
-
-
-def test_dynamic_lora_cache_rejects_paths_outside_allowed_base(tmp_path) -> None:
-    allowed = tmp_path / "allowed"
-    outside = tmp_path / "outside"
-    allowed.mkdir()
-    outside.mkdir()
-    _write_lora_metadata(outside)
-    symlink = allowed / "escape"
-    symlink.symlink_to(outside, target_is_directory=True)
-    cache = stages.DynamicLoraCache(
-        lambda _ref: SimpleNamespace(success=True, error_message=""),
-        max_cached_adapters=2,
-        serve_model_name=_TEST_MODEL_NAME,
-        allowed_base_dir=allowed,
-    )
-
-    with pytest.raises(ValueError, match="outside allowed base directory"):
-        cache.get_or_load(str(outside))
-    with pytest.raises(ValueError, match="outside allowed base directory"):
-        cache.get_or_load(str(symlink))
-
-
-def test_dynamic_lora_cache_rejects_new_path_when_full(tmp_path, caplog) -> None:
-    first = tmp_path / "first"
-    second = tmp_path / "second"
-    first.mkdir()
-    second.mkdir()
-    _write_lora_metadata(first)
-    _write_lora_metadata(second)
-    loads = []
-    cache = stages.DynamicLoraCache(
-        lambda ref: loads.append(ref)
-        or SimpleNamespace(success=True, error_message=""),
-        max_cached_adapters=1,
-        serve_model_name=_TEST_MODEL_NAME,
-        allowed_base_dir=tmp_path,
-    )
-
-    with caplog.at_level("WARNING"):
-        cache.get_or_load(str(first))
-    assert "cache is at 1/1 adapters" in caplog.text
-    with pytest.raises(ValueError, match="cache is full"):
-        cache.get_or_load(str(second))
-
-    assert len(loads) == 1
-
-
-def test_dynamic_lora_cache_surfaces_loader_failure(tmp_path) -> None:
-    adapter = tmp_path / "adapter"
-    adapter.mkdir()
-    _write_lora_metadata(adapter)
-    cache = stages.DynamicLoraCache(
-        lambda _ref: SimpleNamespace(
-            success=False,
-            error_message="adapter rank 64 exceeds max rank 32",
-        ),
-        max_cached_adapters=1,
-        serve_model_name=_TEST_MODEL_NAME,
-        allowed_base_dir=tmp_path,
-    )
-
-    with pytest.raises(ValueError, match="rank 64 exceeds max rank 32"):
-        cache.get_or_load(str(adapter))
-
-
-def test_request_builder_loads_dynamic_lora_before_inference(tmp_path) -> None:
-    adapter = tmp_path / "adapter"
-    adapter.mkdir()
-    _write_lora_metadata(adapter)
-    loads = []
-    cache = stages.DynamicLoraCache(
-        lambda ref: loads.append(ref)
-        or SimpleNamespace(success=True, error_message=""),
-        max_cached_adapters=2,
-        serve_model_name=_TEST_MODEL_NAME,
-        allowed_base_dir=tmp_path,
-    )
-    payload = StagePayload(
-        request_id="req",
-        request=OmniRequest(inputs="hello"),
-        data=HiggsTtsState(
-            prompt_token_ids=[1, 2, 3], lora_adapter_path=str(adapter)
-        ).to_dict(),
-    )
-    wrapped = stages._with_dynamic_lora_cache(
-        lambda value: HiggsTtsState.from_dict(value.data), cache
-    )
-
-    result = wrapped(payload)
-
-    assert result.lora_id == loads[0].lora_id
-    assert result.lora_adapter_path == str(adapter)
-
-
-def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch, tmp_path) -> None:
     captured: dict[str, object] = {}
+    infrastructure_saw_graph_disabled: list[bool] = []
+    init_graph_calls: list[bool] = []
 
     def fake_build_sglang_server_args(checkpoint_dir, context_length, **overrides):
         server_args = SimpleNamespace(
             disable_cuda_graph=overrides["disable_cuda_graph"],
             disable_overlap_schedule=False,
+            enable_torch_compile=False,
             max_running_requests=overrides["max_running_requests"],
-            lora_paths=overrides.get("lora_paths"),
-            check_lora_server_args=lambda: captured.update(
-                check_lora_server_args_called=True
-            ),
+            cuda_graph_max_bs=overrides["cuda_graph_max_bs"],
+            cuda_graph_bs=overrides["cuda_graph_bs"],
+            torch_compile_max_bs=32,
         )
         captured["checkpoint_dir"] = checkpoint_dir
         captured["context_length"] = context_length
@@ -213,26 +77,22 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch, tmp_path) -
         captured["server_args"] = server_args
         return server_args
 
-    def fake_create_sglang_infrastructure(server_args, gpu_id):
+    def fake_create_sglang_infrastructure(server_args, gpu_id, **kwargs):
+        del kwargs
         captured["gpu_id"] = gpu_id
-        captured["infra_disable_cuda_graph"] = server_args.disable_cuda_graph
+        infrastructure_saw_graph_disabled.append(bool(server_args.disable_cuda_graph))
         model = SimpleNamespace(
+            sampler_pool_max_running_requests=64,
             reset_request=lambda _request_id: None,
-            enable_cuda_graph_decoder=lambda **kwargs: captured.update(
-                cuda_graph_decoder_kwargs=kwargs
-            ),
         )
+        model_runner = SimpleNamespace(model=model)
+
+        def init_device_graphs() -> None:
+            init_graph_calls.append(True)
+
+        model_runner.init_device_graphs = init_device_graphs
         return (
-            SimpleNamespace(
-                model_runner=SimpleNamespace(
-                    model=model,
-                    lora_manager=SimpleNamespace(lora_refs={}),
-                    load_lora_adapter=lambda _ref: SimpleNamespace(success=True),
-                    init_device_graphs=lambda: captured.update(
-                        init_device_graphs_called=True
-                    ),
-                )
-            ),
+            SimpleNamespace(model_runner=model_runner),
             object(),
             object(),
             object(),
@@ -249,258 +109,1583 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch, tmp_path) -
         def __init__(self, model_worker, output_proc) -> None:
             captured["model_runner_args"] = (model_worker, output_proc)
 
-    class FakeOmniScheduler:
-        def __init__(self, **kwargs) -> None:
-            captured["scheduler"] = "omni"
-            captured["scheduler_kwargs"] = kwargs
+        def set_stream_outbox(self, outbox) -> None:
+            self._outbox = outbox
+            captured["stream_outbox"] = outbox
 
-    class FakeHiggsScheduler:
+    class FakeScheduler:
         def __init__(self, **kwargs) -> None:
-            captured["scheduler"] = "higgs"
             captured["scheduler_kwargs"] = kwargs
+            self.outbox = object()
 
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
     monkeypatch.setattr(
-        stages, "build_sglang_server_args", fake_build_sglang_server_args
+        sglang_backend, "build_sglang_server_args", fake_build_sglang_server_args
     )
     monkeypatch.setattr(
-        stages, "create_sglang_infrastructure", fake_create_sglang_infrastructure
+        bootstrap, "create_sglang_infrastructure", fake_create_sglang_infrastructure
     )
-    monkeypatch.setattr(stages, "truncate_rope_to_bf16", lambda model: None)
-    monkeypatch.setattr(stages, "SGLangOutputProcessor", FakeOutputProcessor)
-    monkeypatch.setattr(stages, "HiggsTTSModelRunner", FakeModelRunner)
+    monkeypatch.setattr(higgs_utils, "truncate_rope_to_bf16", lambda model: None)
+    monkeypatch.setattr(sglang_backend, "SGLangOutputProcessor", FakeOutputProcessor)
+    monkeypatch.setattr(model_runner_mod, "HiggsTTSModelRunner", FakeModelRunner)
 
     def fake_make_adapters(model, **kwargs):
         captured["adapter_kwargs"] = kwargs
         return None, None
 
-    monkeypatch.setattr(stages, "make_higgs_scheduler_adapters", fake_make_adapters)
-    monkeypatch.setattr(stages, "OmniScheduler", FakeOmniScheduler, raising=False)
-    monkeypatch.setattr(stages, "HiggsScheduler", FakeHiggsScheduler, raising=False)
-
-    # Engine-side session continuity builds a tokenizer adapter + session
-    # store; stub them so the test doesn't need a real checkpoint on disk.
     monkeypatch.setattr(
-        stages, "Tokenizer", SimpleNamespace(from_file=lambda _path: object())
+        request_builders, "make_higgs_scheduler_adapters", fake_make_adapters
     )
-    monkeypatch.setattr(stages, "PreTrainedTokenizerFast", lambda **kwargs: object())
-    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", lambda _tok: object())
-    monkeypatch.setattr(stages, "SessionStore", lambda **kwargs: object())
+    monkeypatch.setattr(omni_scheduler, "OmniScheduler", FakeScheduler)
 
-    adapter = tmp_path / "adapter-a"
-    adapter.mkdir()
-    _write_lora_metadata(adapter)
-    stages.create_sglang_tts_engine_executor(
-        "boson-sglang/higgs-audio-v3-tts-4b-base",
-        lora_voices={"adapter-a": str(adapter)},
-        serve_model_name=_TEST_MODEL_NAME,
-        enable_dynamic_lora=True,
-        lora_max_cached_adapters=3,
-        lora_base_dir=str(tmp_path),
-    )
+    stages.create_sglang_tts_engine_executor("bosonai/higgs-tts-3-4b")
 
-    assert captured["checkpoint_dir"] == "boson-sglang/higgs-audio-v3-tts-4b-base"
+    assert captured["checkpoint_dir"] == "bosonai/higgs-tts-3-4b"
     assert captured["context_length"] == 4096
     assert captured["gpu_id"] == 0
     assert captured["overrides"]["disable_cuda_graph"] is False
-    assert captured["overrides"]["cuda_graph_max_bs"] == 32
-    assert captured["overrides"]["max_running_requests"] == 16
-    assert captured["overrides"]["enable_lora"] is True
-    assert captured["overrides"]["lora_paths"] == {"adapter-a": str(adapter)}
-    assert captured["overrides"]["max_lora_rank"] == 32
-    assert captured["overrides"]["max_loaded_loras"] == 4
-    assert captured["overrides"]["max_loras_per_batch"] == 4
-    assert captured["overrides"]["lora_backend"] == "triton"
-    assert captured["overrides"]["lora_target_modules"] == [
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
+    assert captured["overrides"]["cuda_graph_bs"] == [
+        1,
+        2,
+        4,
+        8,
+        12,
+        16,
+        24,
+        32,
+        40,
+        48,
+        56,
+        64,
     ]
-    assert captured["check_lora_server_args_called"] is True
-    assert captured["infra_disable_cuda_graph"] is True
-    assert captured["server_args"].disable_cuda_graph is False
-    assert captured["cuda_graph_decoder_kwargs"] == {"max_batch_size": 16}
-    assert captured["init_device_graphs_called"] is True
+    assert captured["overrides"]["cuda_graph_max_bs"] == 64
+    assert captured["overrides"]["max_running_requests"] == 64
     assert captured["server_args"].disable_overlap_schedule is True
-    assert captured["adapter_kwargs"]["max_new_tokens_cap"] == 1024
-    # Engine-side continuity wiring: a tokenizer adapter + session store are
-    # handed to the scheduler adapters.
-    assert captured["adapter_kwargs"]["adapter"] is not None
-    assert captured["adapter_kwargs"]["session_store"] is not None
-    assert captured["scheduler"] == "omni"
-    assert captured["scheduler_kwargs"]["tp_worker"] is captured["model_runner_args"][0]
-    assert callable(captured["scheduler_kwargs"]["stream_output_builder"])
-
-
-def test_higgs_model_runner_marks_sampler_finish() -> None:
-    runner = object.__new__(HiggsTTSModelRunner)
-    slot = SimpleNamespace(
-        output_codes=[torch.tensor([EOC_ID, 1, 2])],
-        sampler=SimpleNamespace(generation_done=True),
-    )
-    runner.model = SimpleNamespace(
-        _slots={"req": slot},
-        _graph_decode_ready=False,
-    )
-    req = SimpleNamespace(is_chunked=0, finished_reason=None)
-    data = SimpleNamespace(req=req, output_codes=[], generation_done=False)
-    result = SimpleNamespace(
-        logits_output=SimpleNamespace(next_token_logits=torch.zeros(1, 4))
-    )
-
-    runner._collect_step_outputs(
-        result,
-        [SimpleNamespace(request_id="req", data=data)],
-    )
-
-    assert data.generation_done is True
-    assert req.finished_reason is not None
-    assert len(data.output_codes) == 1
-    assert torch.equal(data.latest_stream_code_chunk, torch.tensor([[EOC_ID, 1, 2]]))
-    assert result.next_token_ids.tolist() == [EOC_ID]
-
-
-def test_higgs_model_runner_marks_sampler_finish_graph() -> None:
-    runner = object.__new__(HiggsTTSModelRunner)
-    slot = SimpleNamespace(
-        output_codes=[],
-        sampler=SimpleNamespace(
-            delay_count=0,
-            eoc_countdown=None,
-            generation_done=False,
-            last_codes=None,
-        ),
-    )
-    runner.model = SimpleNamespace(
-        _graph_decode_ready=True,
-        _graph_output_codes=torch.tensor([[EOC_ID, 1, 2]]),
-        _graph_delay_count=torch.tensor([8], dtype=torch.int32),
-        _graph_eoc_countdown=torch.tensor([0], dtype=torch.int32),
-        _graph_generation_done=torch.tensor([True]),
-        _graph_has_last_codes=torch.tensor([True]),
-        _graph_last_codes=torch.tensor([[1, 2, 3]]),
-        _graph_sampling_seed=torch.tensor([1234], dtype=torch.long),
-        _graph_sampling_step=torch.tensor([9], dtype=torch.long),
-        get_slot=lambda _rid: slot,
-    )
-    req = SimpleNamespace(is_chunked=0, finished_reason=None)
-    data = SimpleNamespace(req=req, output_codes=[], generation_done=False)
-    result = SimpleNamespace(
-        logits_output=SimpleNamespace(next_token_logits=torch.zeros(1, 4))
-    )
-
-    runner._collect_step_outputs(
-        result,
-        [SimpleNamespace(request_id="req", data=data)],
-    )
-
-    assert data.generation_done is True
-    assert req.finished_reason is not None
-    assert len(data.output_codes) == 1
-    assert torch.equal(data.latest_stream_code_chunk, torch.tensor([[EOC_ID, 1, 2]]))
-    assert result.next_token_ids.tolist() == [EOC_ID]
-
-
-def test_higgs_performance_config_routes_lora_and_vocoder_batching() -> None:
-    from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
-
-    cfg = HiggsTtsPipelineConfig(
-        model_path="test-model",
-        lora_voices={"adapter-a": "/models/adapter-a"},
-        lora_backend="csgmv",
-        lora_max_rank=64,
-        enable_dynamic_lora=True,
-        lora_max_cached_adapters=6,
-        lora_base_dir="/models",
-        separate_vocoder_process=True,
-        vocoder_max_batch_size=16,
-        vocoder_audio_chunk_size=32,
-        vocoder_audio_chunk_overlap_size=16,
-    )
-    stages_by_name = {stage.name: stage for stage in cfg.stages}
-
-    assert stages_by_name["preprocessing"].factory_args["lora_voices"] == {
-        "adapter-a": "/models/adapter-a"
-    }
-    assert stages_by_name["tts_engine"].factory_args["lora_voices"] == {
-        "adapter-a": "/models/adapter-a"
-    }
-    assert stages_by_name["tts_engine"].factory_args["lora_backend"] == "csgmv"
-    assert stages_by_name["tts_engine"].factory_args["lora_max_rank"] == 64
-    assert stages_by_name["tts_engine"].factory_args["enable_dynamic_lora"] is True
-    assert stages_by_name["tts_engine"].factory_args["lora_max_cached_adapters"] == 6
-    assert stages_by_name["tts_engine"].factory_args["lora_base_dir"] == "/models"
-    assert stages_by_name["tts_engine"].factory_args["serve_model_name"] == "test-model"
-    assert stages_by_name["vocoder"].factory_args["max_batch_size"] == 16
-    assert stages_by_name["vocoder"].factory_args["audio_chunk_size"] == 32
-    assert stages_by_name["vocoder"].factory_args["audio_chunk_overlap_size"] == 16
-    assert stages_by_name["vocoder"].process == "vocoder"
+    assert captured["server_args"].enable_torch_compile is False
+    assert captured["server_args"].torch_compile_max_bs == 32
+    assert infrastructure_saw_graph_disabled == [True]
+    assert init_graph_calls == [True]
+    assert captured["adapter_kwargs"] == {"max_new_tokens_cap": 2048}
     assert (
-        sum(
-            stages_by_name[name].runtime.resources.total_gpu_memory_fraction
-            for name in ("audio_encoder", "tts_engine", "vocoder")
-        )
-        == 1.0
+        captured["stream_outbox"]
+        is captured["scheduler_kwargs"]["model_runner"]._outbox
     )
 
 
-def test_dynamic_lora_config_requires_allowed_base_directory() -> None:
-    from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
+def test_higgs_tts_engine_abort_callback_requires_model() -> None:
+    from sglang_omni.models.higgs_tts.engine_builder import HiggsTtsEngineBuilder
 
-    with pytest.raises(ValueError, match="requires lora_base_dir"):
-        HiggsTtsPipelineConfig(
-            model_path="test-model",
-            enable_dynamic_lora=True,
-        )
-
-
-def test_separate_vocoder_preserves_explicit_memory_fractions() -> None:
-    from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
-
-    stages = HiggsTtsPipelineConfig(model_path="test-model").stages
-    expected = {"audio_encoder": 0.02, "tts_engine": 0.91, "vocoder": 0.07}
-    for stage in stages:
-        if stage.name in expected:
-            stage.runtime.resources.total_gpu_memory_fraction = expected[stage.name]
-
-    cfg = HiggsTtsPipelineConfig(
-        model_path="test-model",
-        stages=stages,
-        separate_vocoder_process=True,
+    builder = HiggsTtsEngineBuilder(
+        max_new_tokens=2048,
+        max_running_requests=64,
+        cuda_graph_max_bs=64,
+        enable_async_decode=False,
+        async_decode_min_batch_size=2,
     )
 
-    actual = {
-        stage.name: stage.runtime.resources.total_gpu_memory_fraction
-        for stage in cfg.stages
-        if stage.name in expected
-    }
-    assert actual == expected
+    with pytest.raises(AssertionError):
+        builder.make_abort_callback()
+
+    reset_calls: list[str] = []
+    builder.model = SimpleNamespace(reset_request=reset_calls.append)
+    abort_callback = builder.make_abort_callback()
+    abort_callback("req-1")
+
+    assert reset_calls == ["req-1"]
 
 
-def test_audio_encoder_defers_codec_load_until_raw_reference(monkeypatch) -> None:
-    load_calls = []
-    monkeypatch.setattr(stages, "resolve_checkpoint", lambda path: path)
+def test_higgs_reference_code_cache_key_round_trip() -> None:
+    state = HiggsTtsState(
+        reference_code_cache_key="waveform:sr:24000:test",
+        uploaded_voice_name="guide",
+        uploaded_voice_created_at=7,
+    )
+
+    restored = HiggsTtsState.from_dict(state.to_dict())
+
+    assert restored.reference_code_cache_key == "waveform:sr:24000:test"
+    assert restored.uploaded_voice_name == "guide"
+    assert restored.uploaded_voice_created_at == 7
+
+
+def test_higgs_reference_source_key_tracks_file_content(tmp_path) -> None:
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(b"a")
+    first_key = stages._reference_audio_cache_key(ref_audio)
+
+    # Same content -> stable key (so repeat requests hit the cache).
+    assert first_key == stages._reference_audio_cache_key(ref_audio)
+
+    ref_audio.write_bytes(b"longer")
+    second_key = stages._reference_audio_cache_key(ref_audio)
+
+    # Different content -> different key (so a replaced file is not stale-served).
+    assert first_key is not None and first_key.startswith("file:")
+    assert second_key is not None and second_key.startswith("file:")
+    assert first_key != second_key
+
+
+def test_higgs_reference_source_key_same_size_edit_and_urls(tmp_path) -> None:
+    # Same path, same size, same head/tail, different middle must not stale-hit.
+    head, tail = b"H" * 8192, b"T" * 8192
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(head + b"a" * 4096 + tail)
+    key_a = stages._reference_audio_cache_key(ref_audio)
+    ref_audio.write_bytes(head + b"b" * 4096 + tail)  # same size, middle differs
+    assert key_a is not None and key_a != stages._reference_audio_cache_key(ref_audio)
+
+    # URLs and missing files are not cached.
+    assert stages._reference_audio_cache_key("https://example.com/ref.wav") is None
+    assert stages._reference_audio_cache_key(str(tmp_path / "missing.wav")) is None
+
+
+def test_higgs_reference_source_key_memoizes_stable_file_hash(
+    monkeypatch, tmp_path
+) -> None:
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(b"fake wav bytes")
+    stages._REF_PATH_HASH_MEMO.clear()
+    read_calls = 0
+    original_read_bytes = stages.Path.read_bytes
+
+    def counting_read_bytes(path):
+        nonlocal read_calls
+        if path == ref_audio:
+            read_calls += 1
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(stages.Path, "read_bytes", counting_read_bytes)
+
+    first_key = stages._reference_audio_cache_key(ref_audio)
+    second_key = stages._reference_audio_cache_key(ref_audio)
+
+    assert first_key == second_key
+    assert read_calls == 1
+
+
+def test_higgs_reference_source_key_ignores_media_type() -> None:
+    raw = b"\x01\x02\x03fake-audio-bytes"
+    encoded = base64.b64encode(raw).decode()
+    key_wav = stages._reference_audio_cache_key(
+        {"base64": encoded, "media_type": "audio/wav"}
+    )
+    key_mp3 = stages._reference_audio_cache_key(
+        {"base64": encoded, "media_type": "audio/mpeg"}
+    )
+
+    # media_type is a decode hint the codec ignores, so it must not split keys.
+    assert key_wav is not None
+    assert key_wav == key_mp3
+    # Raw bytes and equivalent base64 resolve to the same content key.
+    assert stages._reference_audio_cache_key({"bytes": raw}) == key_wav
+
+
+def test_higgs_audio_encoder_uses_reference_code_cache(monkeypatch) -> None:
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
     monkeypatch.setattr(
-        stages,
-        "Tokenizer",
-        SimpleNamespace(from_file=lambda _path: object()),
+        stages.Tokenizer,
+        "from_file",
+        lambda _path: object(),
     )
     monkeypatch.setattr(
         stages,
         "PreTrainedTokenizerFast",
-        lambda **_kwargs: object(),
+        lambda tokenizer_object: object(),
     )
-    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", lambda _tokenizer: object())
+
+    class FakeAdapter:
+        def __init__(self, _tokenizer) -> None:
+            pass
+
+        def build_prompt(
+            self, text: str, *, num_ref_tokens: int, reference_text: str | None
+        ) -> list[int]:
+            return [len(text), num_ref_tokens, len(reference_text or "")]
+
+    class FakeCodec:
+        SAMPLE_RATE = 24000
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.model = SimpleNamespace(acoustic_encoder=torch.nn.Identity())
+
+        def encode_reference(self, waveform, sample_rate: int) -> torch.Tensor:
+            self.calls += 1
+            return torch.tensor([[11, 12], [21, 22]], dtype=torch.long)
+
+    fake_codec = FakeCodec()
+    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", FakeAdapter)
+    monkeypatch.setattr(stages, "get_or_load_codec", lambda *args, **kwargs: fake_codec)
+
+    scheduler = stages.create_audio_encoder_executor(
+        "ckpt",
+        device="cuda:0",
+        num_codebooks=2,
+    )
+    # Ignore the construction-time codec warm-up call added by #612.
+    fake_codec.calls = 0
+    encode = scheduler._fn
+
+    def make_payload(request_id: str) -> StagePayload:
+        state = HiggsTtsState(
+            reference_waveform=torch.zeros(1, 1, 16),
+            reference_code_cache_key="waveform:sr:24000:test",
+            target_text="hello",
+            reference_text="speaker",
+            num_codebooks=2,
+        )
+        return StagePayload(
+            request_id=request_id,
+            request=OmniRequest(inputs={}),
+            data=state.to_dict(),
+        )
+
+    first = encode(make_payload("first"))
+    second = encode(make_payload("second"))
+
+    assert fake_codec.calls == 1
+    assert (
+        first.data["reference_codes_delayed"] == second.data["reference_codes_delayed"]
+    )
+    assert first.data["prompt_token_ids"] == [5, 3, 7]
+    assert second.data["prompt_token_ids"] == [5, 3, 7]
+    assert "reference_waveform" not in second.data
+    assert "reference_code_cache_key" not in second.data
+
+
+def test_higgs_audio_encoder_uses_shared_cache_for_uploaded_voice(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(stages.Tokenizer, "from_file", lambda _path: object())
     monkeypatch.setattr(
         stages,
-        "get_or_load_codec",
-        lambda *args: load_calls.append(args),
+        "PreTrainedTokenizerFast",
+        lambda tokenizer_object: object(),
     )
 
-    stages.create_audio_encoder_executor("test-model")
+    class FakeAdapter:
+        def __init__(self, _tokenizer) -> None:
+            pass
 
-    assert load_calls == []
+        def build_prompt(
+            self, text: str, *, num_ref_tokens: int, reference_text: str | None
+        ) -> list[int]:
+            return [len(text), num_ref_tokens, len(reference_text or "")]
+
+    class FakeCodec:
+        SAMPLE_RATE = 24000
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.model = SimpleNamespace(acoustic_encoder=torch.nn.Identity())
+
+        def encode_reference(self, waveform, sample_rate: int) -> torch.Tensor:
+            self.calls += 1
+            return torch.tensor([[11, 12], [21, 22]], dtype=torch.long)
+
+    cache = get_speaker_artifact_cache()
+    cache.clear()
+    fake_codec = FakeCodec()
+    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", FakeAdapter)
+    monkeypatch.setattr(stages, "get_or_load_codec", lambda *args, **kwargs: fake_codec)
+
+    scheduler = stages.create_audio_encoder_executor(
+        "ckpt",
+        device="cuda:0",
+        num_codebooks=2,
+    )
+    fake_codec.calls = 0
+    encode = scheduler._fn
+
+    def make_payload(request_id: str) -> StagePayload:
+        state = HiggsTtsState(
+            reference_waveform=torch.zeros(1, 1, 16),
+            reference_code_cache_key="waveform:sr:24000:uploaded",
+            target_text="hello",
+            reference_text="speaker",
+            uploaded_voice_name="guide",
+            uploaded_voice_created_at=7,
+            num_codebooks=2,
+        )
+        return StagePayload(
+            request_id=request_id,
+            request=OmniRequest(inputs={}),
+            data=state.to_dict(),
+        )
+
+    first = encode(make_payload("first"))
+    second = encode(make_payload("second"))
+    cache.clear_voice("guide")
+    third = encode(make_payload("third"))
+
+    assert fake_codec.calls == 2
+    assert (
+        first.data["reference_codes_delayed"] == second.data["reference_codes_delayed"]
+    )
+    assert (
+        third.data["reference_codes_delayed"] == first.data["reference_codes_delayed"]
+    )
+
+
+def test_higgs_preprocessing_uses_waveform_cache(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(stages.Tokenizer, "from_file", lambda _path: object())
+    monkeypatch.setattr(
+        stages,
+        "PreTrainedTokenizerFast",
+        lambda tokenizer_object: object(),
+    )
+    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", lambda _tokenizer: object())
+
+    load_calls = 0
+
+    def fake_load_audio_to_24k(reference_audio):
+        nonlocal load_calls
+        load_calls += 1
+        return np.zeros(16, dtype=np.float32), 24000
+
+    monkeypatch.setattr(stages, "load_audio_to_24k", fake_load_audio_to_24k)
+    reference_code_key_calls = 0
+    original_reference_code_cache_key = stages._reference_code_cache_key_from_waveform
+
+    def counting_reference_code_cache_key(waveform, sample_rate):
+        nonlocal reference_code_key_calls
+        reference_code_key_calls += 1
+        return original_reference_code_cache_key(waveform, sample_rate)
+
+    monkeypatch.setattr(
+        stages,
+        "_reference_code_cache_key_from_waveform",
+        counting_reference_code_cache_key,
+    )
+
+    scheduler = stages.create_preprocessing_executor("ckpt", num_codebooks=2)
+    preprocess = scheduler._fn
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(b"fake wav bytes")
+
+    def make_payload(request_id: str) -> StagePayload:
+        return StagePayload(
+            request_id=request_id,
+            request=OmniRequest(
+                inputs={
+                    "text": "hello",
+                    "references": [{"audio_path": str(ref_audio), "text": "speaker"}],
+                },
+                params={},
+            ),
+            data={},
+        )
+
+    first = preprocess(make_payload("first"))
+    second = preprocess(make_payload("second"))
+    first_state = HiggsTtsState.from_dict(first.data)
+    second_state = HiggsTtsState.from_dict(second.data)
+
+    assert load_calls == 1
+    assert reference_code_key_calls == 1
+    assert first_state.reference_code_cache_key == second_state.reference_code_cache_key
+    assert torch.equal(first_state.reference_waveform, second_state.reference_waveform)
+    assert (
+        first_state.reference_waveform.data_ptr()
+        != second_state.reference_waveform.data_ptr()
+    )
+
+
+def test_higgs_preprocessing_url_refs_use_decoded_content_key(monkeypatch) -> None:
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(stages.Tokenizer, "from_file", lambda _path: object())
+    monkeypatch.setattr(
+        stages,
+        "PreTrainedTokenizerFast",
+        lambda tokenizer_object: object(),
+    )
+    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", lambda _tokenizer: object())
+
+    def fake_load_audio_to_24k(reference_audio):
+        assert str(reference_audio).startswith("https://example.com/")
+        return np.zeros(16, dtype=np.float32), 24000
+
+    monkeypatch.setattr(stages, "load_audio_to_24k", fake_load_audio_to_24k)
+
+    scheduler = stages.create_preprocessing_executor("ckpt", num_codebooks=2)
+    preprocess = scheduler._fn
+
+    def make_payload(request_id: str, url: str) -> StagePayload:
+        return StagePayload(
+            request_id=request_id,
+            request=OmniRequest(
+                inputs={
+                    "text": "hello",
+                    "references": [{"audio_path": url, "text": "speaker"}],
+                },
+                params={},
+            ),
+            data={},
+        )
+
+    first = preprocess(make_payload("first", "https://example.com/a.wav"))
+    second = preprocess(make_payload("second", "https://example.com/b.wav"))
+    first_state = HiggsTtsState.from_dict(first.data)
+    second_state = HiggsTtsState.from_dict(second.data)
+
+    assert first_state.reference_code_cache_key is not None
+    assert first_state.reference_code_cache_key.startswith("waveform:")
+    assert first_state.reference_code_cache_key == second_state.reference_code_cache_key
+
+
+def test_higgs_model_runner_marks_sampler_finish() -> None:
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner._outbox = None
+    runner._vocoder_target = "vocoder"
+    runner.model = SimpleNamespace(
+        _rid_to_row={"req": 0},
+        _output_codes={"req": [torch.tensor([EOC_ID, 1, 2])]},
+        _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
+    )
+    req = SimpleNamespace(
+        is_chunked=0,
+        finished_reason=None,
+        finished=lambda: False,
+    )
+    data = SimpleNamespace(
+        req=req,
+        output_codes=[],
+        output_logprobs=[],
+        return_omni_rollout=False,
+        return_logprob=False,
+        generation_done=False,
+    )
+    result = SimpleNamespace(
+        logits_output=SimpleNamespace(next_token_logits=torch.zeros(1, 4))
+    )
+
+    runner._collect_step_outputs(
+        result,
+        [SimpleNamespace(request_id="req", data=data)],
+    )
+
+    assert data.generation_done is True
+    assert req.finished_reason.to_json() == {"type": "stop", "matched": EOC_ID}
+    assert len(data.output_codes) == 1
+
+
+def test_higgs_model_runner_emits_latched_stream_metadata() -> None:
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner._outbox = queue.Queue()
+    runner._vocoder_target = "vocoder"
+    runner.model = SimpleNamespace(
+        _rid_to_row={"req": 0},
+        _output_codes={"req": [torch.tensor([EOC_ID, 1, 2])]},
+        _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
+    )
+    req = SimpleNamespace(
+        is_chunked=0,
+        finished_reason=None,
+        finished=lambda: False,
+    )
+    data = SimpleNamespace(
+        req=req,
+        output_codes=[],
+        output_logprobs=[],
+        return_omni_rollout=False,
+        return_logprob=False,
+        generation_done=False,
+        stream_metadata={
+            "modality": "audio_codes",
+            "stream": True,
+            "num_codebooks": 3,
+            "codebook_size": 17,
+            "initial_codec_chunk_frames": 2,
+        },
+    )
+    result = SimpleNamespace(
+        logits_output=SimpleNamespace(next_token_logits=torch.zeros(1, 4))
+    )
+
+    runner._collect_step_outputs(
+        result,
+        [SimpleNamespace(request_id="req", data=data)],
+    )
+
+    out = runner._outbox.get_nowait()
+    assert out.type == "stream"
+    assert out.target == "vocoder"
+    assert out.data.tolist() == [EOC_ID, 1, 2]
+    assert out.metadata == {
+        "modality": "audio_codes",
+        "stream": True,
+        "num_codebooks": 3,
+        "codebook_size": 17,
+        "initial_codec_chunk_frames": 2,
+    }
+
+
+def test_higgs_stream_metadata_carries_initial_codec_chunk_frames() -> None:
+    payload = StagePayload(
+        request_id="req",
+        request=OmniRequest(
+            inputs="",
+            params={"stream": True, "initial_codec_chunk_frames": 1},
+        ),
+        data={},
+    )
+    data = SimpleNamespace(num_codebooks=3, codebook_size=17)
+
+    metadata = build_higgs_stream_metadata(payload, data)
+
+    assert metadata == {
+        "modality": "audio_codes",
+        "stream": True,
+        "num_codebooks": 3,
+        "codebook_size": 17,
+        "initial_codec_chunk_frames": 1,
+    }
+
+
+def test_higgs_model_runner_marks_sampler_finish_cg() -> None:
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner._outbox = None
+    runner._vocoder_target = "vocoder"
+    runner.model = SimpleNamespace(
+        _cg_row_indices=torch.tensor([0]),
+        _cg_active_delay_count=torch.tensor([8], dtype=torch.int32),
+        _cg_active_eoc_countdown=torch.tensor([0], dtype=torch.int32),
+        _cg_active_generation_done=torch.tensor([True]),
+        _cg_active_last_codes=torch.tensor([[1, 2, 3]]),
+        _cg_active_step_count=torch.zeros(1, dtype=torch.long),
+        _cg_was_done=torch.tensor([False]),
+        _cg_codes_BN=torch.tensor([[EOC_ID, 1, 2]]),
+        _cg_collect_staging=torch.zeros((1, 3 + 2), dtype=torch.long),
+        _sampler_pool=SimpleNamespace(
+            delay_count=torch.zeros(1, dtype=torch.int32),
+            eoc_countdown=torch.zeros(1, dtype=torch.int32),
+            generation_done=torch.zeros(1, dtype=torch.bool),
+            last_codes=torch.zeros((1, 3), dtype=torch.long),
+            step_count=torch.zeros(1, dtype=torch.long),
+        ),
+    )
+    req = SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False)
+    data = SimpleNamespace(
+        req=req,
+        output_codes=[],
+        output_logprobs=[],
+        return_omni_rollout=False,
+        return_logprob=False,
+        generation_done=False,
+    )
+    result = SimpleNamespace(
+        logits_output=SimpleNamespace(next_token_logits=torch.zeros(1, 4))
+    )
+    forward_batch = SimpleNamespace(batch_size=1)
+
+    runner._collect_step_outputs_cg(
+        result,
+        forward_batch,
+        [SimpleNamespace(request_id="req", data=data)],
+    )
+
+    assert data.generation_done is True
+    assert req.finished_reason.to_json() == {"type": "stop", "matched": EOC_ID}
+    assert len(data.output_codes) == 1
+
+
+def test_higgs_model_runner_collect_cg_mixed_batch() -> None:
+    """A 4-row batch covering chunked / was-done / active rows verifies the
+    batched single-D2H packing preserves per-row semantics, including the
+    bool->long->bool round-trip for generation_done.
+    """
+    n, k = 4, 3
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner._outbox = None
+    runner._vocoder_target = "vocoder"
+    runner.model = SimpleNamespace(
+        _cg_row_indices=torch.arange(n),
+        _cg_active_delay_count=torch.zeros(n, dtype=torch.int32),
+        _cg_active_eoc_countdown=torch.zeros(n, dtype=torch.int32),
+        # row1's True must NOT leak into the was-done (skipped) request.
+        _cg_active_generation_done=torch.tensor([False, True, False, True]),
+        _cg_active_last_codes=torch.zeros((n, k), dtype=torch.long),
+        _cg_active_step_count=torch.zeros(n, dtype=torch.long),
+        _cg_was_done=torch.tensor([False, True, False, False]),
+        _cg_codes_BN=torch.tensor([[1, 1, 1], [7, 8, 9], [20, 1, 2], [EOC_ID, 3, 4]]),
+        _cg_collect_staging=torch.zeros((n, k + 2), dtype=torch.long),
+        _sampler_pool=SimpleNamespace(
+            delay_count=torch.zeros(n, dtype=torch.int32),
+            eoc_countdown=torch.zeros(n, dtype=torch.int32),
+            generation_done=torch.zeros(n, dtype=torch.bool),
+            step_count=torch.zeros(n, dtype=torch.long),
+            last_codes=torch.zeros((n, k), dtype=torch.long),
+        ),
+    )
+    # row0 chunked, row1 was-done, row2 active (not done), row3 active (EOC done).
+    reqs = [
+        SimpleNamespace(is_chunked=1, finished_reason=None, finished=lambda: False),
+        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
+        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
+        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
+    ]
+    datas = [
+        SimpleNamespace(
+            req=r,
+            output_codes=[],
+            output_logprobs=[],
+            return_omni_rollout=False,
+            return_logprob=False,
+            generation_done=False,
+        )
+        for r in reqs
+    ]
+    result = SimpleNamespace(
+        logits_output=SimpleNamespace(next_token_logits=torch.zeros(n, 4))
+    )
+    forward_batch = SimpleNamespace(batch_size=n)
+
+    runner._collect_step_outputs_cg(
+        result,
+        forward_batch,
+        [SimpleNamespace(request_id=f"req{i}", data=d) for i, d in enumerate(datas)],
+    )
+
+    assert [len(d.output_codes) for d in datas] == [0, 0, 1, 1]
+    # Direct bool-list equality locks the bool->long->bool round-trip; the
+    # was-done row stays False despite _cg_active_generation_done[1] being True.
+    assert [d.generation_done for d in datas] == [False, False, False, True]
+    assert result.next_token_ids.tolist() == [0, 0, 20, EOC_ID]
+    assert datas[2].output_codes[0].tolist() == [20, 1, 2]
+    assert datas[3].output_codes[0].tolist() == [EOC_ID, 3, 4]
+    assert reqs[3].finished_reason.to_json() == {"type": "stop", "matched": EOC_ID}
+    assert all(reqs[i].finished_reason is None for i in (0, 1, 2))
+
+
+def test_higgs_model_runner_collects_rollout_logprobs_only_when_requested() -> None:
+    n, k, vocab = 1, 3, 8
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner._outbox = None
+    runner._vocoder_target = "vocoder"
+    logits = torch.randn(n, k, vocab)
+
+    runner.model = SimpleNamespace(
+        modality_head=SimpleNamespace(
+            generate=lambda hidden: logits[: hidden.shape[0]]
+        ),
+        _num_codebooks=k,
+        _cg_row_indices=torch.arange(n),
+        _cg_temperature=torch.ones(n),
+        _cg_top_k_buf=torch.full((n,), K_MAX, dtype=torch.long),
+        _cg_active_delay_count=torch.zeros(n, dtype=torch.int32),
+        _cg_active_eoc_countdown=torch.zeros(n, dtype=torch.int32),
+        _cg_active_generation_done=torch.tensor([False]),
+        _cg_active_last_codes=torch.zeros((n, k), dtype=torch.long),
+        _cg_active_step_count=torch.zeros(n, dtype=torch.long),
+        _cg_was_done=torch.tensor([False]),
+        _cg_codes_BN=torch.tensor([[2, 3, 4]]),
+        _cg_collect_staging=torch.zeros((n, k + 2), dtype=torch.long),
+        _sampler_pool=SimpleNamespace(
+            delay_count=torch.zeros(n, dtype=torch.int32),
+            eoc_countdown=torch.zeros(n, dtype=torch.int32),
+            generation_done=torch.zeros(n, dtype=torch.bool),
+            step_count=torch.zeros(n, dtype=torch.long),
+            last_codes=torch.zeros((n, k), dtype=torch.long),
+        ),
+    )
+    req = SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False)
+    data = SimpleNamespace(
+        req=req,
+        output_codes=[],
+        output_logprobs=[],
+        return_omni_rollout=True,
+        return_logprob=True,
+        generation_done=False,
+    )
+    result = SimpleNamespace(
+        logits_output=SimpleNamespace(
+            next_token_logits=torch.zeros(n, 4),
+            hidden_states=torch.zeros(n, 5),
+        )
+    )
+
+    runner._collect_step_outputs_cg(
+        result,
+        SimpleNamespace(batch_size=n),
+        [SimpleNamespace(request_id="req", data=data)],
+    )
+
+    expected = torch.log_softmax(logits, dim=-1).gather(
+        -1, torch.tensor([[[2], [3], [4]]])
+    )
+    assert len(data.output_logprobs) == 1
+    assert torch.allclose(data.output_logprobs[0], expected.squeeze(-1)[0])
+
+
+def test_higgs_model_runner_skips_already_finished_eager_request() -> None:
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner._outbox = None
+    runner._vocoder_target = "vocoder"
+    runner.model = SimpleNamespace(
+        _rid_to_row={"req": 0},
+        _output_codes={"req": [torch.tensor([EOC_ID, 1, 2])]},
+        _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
+    )
+    req = SimpleNamespace(
+        is_chunked=0,
+        finished_reason=object(),
+        finished=lambda: True,
+    )
+    data = SimpleNamespace(
+        req=req,
+        output_codes=[],
+        return_omni_rollout=False,
+        return_logprob=False,
+        generation_done=True,
+    )
+    result = SimpleNamespace(
+        logits_output=SimpleNamespace(next_token_logits=torch.zeros(1, 4))
+    )
+
+    runner._collect_step_outputs(
+        result,
+        [SimpleNamespace(request_id="req", data=data)],
+    )
+
+    assert data.output_codes == []
+    assert result.next_token_ids.tolist() == [0]
+
+
+def _make_payload(request_id: str, state: HiggsTtsState) -> StagePayload:
+    return StagePayload(
+        request_id=request_id,
+        request=OmniRequest(inputs=""),
+        data=state.to_dict(),
+    )
+
+
+def _fake_codec_fixtures(monkeypatch):
+    """Patch codec loading; return list that records decode_batch call sizes."""
+    decode_batch_sizes: list[int] = []
+
+    class FakeCodec:
+        SAMPLE_RATE = 24_000
+
+        def decode(self, codes_TN):
+            return torch.zeros(codes_TN.shape[0], dtype=torch.float32)
+
+        def decode_batch(self, codes_list):
+            decode_batch_sizes.append(len(codes_list))
+            return [torch.arange(c.shape[0], dtype=torch.float32) for c in codes_list]
+
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda p: p)
+    monkeypatch.setattr(stages, "get_or_load_codec", lambda *a, **kw: FakeCodec())
+    return decode_batch_sizes
+
+
+def test_higgs_tts_vocoder_batches_decode_requests(
+    monkeypatch,
+) -> None:
+    """Protects Higgs TTS vocoder throughput from regressing to serial decode."""
+    decode_batch_sizes = _fake_codec_fixtures(monkeypatch)
+
+    scheduler = stages.create_vocoder_executor(
+        "fake-model", vocoder_decode_batch_size=4, max_batch_wait_ms=2
+    )
+
+    p1 = _make_payload(
+        "r1",
+        HiggsTtsState(
+            output_codes_delayed=[[i % 100] * 8 for i in range(10)],
+            prompt_tokens=5,
+            completion_tokens=10,
+            engine_time_s=0.5,
+        ),
+    )
+    p2 = _make_payload(
+        "r2",
+        HiggsTtsState(
+            output_codes_delayed=[[i % 100] * 8 for i in range(12)],
+        ),
+    )
+
+    results = scheduler._batch_fn([p1, p2])
+
+    assert decode_batch_sizes == [2], "should call decode_batch once with 2 items"
+    assert len(results) == 2
+    audio = np.frombuffer(results[0].data["audio_waveform"], dtype=np.float32)
+    assert audio.size > 0
+    assert "audio_data" not in results[0].data
+    assert results[0].data["usage"]["prompt_tokens"] == 5
+
+
+def test_higgs_tts_vocoder_batch_handles_empty_items(
+    monkeypatch,
+) -> None:
+    """Items with empty/too-short codes get empty waveform payloads, not a crash."""
+    decode_batch_sizes = _fake_codec_fixtures(monkeypatch)
+
+    scheduler = stages.create_vocoder_executor(
+        "fake-model", vocoder_decode_batch_size=4
+    )
+
+    payloads = [
+        _make_payload("r-empty", HiggsTtsState(output_codes_delayed=None)),
+        _make_payload(
+            "r-short",
+            HiggsTtsState(output_codes_delayed=[[0] * 8 for _ in range(3)]),
+        ),
+        _make_payload(
+            "r-valid",
+            HiggsTtsState(output_codes_delayed=[[i % 100] * 8 for i in range(10)]),
+        ),
+    ]
+
+    results = scheduler._batch_fn(payloads)
+
+    assert decode_batch_sizes == [1], "only the valid item should be batched"
+    assert results[0].data["audio_waveform_shape"] == [0]
+    assert results[1].data["audio_waveform_shape"] == [0]
+    audio = np.frombuffer(results[2].data["audio_waveform"], dtype=np.float32)
+    assert audio.size > 0
+    assert all("audio_data" not in result.data for result in results)
+
+
+class _FakeHiggsStreamingCodec:
+    def __init__(self, samples_per_frame: int = 4) -> None:
+        self.samples_per_frame = samples_per_frame
+        self.decode_inputs: list[torch.Tensor] = []
+        self.decode_batch_sizes: list[int] = []
+
+    def decode(self, codes_TN: torch.Tensor) -> torch.Tensor:
+        self.decode_inputs.append(codes_TN.detach().clone())
+        frames = int(codes_TN.shape[0])
+        return torch.arange(frames * self.samples_per_frame, dtype=torch.float32)
+
+    def decode_batch(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
+        self.decode_batch_sizes.append(len(codes_list))
+        return [self.decode(codes) for codes in codes_list]
+
+
+class _FakeUnevenHiggsStreamingCodec:
+    class _Model:
+        class config:
+            hop_length = 5
+
+    def __init__(self, tail_samples: int = 3) -> None:
+        self.model = self._Model()
+        self.tail_samples = tail_samples
+
+    def decode(self, codes_TN: torch.Tensor) -> torch.Tensor:
+        frames = []
+        offsets = torch.arange(
+            self.model.config.hop_length,
+            dtype=torch.float32,
+        )
+        for row in codes_TN:
+            frames.append(row.sum().float().repeat(self.model.config.hop_length))
+            frames[-1] = frames[-1] + offsets / 10.0
+        body = torch.cat(frames) if frames else torch.empty(0, dtype=torch.float32)
+        tail = torch.arange(self.tail_samples, dtype=torch.float32) + 10_000
+        return torch.cat([body, tail])
+
+    def decode_batch(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [self.decode(codes) for codes in codes_list]
+
+
+class _FakeMaskedHiggsStreamingCodec(_FakeUnevenHiggsStreamingCodec):
+    def __init__(self) -> None:
+        super().__init__(tail_samples=0)
+        self.masked_batch_sizes: list[int] = []
+
+    def decode_masked_batch(
+        self,
+        codes_list: list[torch.Tensor],
+        counts_list: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        self.masked_batch_sizes.append(len(codes_list))
+        assert all(
+            torch.equal(counts, torch.tensor([3, 2, 1])) for counts in counts_list
+        )
+        return [self.decode(codes) for codes in codes_list]
+
+
+def _higgs_stream_payload(
+    request_id: str,
+    *,
+    stream: bool,
+    delayed_rows: list[list[int]],
+    num_codebooks: int = 3,
+    codebook_size: int = 20,
+    initial_codec_chunk_frames: int | None = None,
+) -> StagePayload:
+    state = HiggsTtsState(
+        output_codes_delayed=delayed_rows,
+        num_codebooks=num_codebooks,
+        codebook_size=codebook_size,
+        prompt_tokens=2,
+        completion_tokens=len(delayed_rows),
+    )
+    params: dict[str, Any] = {"stream": stream}
+    if initial_codec_chunk_frames is not None:
+        params["initial_codec_chunk_frames"] = initial_codec_chunk_frames
+    return StagePayload(
+        request_id=request_id,
+        request=OmniRequest(inputs="", params=params),
+        data=state.to_dict(),
+    )
+
+
+def _higgs_stream_item(
+    row: torch.Tensor,
+    *,
+    num_codebooks: int = 3,
+    codebook_size: int = 20,
+) -> StreamItem:
+    return StreamItem(
+        chunk_id=0,
+        data=row,
+        from_stage="tts_engine",
+        metadata={
+            "modality": "audio_codes",
+            "stream": True,
+            "num_codebooks": num_codebooks,
+            "codebook_size": codebook_size,
+        },
+    )
+
+
+def test_higgs_streaming_vocoder_emits_compact_chunks_and_slim_final() -> None:
+    raw_codes = torch.tensor(
+        [
+            [1, 8, 9],
+            [2, 3, 10],
+            [4, 11, 12],
+            [1, 2, 3],
+        ],
+        dtype=torch.long,
+    )
+    delayed = apply_delay_pattern(raw_codes)
+    codec = _FakeHiggsStreamingCodec()
+    scheduler = HiggsStreamingVocoderScheduler(
+        codec,
+        stream_stride=3,
+        stream_followup_stride=2,
+        stream_holdback_tokens=0,
+    )
+    payload = _higgs_stream_payload(
+        "req",
+        stream=True,
+        delayed_rows=delayed.tolist(),
+        codebook_size=7,
+    )
+
+    scheduler._on_streaming_new_request("req", payload)
+    for idx, row in enumerate(delayed):
+        item = _higgs_stream_item(row, codebook_size=7)
+        item.chunk_id = idx
+        scheduler._on_chunk("req", item)
+    scheduler._on_done("req")
+
+    messages = _drain_higgs_outbox(scheduler)
+    stream_messages = [msg for msg in messages if msg.type == "stream"]
+    result_messages = [msg for msg in messages if msg.type == "result"]
+
+    assert stream_messages
+    first_chunk = stream_messages[0].data
+    assert "audio_waveform" in first_chunk
+    assert "audio_data" not in first_chunk
+    audio = np.frombuffer(first_chunk["audio_waveform"], dtype=np.float32)
+    assert audio.shape == tuple(first_chunk["audio_waveform_shape"])
+    assert first_chunk["audio_waveform_dtype"] == "float32"
+    assert first_chunk["sample_rate"] == 24000
+    assert codec.decode_inputs
+    assert all(int(codes.max().item()) < 5 for codes in codec.decode_inputs)
+
+    assert len(result_messages) == 1
+    final_data = result_messages[0].data.data
+    assert final_data == {
+        "modality": "audio",
+        "sample_rate": 24000,
+        "usage": {
+            "prompt_tokens": 2,
+            "completion_tokens": len(delayed),
+            "total_tokens": 2 + len(delayed),
+        },
+    }
+    assert "req" not in scheduler._pending_done
+    assert "req" not in scheduler._stream_states
+
+
+def test_higgs_streaming_vocoder_honors_initial_codec_chunk_frames() -> None:
+    raw_codes = torch.tensor(
+        [
+            [1, 8, 9],
+            [2, 3, 10],
+            [4, 11, 12],
+            [1, 2, 3],
+        ],
+        dtype=torch.long,
+    )
+    delayed = apply_delay_pattern(raw_codes)
+    codec = _FakeHiggsStreamingCodec(samples_per_frame=4)
+    scheduler = HiggsStreamingVocoderScheduler(
+        codec,
+        stream_stride=8,
+        stream_followup_stride=8,
+        stream_holdback_tokens=0,
+    )
+    payload = _higgs_stream_payload(
+        "req",
+        stream=True,
+        delayed_rows=delayed.tolist(),
+        codebook_size=20,
+        initial_codec_chunk_frames=1,
+    )
+
+    scheduler._on_streaming_new_request("req", payload)
+    for idx, row in enumerate(delayed[:2]):
+        item = _higgs_stream_item(row)
+        item.chunk_id = idx
+        scheduler._on_chunk("req", item)
+    assert not _drain_higgs_outbox(scheduler)
+
+    item = _higgs_stream_item(delayed[2])
+    item.chunk_id = 2
+    scheduler._on_chunk("req", item)
+    messages = _drain_higgs_outbox(scheduler)
+
+    assert len(messages) == 1
+    audio = np.frombuffer(messages[0].data["audio_waveform"], dtype=np.float32)
+    assert audio.size == 4
+    assert codec.decode_inputs[0].shape[0] == 1
+
+
+def test_higgs_masked_startup_coalesces_ready_requests() -> None:
+    codec = _FakeMaskedHiggsStreamingCodec()
+    scheduler = HiggsStreamingVocoderScheduler(
+        codec,
+        full_context_streaming=True,
+        startup_masked_delay_rows=3,
+        startup_masked_emit_frames=2,
+        startup_masked_until_frames=2,
+    )
+    raw_codes = torch.arange(1, 13, dtype=torch.long).reshape(4, 3)
+    delayed = apply_delay_pattern(raw_codes)
+    for request_id in ("a", "b"):
+        scheduler._on_streaming_new_request(
+            request_id,
+            _higgs_stream_payload(
+                request_id,
+                stream=True,
+                delayed_rows=delayed.tolist(),
+                codebook_size=64,
+            ),
+        )
+
+    scheduler.on_stream_chunk_batch(
+        [
+            (request_id, _higgs_stream_item(delayed[row], codebook_size=64))
+            for row in range(3)
+            for request_id in ("a", "b")
+        ]
+    )
+
+    streams = [msg for msg in _drain_higgs_outbox(scheduler) if msg.type == "stream"]
+    assert codec.masked_batch_sizes == [2]
+    assert {msg.request_id for msg in streams} == {"a", "b"}
+    assert all(
+        np.frombuffer(msg.data["audio_waveform"], dtype=np.float32).size == 10
+        for msg in streams
+    )
+
+
+def test_higgs_masked_startup_keeps_configured_lookahead() -> None:
+    scheduler = HiggsStreamingVocoderScheduler(
+        _FakeMaskedHiggsStreamingCodec(),
+        full_context_streaming=True,
+        startup_masked_delay_rows=8,
+        startup_masked_emit_frames=3,
+        startup_masked_until_frames=8,
+    )
+    state = scheduler.create_stream_state("req")
+    state.num_codebooks = 8
+    state.codebook_size = 64
+    state.delayed_rows = [torch.arange(8) for _ in range(8)]
+
+    task = scheduler._prepare_context_task("req", state)
+
+    assert task is not None
+    assert task.emit_frames == 3
+    assert task.codes_TN.shape == (8, 8)
+    assert task.counts_T.tolist() == [8, 7, 6, 5, 4, 3, 2, 1]
+
+
+def test_higgs_masked_startup_holds_back_eoc_adjacent_final_frame() -> None:
+    raw_codes = torch.arange(1, 10, dtype=torch.long).reshape(3, 3)
+    delayed = apply_delay_pattern(raw_codes)
+    scheduler = HiggsStreamingVocoderScheduler(
+        _FakeMaskedHiggsStreamingCodec(),
+        full_context_streaming=True,
+        startup_masked_delay_rows=3,
+        startup_masked_emit_frames=3,
+        startup_masked_until_frames=3,
+    )
+    state = scheduler.create_stream_state("req")
+    state.num_codebooks = 3
+    state.codebook_size = 1026
+    state.delayed_rows = list(delayed)
+
+    task = scheduler._prepare_context_task("req", state)
+
+    assert task is not None
+    assert task.emit_frames == 2
+
+
+def test_higgs_streaming_vocoder_matches_full_decode_with_codec_tail() -> None:
+    raw_codes = torch.tensor(
+        [
+            [1, 2, 3],
+            [4, 5, 6],
+            [7, 8, 9],
+            [10, 11, 12],
+            [13, 14, 15],
+            [16, 17, 18],
+        ],
+        dtype=torch.long,
+    )
+    delayed = apply_delay_pattern(raw_codes)
+    codec = _FakeUnevenHiggsStreamingCodec()
+    scheduler = HiggsStreamingVocoderScheduler(
+        codec,
+        stream_stride=3,
+        stream_followup_stride=2,
+        stream_overlap_tokens=1,
+        stream_holdback_tokens=0,
+    )
+    payload = _higgs_stream_payload(
+        "req",
+        stream=True,
+        delayed_rows=delayed.tolist(),
+        codebook_size=64,
+    )
+
+    full = scheduler._decode_state_to_audio(HiggsTtsState.from_dict(payload.data))
+    assert full is not None
+    assert full.numel() == (raw_codes.shape[0] - 1) * codec.model.config.hop_length
+    assert bool((full < 10_000).all())
+
+    scheduler._on_streaming_new_request("req", payload)
+    for idx, row in enumerate(delayed):
+        item = _higgs_stream_item(row, codebook_size=64)
+        item.chunk_id = idx
+        scheduler._on_chunk("req", item)
+    scheduler._on_done("req")
+
+    stream_chunks = [
+        np.frombuffer(msg.data["audio_waveform"], dtype=np.float32).copy()
+        for msg in _drain_higgs_outbox(scheduler)
+        if msg.type == "stream"
+    ]
+    streamed = np.concatenate(stream_chunks)
+    np.testing.assert_array_equal(streamed, full.numpy())
+
+
+def test_higgs_non_streaming_vocoder_drops_final_frame_and_codec_tail() -> None:
+    raw_codes = torch.tensor(
+        [
+            [1, 2, 3],
+            [4, 5, 6],
+            [7, 8, 9],
+            [10, 11, 12],
+        ],
+        dtype=torch.long,
+    )
+    codec = _FakeUnevenHiggsStreamingCodec()
+    scheduler = HiggsStreamingVocoderScheduler(codec)
+    payload = _higgs_stream_payload(
+        "req",
+        stream=False,
+        delayed_rows=apply_delay_pattern(raw_codes).tolist(),
+        codebook_size=64,
+    )
+
+    result = scheduler._vocode_payload(payload)
+
+    audio = np.frombuffer(result.data["audio_waveform"], dtype=np.float32)
+    assert audio.size == (raw_codes.shape[0] - 1) * codec.model.config.hop_length
+    assert bool((audio < 10_000).all())
+
+
+def test_higgs_initial_codec_chunk_frames_controls_first_chunk_only() -> None:
+    raw_codes = torch.tensor(
+        [
+            [1, 2, 3],
+            [4, 5, 6],
+            [7, 8, 9],
+            [10, 11, 12],
+            [13, 14, 15],
+            [16, 17, 18],
+        ],
+        dtype=torch.long,
+    )
+    delayed = apply_delay_pattern(raw_codes)
+    scheduler = HiggsStreamingVocoderScheduler(
+        _FakeUnevenHiggsStreamingCodec(),
+        stream_stride=6,
+        stream_followup_stride=3,
+        stream_overlap_tokens=1,
+        stream_holdback_tokens=4,
+    )
+    payload = _higgs_stream_payload(
+        "req",
+        stream=True,
+        delayed_rows=delayed.tolist(),
+        codebook_size=64,
+        initial_codec_chunk_frames=1,
+    )
+
+    scheduler._on_streaming_new_request("req", payload)
+    for row in delayed[:3]:
+        scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=64))
+
+    first_streams = [
+        msg for msg in _drain_higgs_outbox(scheduler) if msg.type == "stream"
+    ]
+    assert len(first_streams) == 1
+
+    for row in delayed[3:5]:
+        scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=64))
+
+    assert _drain_higgs_outbox(scheduler) == []
+
+
+def test_higgs_initial_chunk_resumes_after_followup_boundary() -> None:
+    raw_codes = torch.arange(1, 43, dtype=torch.long).reshape(14, 3)
+    delayed = apply_delay_pattern(raw_codes)
+    scheduler = HiggsStreamingVocoderScheduler(
+        _FakeUnevenHiggsStreamingCodec(),
+        stream_stride=8,
+        stream_followup_stride=4,
+        stream_overlap_tokens=1,
+        stream_holdback_tokens=0,
+    )
+    payload = _higgs_stream_payload(
+        "req",
+        stream=True,
+        delayed_rows=delayed.tolist(),
+        codebook_size=64,
+        initial_codec_chunk_frames=1,
+    )
+
+    scheduler._on_streaming_new_request("req", payload)
+    for row in delayed[:3]:
+        scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=64))
+
+    first_streams = [
+        msg for msg in _drain_higgs_outbox(scheduler) if msg.type == "stream"
+    ]
+    assert len(first_streams) == 1
+
+    for row in delayed[3:7]:
+        scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=64))
+    assert _drain_higgs_outbox(scheduler) == []
+
+    for row in delayed[7:11]:
+        scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=64))
+    assert _drain_higgs_outbox(scheduler) == []
+
+    scheduler._on_chunk("req", _higgs_stream_item(delayed[11], codebook_size=64))
+    second_streams = [
+        msg for msg in _drain_higgs_outbox(scheduler) if msg.type == "stream"
+    ]
+    assert len(second_streams) == 1
+
+
+def test_higgs_stream_contract_change_rejects_chunk_without_buffering() -> None:
+    scheduler = HiggsStreamingVocoderScheduler(_FakeHiggsStreamingCodec())
+    payload = _higgs_stream_payload("req", stream=True, delayed_rows=[[1, 2, 3]])
+    scheduler._on_streaming_new_request("req", payload)
+
+    row = torch.tensor([1, 2, 3], dtype=torch.long)
+    with pytest.raises(ValueError, match="num_codebooks changed for"):
+        scheduler._on_chunk("req", _higgs_stream_item(row, num_codebooks=4))
+    with pytest.raises(ValueError, match="codebook_size changed for"):
+        scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=21))
+    assert scheduler._stream_states["req"].delayed_rows == []
+
+
+def test_higgs_stream_contract_requires_integer_values() -> None:
+    scheduler = HiggsStreamingVocoderScheduler(_FakeHiggsStreamingCodec())
+    payload = _higgs_stream_payload("req", stream=True, delayed_rows=[[1, 2, 3]])
+    scheduler._on_streaming_new_request("req", payload)
+
+    item = _higgs_stream_item(torch.tensor([1, 2, 3], dtype=torch.long))
+    item.metadata["num_codebooks"] = "three"
+    with pytest.raises(TypeError, match="must include integer"):
+        scheduler._on_chunk("req", item)
+    assert scheduler._stream_states["req"].delayed_rows == []
+
+
+def test_higgs_streaming_payload_missing_contract_fields_errors() -> None:
+    scheduler = HiggsStreamingVocoderScheduler(_FakeHiggsStreamingCodec())
+    payload = StagePayload(
+        request_id="req",
+        request=OmniRequest(inputs="", params={"stream": True}),
+        data={},
+    )
+    with pytest.raises(RuntimeError, match="is missing fields"):
+        scheduler._on_streaming_new_request("req", payload)
+
+
+def _drain_higgs_outbox(
+    scheduler: HiggsStreamingVocoderScheduler,
+) -> list:
+    messages = []
+    while True:
+        try:
+            messages.append(scheduler.outbox.get_nowait())
+        except queue.Empty:
+            return messages
+
+
+def _make_fake_codec(call_log: list[tuple[int, int]]):
+    """Build a HiggsAudioCodec wrapping a deterministic FakeModel that logs (B, T)."""
+    from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
+
+    class FakeModel:
+        class config:
+            hop_length = 320
+
+        def decode(self, codes_BNT):
+            B, N, T = codes_BNT.shape
+            call_log.append((B, T))
+            L = 320 * T + 64
+            audio = torch.zeros(B, 1, L)
+            for b in range(B):
+                audio[b, 0, :] = codes_BNT[b].float().sum(dim=0).repeat(L // T + 1)[:L]
+            return SimpleNamespace(audio_values=audio)
+
+    codec = object.__new__(HiggsAudioCodec)
+    codec.model = FakeModel()
+    codec.device = torch.device("cpu")
+    codec._dtype = torch.float32
+    return codec
+
+
+def test_decode_batch_buckets_by_length() -> None:
+    """Same-T items batch into one call; mixed-T items get separate calls."""
+    call_log: list[tuple[int, int]] = []
+    codec = _make_fake_codec(call_log)
+
+    # Same length → single batched forward pass
+    same = [torch.randint(0, 100, (10, 8)) for _ in range(3)]
+    results = codec.decode_batch(same)
+    assert call_log == [(3, 10)], "single batched call with B=3"
+    assert all(r.shape == (320 * 10 + 64,) for r in results)
+
+    # Mixed lengths → per-bucket calls
+    call_log.clear()
+    mixed = [
+        torch.randint(0, 100, (10, 8)),
+        torch.randint(0, 100, (10, 8)),
+        torch.randint(0, 100, (15, 8)),
+    ]
+    results = codec.decode_batch(mixed)
+    assert sorted(call_log) == [(1, 15), (2, 10)]
+    assert results[2].shape == (320 * 15 + 64,)
+
+
+def test_decode_batch_bit_exact_with_single_decode() -> None:
+    """Batched decode must produce identical output to individual decode."""
+    call_log: list[tuple[int, int]] = []
+    codec = _make_fake_codec(call_log)
+
+    codes_a = torch.randint(0, 100, (10, 8))
+    codes_b = torch.randint(0, 100, (10, 8))
+
+    single_a = codec.decode(codes_a)
+    single_b = codec.decode(codes_b)
+    call_log.clear()
+
+    batch_results = codec.decode_batch([codes_a, codes_b])
+
+    assert call_log == [(2, 10)]
+    assert torch.equal(single_a, batch_results[0])
+    assert torch.equal(single_b, batch_results[1])
+
+
+def _make_fake_encoder_codec(encode_calls: list):
+    """Build a HiggsAudioCodec wrapping a FakeModel that logs encode calls.
+
+    Each item in the batch gets codes filled with ``int(batch[i,0,0]*100)``,
+    making outputs distinguishable by the waveform's first sample value.
+    """
+    from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
+
+    N = 8  # num_codebooks
+
+    class FakeModel:
+        def encode(self, batch: torch.Tensor):
+            B, _, L = batch.shape
+            T = max(L // 320, 1)
+            encode_calls.append(tuple(batch.shape))
+            codes = torch.zeros(B, N, T, dtype=torch.long)
+            for i in range(B):
+                codes[i] = int(round(batch[i, 0, 0].item() * 100))
+            return SimpleNamespace(audio_codes=codes)
+
+        def parameters(self):
+            return iter([torch.zeros(1)])
+
+    codec = object.__new__(HiggsAudioCodec)
+    codec.model = FakeModel()
+    codec.device = torch.device("cpu")
+    codec._dtype = torch.float32
+    return codec
+
+
+def test_higgs_audio_codec_encode_batch_empty() -> None:
+    codec = _make_fake_encoder_codec([])
+    assert codec.encode_batch([]) == []
+
+
+def test_higgs_audio_codec_encode_batch_same_length_batched() -> None:
+    calls: list = []
+    codec = _make_fake_encoder_codec(calls)
+    wav1 = torch.zeros(1, 1, 24000)
+    wav2 = torch.ones(1, 1, 24000) * 0.5
+    results = codec.encode_batch([wav1, wav2])
+    assert len(calls) == 1, "same-length waveforms must batch into one forward pass"
+    assert calls[0] == (2, 1, 24000)
+    assert len(results) == 2
+    assert all(r.shape == (75, 8) for r in results)
+
+
+def test_higgs_audio_codec_encode_batch_short_waveforms_padded_and_batched() -> None:
+    calls: list = []
+    codec = _make_fake_encoder_codec(calls)
+    wav1 = torch.zeros(1, 1, 8000)
+    wav2 = torch.zeros(1, 1, 12000)
+    results = codec.encode_batch([wav1, wav2])
+    assert len(calls) == 1, "short waveforms must be padded to same length and batched"
+    assert calls[0] == (2, 1, 24000)
+    assert len(results) == 2
+
+
+def test_higgs_audio_codec_encode_batch_different_lengths_separate_calls() -> None:
+    calls: list = []
+    codec = _make_fake_encoder_codec(calls)
+    wav1 = torch.zeros(1, 1, 24000)
+    wav2 = torch.zeros(1, 1, 48000)
+    results = codec.encode_batch([wav1, wav2])
+    assert len(calls) == 2, "different-length waveforms must use separate passes"
+    assert len(results) == 2
+    assert results[0].shape[0] == 75
+    assert results[1].shape[0] == 150
+
+
+def test_higgs_audio_codec_encode_batch_order_preserved() -> None:
+    calls: list = []
+    codec = _make_fake_encoder_codec(calls)
+    wavs = [
+        torch.full((1, 1, 48000), 0.3),
+        torch.full((1, 1, 24000), 0.5),
+        torch.full((1, 1, 48000), 0.7),
+    ]
+    ref0 = codec.encode_reference(wavs[0])
+    ref1 = codec.encode_reference(wavs[1])
+    ref2 = codec.encode_reference(wavs[2])
+    calls.clear()
+
+    results = codec.encode_batch(wavs)
+
+    assert len(results) == 3
+    assert torch.equal(results[0], ref0)
+    assert torch.equal(results[1], ref1)
+    assert torch.equal(results[2], ref2)
+
+
+def test_higgs_audio_codec_encode_batch_matches_encode_reference() -> None:
+    """encode_batch must produce bit-exact codes vs per-item encode_reference."""
+    calls: list = []
+    codec = _make_fake_encoder_codec(calls)
+    wav1 = torch.full((1, 1, 24000), 0.3)
+    wav2 = torch.full((1, 1, 24000), 0.7)
+    wav3 = torch.full((1, 1, 48000), 0.5)
+
+    ref1 = codec.encode_reference(wav1)
+    ref2 = codec.encode_reference(wav2)
+    ref3 = codec.encode_reference(wav3)
+    calls.clear()
+
+    batch_results = codec.encode_batch([wav1, wav2, wav3])
+
+    assert torch.equal(batch_results[0], ref1)
+    assert torch.equal(batch_results[1], ref2)
+    assert torch.equal(batch_results[2], ref3)
+
+
+def test_higgs_audio_codec_encode_batch_input_normalisation() -> None:
+    """1-D tensor, 2-D tensor, and np.ndarray inputs all normalise to the same codes."""
+    calls: list = []
+    codec = _make_fake_encoder_codec(calls)
+    amp = 0.4
+
+    wav_3d = torch.full((1, 1, 24000), amp)
+    wav_2d = torch.full((1, 24000), amp)
+    wav_1d = torch.full((24000,), amp)
+    wav_np = np.full(24000, amp, dtype=np.float32)
+
+    ref = codec.encode_reference(wav_3d)
+    calls.clear()
+
+    results = codec.encode_batch([wav_3d, wav_2d, wav_1d, wav_np])
+
+    for i, r in enumerate(results):
+        assert torch.equal(
+            r, ref
+        ), f"input format {i} produced different codes than encode_reference"
+
+
+def test_higgs_mem_fraction_role_to_stage_targets_tts_engine() -> None:
+    assert HiggsTtsPipelineConfig.mem_fraction_role_to_stage() == {
+        "talker": "tts_engine"
+    }
+
+
+def test_higgs_cli_mem_fraction_static_pins_tts_engine() -> None:
+    config = HiggsTtsPipelineConfig(model_path="fake-model")
+
+    apply_mem_fraction_cli_overrides(
+        config,
+        mem_fraction_static=0.27,
+        thinker_mem_fraction_static=None,
+        talker_mem_fraction_static=None,
+    )
+
+    tts_engine = next(s for s in config.stages if s.name == "tts_engine")
+    assert tts_engine.runtime.sglang_server_args.mem_fraction_static == 0.27
+
+
+def test_higgs_cli_talker_mem_fraction_static_pins_tts_engine() -> None:
+    config = HiggsTtsPipelineConfig(model_path="fake-model")
+
+    apply_mem_fraction_cli_overrides(
+        config,
+        mem_fraction_static=None,
+        thinker_mem_fraction_static=None,
+        talker_mem_fraction_static=0.3,
+    )
+
+    tts_engine = next(s for s in config.stages if s.name == "tts_engine")
+    assert tts_engine.runtime.sglang_server_args.mem_fraction_static == 0.3
+
+
+def test_higgs_cli_rejects_unsupported_thinker_mem_fraction() -> None:
+    config = HiggsTtsPipelineConfig(model_path="fake-model")
+
+    with pytest.raises(typer.BadParameter):
+        apply_mem_fraction_cli_overrides(
+            config,
+            mem_fraction_static=None,
+            thinker_mem_fraction_static=0.3,
+            talker_mem_fraction_static=None,
+        )

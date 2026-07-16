@@ -13,19 +13,13 @@ lora_max_rank: 32
 # Keep autoregressive generation and waveform decoding in separate processes.
 separate_vocoder_process: true
 
-# Frames 0-7 use masked K8/M3 decoding, frames 8-10 transition with six
-# complete future-context frames, and later chunks use nine-frame context.
+# K8/M3 is an audio-quality constraint established by listening tests: wait
+# for eight delayed rows and emit three startup frames. Do not lower K below 8
+# to chase startup latency; more aggressive masking audibly degrades quality.
+# K8/M4 was also tested, but its latency gain was too small to pursue.
+vocoder_stream_stride: 32
+vocoder_stream_followup_stride: 32
 vocoder_full_context_streaming: true
-vocoder_context_frames: 9
 vocoder_startup_masked_delay_rows: 8
 vocoder_startup_masked_emit_frames: 3
 vocoder_startup_masked_until_frames: 8
-vocoder_startup_reduced_context_frames: 6
-vocoder_startup_reduced_left_context_frames: 9
-vocoder_startup_reduced_context_until_frames: 11
-startup_full_chunk_frames: 8
-startup_full_chunk_count: 3
-
-vocoder_max_batch_size: 16
-vocoder_max_batch_wait_ms: 2
-vocoder_audio_chunk_size: 32
