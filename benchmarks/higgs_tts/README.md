@@ -31,6 +31,11 @@ well, but its latency benefit was too small to justify further work. Treat
 K8/M3 as an audio-quality invariant and optimize request handling, generation,
 batching, vocoder execution, or transport instead of reducing K.
 
+Final vocoder output drops the EOC-adjacent last recovered raw codec frame and
+clips decoded audio to the exact remaining frame boundary. This is the default
+tail behavior selected by the sample-audio listening A/B; keep it consistent
+between performance and listening tests.
+
 ```bash
 export MODEL_PATH=/absolute/path/to/higgs-tts-3-4b
 export LORA_ROOT=/hot-data/checkpoints/TTSDeepclone

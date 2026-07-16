@@ -53,7 +53,12 @@ class _ContextStepPlan:
 class HiggsStreamingVocoderScheduler(
     StreamingVocoderBase[_HiggsStreamState, _ContextStepPlan]
 ):
-    """Decode Higgs codec rows incrementally, with batched final decode."""
+    """Decode Higgs codec rows incrementally, with batched final decode.
+
+    Finalization omits the EOC-adjacent final raw codec frame and clips decoded
+    audio to the exact frame boundary. Listening A/B tests selected this over
+    retaining the noisy final frame.
+    """
 
     def __init__(
         self,
@@ -250,11 +255,21 @@ class HiggsStreamingVocoderScheduler(
             state.next_decode_rows = next_decode_rows
             return None
 
-        emit_until_raw = raw_total
+        if is_final and raw_total > 0:
+            emit_until_raw = raw_total - 1
+            if state.emitted_raw_frames > emit_until_raw:
+                raise RuntimeError(
+                    "Higgs final frame was emitted before the final-frame holdback"
+                )
+        else:
+            emit_until_raw = raw_total
         if use_initial_chunk and not is_final:
             emit_until_raw = min(raw_total, state.initial_codec_chunk_frames)
-        elif not is_final and self._stream_holdback_tokens:
-            emit_until_raw = max(0, raw_total - self._stream_holdback_tokens)
+        elif not is_final:
+            emit_until_raw = max(
+                0,
+                raw_total - max(1, self._stream_holdback_tokens),
+            )
         can_flush_codec_tail = is_final and self._samples_per_frame is not None
         if emit_until_raw < state.emitted_raw_frames or (
             emit_until_raw == state.emitted_raw_frames and not can_flush_codec_tail
@@ -279,7 +294,7 @@ class HiggsStreamingVocoderScheduler(
         )
         trim_frames = state.emitted_raw_frames - window_start_raw
         trim_samples = min(int(trim_frames * samples_per_frame), int(audio.shape[-1]))
-        if not is_final and self._samples_per_frame is not None:
+        if self._samples_per_frame is not None:
             new_frames = emit_until_raw - state.emitted_raw_frames
             emit_samples = int(new_frames * samples_per_frame)
             delta = audio[trim_samples : trim_samples + emit_samples].contiguous()
@@ -368,6 +383,14 @@ class HiggsStreamingVocoderScheduler(
                 self._startup_masked_emit_frames,
                 self._startup_masked_until_frames - next_frame,
             )
+            emit_frames = self._cap_emit_before_final_frame(
+                state,
+                next_frame=next_frame,
+                emit_frames=emit_frames,
+                codebook_size=codebook_size,
+            )
+            if emit_frames <= 0:
+                return None
             frame_start = max(0, next_frame - self._context_frames)
             frame_end = next_frame + self._startup_masked_delay_rows
             if cache_len < frame_end:
@@ -392,6 +415,14 @@ class HiggsStreamingVocoderScheduler(
                 left_context = self._context_frames
                 right_context = self._context_frames
                 phase = "full_context"
+            emit_frames = self._cap_emit_before_final_frame(
+                state,
+                next_frame=next_frame,
+                emit_frames=emit_frames,
+                codebook_size=codebook_size,
+            )
+            if emit_frames <= 0:
+                return None
             frame_start = max(0, next_frame - left_context)
             frame_end = next_frame + emit_frames + right_context
             if cache_len < frame_end + num_codebooks - 1:
@@ -416,6 +447,21 @@ class HiggsStreamingVocoderScheduler(
             emit_frames=emit_frames,
             phase=phase,
         )
+
+    @staticmethod
+    def _cap_emit_before_final_frame(
+        state: _HiggsStreamState,
+        *,
+        next_frame: int,
+        emit_frames: int,
+        codebook_size: int,
+    ) -> int:
+        eoc_id = int(codebook_size) - 1
+        for row_index, row in enumerate(state.delayed_rows):
+            if int(row[0].item()) == eoc_id:
+                final_exclusive = max(0, row_index - 1)
+                return min(int(emit_frames), max(0, final_exclusive - next_frame))
+        return int(emit_frames)
 
     @staticmethod
     def _context_task_key(task: _ContextDecodeTask) -> tuple[Any, ...]:
@@ -564,8 +610,11 @@ class HiggsStreamingVocoderScheduler(
                     f"Higgs vocoder decode_batch returned {len(wavs)} audios "
                     f"for {len(valid)} requests"
                 )
-            for idx, wav in zip(indices, wavs):
-                waveforms[idx] = wav
+            for idx, wav, codes in zip(indices, wavs, codes_list):
+                waveforms[idx] = self._trim_codec_tail(
+                    wav,
+                    frames=int(codes.shape[0]),
+                )
         return [
             self._store_vocoder_result(payload, state, wav)
             for payload, (state, _), wav in zip(payloads, items, waveforms)
@@ -583,6 +632,9 @@ class HiggsStreamingVocoderScheduler(
         if delayed_LN.shape[0] < state.num_codebooks:
             return state, None
         codes_TN = reverse_delay_pattern(delayed_LN)
+        if int(codes_TN.shape[0]) <= 1:
+            return state, None
+        codes_TN = codes_TN[:-1]
         codec_vocab = int(state.codebook_size) - 2
         return state, torch.where(
             codes_TN >= codec_vocab, torch.zeros_like(codes_TN), codes_TN
@@ -619,6 +671,8 @@ class HiggsStreamingVocoderScheduler(
             rows,
             num_codebooks=int(state.num_codebooks),
             codebook_size=int(state.codebook_size),
+            drop_final_frame=True,
+            trim_codec_tail=True,
         )
 
     def _decode_delayed_rows(
@@ -627,6 +681,8 @@ class HiggsStreamingVocoderScheduler(
         *,
         num_codebooks: int,
         codebook_size: int,
+        drop_final_frame: bool = False,
+        trim_codec_tail: bool = False,
     ) -> torch.Tensor:
         if len(rows) < int(num_codebooks):
             raise ValueError(
@@ -635,11 +691,24 @@ class HiggsStreamingVocoderScheduler(
             )
         delayed_LN = torch.stack(rows, dim=0).to(torch.long)
         codes_TN = reverse_delay_pattern(delayed_LN)
+        if drop_final_frame:
+            codes_TN = codes_TN[:-1]
+        if int(codes_TN.shape[0]) == 0:
+            return torch.empty(0, dtype=torch.float32)
         codec_vocab = int(codebook_size) - 2
         codes_TN = torch.where(
             codes_TN >= codec_vocab, torch.zeros_like(codes_TN), codes_TN
         )
-        return self._codec.decode(codes_TN).detach().to(torch.float32)
+        audio = self._codec.decode(codes_TN).detach().to(torch.float32)
+        if trim_codec_tail:
+            audio = self._trim_codec_tail(audio, frames=int(codes_TN.shape[0]))
+        return audio
+
+    def _trim_codec_tail(self, audio: torch.Tensor, *, frames: int) -> torch.Tensor:
+        if self._samples_per_frame is None:
+            return audio
+        samples = max(0, int(frames)) * self._samples_per_frame
+        return audio[..., :samples].contiguous()
 
     @staticmethod
     def _resolve_samples_per_frame(codec: HiggsAudioCodec) -> int | None:

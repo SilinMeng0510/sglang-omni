@@ -1218,6 +1218,27 @@ def test_higgs_masked_startup_keeps_configured_lookahead() -> None:
     assert task.counts_T.tolist() == [8, 7, 6, 5, 4, 3, 2, 1]
 
 
+def test_higgs_masked_startup_holds_back_eoc_adjacent_final_frame() -> None:
+    raw_codes = torch.arange(1, 10, dtype=torch.long).reshape(3, 3)
+    delayed = apply_delay_pattern(raw_codes)
+    scheduler = HiggsStreamingVocoderScheduler(
+        _FakeMaskedHiggsStreamingCodec(),
+        full_context_streaming=True,
+        startup_masked_delay_rows=3,
+        startup_masked_emit_frames=3,
+        startup_masked_until_frames=3,
+    )
+    state = scheduler.create_stream_state("req")
+    state.num_codebooks = 3
+    state.codebook_size = 1026
+    state.delayed_rows = list(delayed)
+
+    task = scheduler._prepare_context_task("req", state)
+
+    assert task is not None
+    assert task.emit_frames == 2
+
+
 def test_higgs_streaming_vocoder_matches_full_decode_with_codec_tail() -> None:
     raw_codes = torch.tensor(
         [
@@ -1248,6 +1269,8 @@ def test_higgs_streaming_vocoder_matches_full_decode_with_codec_tail() -> None:
 
     full = scheduler._decode_state_to_audio(HiggsTtsState.from_dict(payload.data))
     assert full is not None
+    assert full.numel() == (raw_codes.shape[0] - 1) * codec.model.config.hop_length
+    assert bool((full < 10_000).all())
 
     scheduler._on_streaming_new_request("req", payload)
     for idx, row in enumerate(delayed):
@@ -1263,6 +1286,32 @@ def test_higgs_streaming_vocoder_matches_full_decode_with_codec_tail() -> None:
     ]
     streamed = np.concatenate(stream_chunks)
     np.testing.assert_array_equal(streamed, full.numpy())
+
+
+def test_higgs_non_streaming_vocoder_drops_final_frame_and_codec_tail() -> None:
+    raw_codes = torch.tensor(
+        [
+            [1, 2, 3],
+            [4, 5, 6],
+            [7, 8, 9],
+            [10, 11, 12],
+        ],
+        dtype=torch.long,
+    )
+    codec = _FakeUnevenHiggsStreamingCodec()
+    scheduler = HiggsStreamingVocoderScheduler(codec)
+    payload = _higgs_stream_payload(
+        "req",
+        stream=False,
+        delayed_rows=apply_delay_pattern(raw_codes).tolist(),
+        codebook_size=64,
+    )
+
+    result = scheduler._vocode_payload(payload)
+
+    audio = np.frombuffer(result.data["audio_waveform"], dtype=np.float32)
+    assert audio.size == (raw_codes.shape[0] - 1) * codec.model.config.hop_length
+    assert bool((audio < 10_000).all())
 
 
 def test_higgs_initial_codec_chunk_frames_controls_first_chunk_only() -> None:
