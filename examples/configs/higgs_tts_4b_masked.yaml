@@ -13,8 +13,12 @@ lora_max_rank: 32
 # Keep autoregressive generation and waveform decoding in separate processes.
 separate_vocoder_process: true
 
-# Use masked-delay startup and short steady-state chunks for continuous PCM
-# playback under rolling concurrency.
+# Decode the first three frames as soon as three delayed rows are available,
+# then ramp K3 -> K8 one row per chunk. This avoids paying the five missing
+# lookahead rows as one playback stall; later chunks use full-context decoding.
 vocoder_stream_stride: 32
 vocoder_stream_followup_stride: 32
 vocoder_full_context_streaming: true
+vocoder_startup_masked_delay_rows: 3
+vocoder_startup_masked_emit_frames: 3
+vocoder_startup_masked_until_frames: 18

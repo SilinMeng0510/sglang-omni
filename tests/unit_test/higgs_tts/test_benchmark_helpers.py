@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from benchmarks.higgs_tts.compare_audio import normalized_words, word_errors
 from benchmarks.higgs_tts.common import (
     BYTES_PER_SECOND,
     continuity,
@@ -30,6 +31,12 @@ def test_continuity_detects_underrun() -> None:
 
     assert jitter == pytest.approx(0.15)
     assert speed == pytest.approx(0.8)
+
+
+def test_audio_comparison_word_errors_normalize_case_and_punctuation() -> None:
+    assert normalized_words("HTTPS, ParseJSON!") == ["https", "parsejson"]
+    assert word_errors("That sounds good.", "that sounds good") == (0, 3)
+    assert word_errors("one two three", "one four three extra") == (2, 3)
 
 
 def test_bundled_prompts_are_valid() -> None:

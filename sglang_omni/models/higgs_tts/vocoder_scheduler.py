@@ -82,6 +82,18 @@ class HiggsStreamingVocoderScheduler(
             raise ValueError("stream_overlap_tokens must be >= 0")
         if stream_holdback_tokens < 0:
             raise ValueError("stream_holdback_tokens must be >= 0")
+        if context_frames < 0:
+            raise ValueError("context_frames must be >= 0")
+        if startup_masked_delay_rows <= 0:
+            raise ValueError("startup_masked_delay_rows must be > 0")
+        if not 1 <= startup_masked_emit_frames <= startup_masked_delay_rows:
+            raise ValueError(
+                "startup_masked_emit_frames must be within masked delay rows"
+            )
+        if startup_masked_until_frames < startup_masked_emit_frames:
+            raise ValueError(
+                "startup_masked_until_frames must be >= startup masked emit frames"
+            )
 
         self._codec = codec
         self._stream_stride = int(stream_stride)
@@ -356,8 +368,16 @@ class HiggsStreamingVocoderScheduler(
                 self._startup_masked_emit_frames,
                 self._startup_masked_until_frames - next_frame,
             )
+            # When startup begins with fewer than all RVQ codebooks, grow the
+            # lookahead by one row per emitted chunk instead of paying the
+            # missing lookahead as one large transition stall.  K8 remains
+            # unchanged because the value is capped at ``num_codebooks``.
+            ramp_steps = next_frame // self._startup_masked_emit_frames
+            active_delay_rows = min(
+                num_codebooks, self._startup_masked_delay_rows + ramp_steps
+            )
             frame_start = max(0, next_frame - self._context_frames)
-            frame_end = next_frame + self._startup_masked_delay_rows
+            frame_end = next_frame + active_delay_rows
             if cache_len < frame_end:
                 return None
             phase = "partial_masked_delay"

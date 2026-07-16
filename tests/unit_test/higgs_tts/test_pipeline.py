@@ -36,6 +36,22 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
 
 
+def test_higgs_masked_startup_config_reaches_vocoder_factory() -> None:
+    config = HiggsTtsPipelineConfig(
+        model_path="fake-model",
+        vocoder_full_context_streaming=True,
+        vocoder_startup_masked_delay_rows=3,
+        vocoder_startup_masked_emit_frames=3,
+        vocoder_startup_masked_until_frames=18,
+    )
+    vocoder = next(stage for stage in config.stages if stage.name == "vocoder")
+
+    assert vocoder.factory_args["full_context_streaming"] is True
+    assert vocoder.factory_args["startup_masked_delay_rows"] == 3
+    assert vocoder.factory_args["startup_masked_emit_frames"] == 3
+    assert vocoder.factory_args["startup_masked_until_frames"] == 18
+
+
 def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     from sglang_omni.models.higgs_tts import model_runner as model_runner_mod
     from sglang_omni.models.higgs_tts import request_builders
@@ -1179,6 +1195,28 @@ def test_higgs_masked_startup_coalesces_ready_requests() -> None:
         np.frombuffer(msg.data["audio_waveform"], dtype=np.float32).size == 10
         for msg in streams
     )
+
+
+def test_higgs_masked_startup_ramps_lookahead_one_row_per_chunk() -> None:
+    scheduler = HiggsStreamingVocoderScheduler(
+        _FakeMaskedHiggsStreamingCodec(),
+        full_context_streaming=True,
+        startup_masked_delay_rows=3,
+        startup_masked_emit_frames=3,
+        startup_masked_until_frames=18,
+    )
+    state = scheduler.create_stream_state("req")
+    state.num_codebooks = 8
+    state.codebook_size = 64
+    state.next_emit_frame = 3
+    state.delayed_rows = [torch.arange(8) for _ in range(7)]
+
+    task = scheduler._prepare_context_task("req", state)
+
+    assert task is not None
+    assert task.emit_frames == 3
+    assert task.codes_TN.shape == (7, 8)
+    assert task.counts_T.tolist() == [7, 6, 5, 4, 3, 2, 1]
 
 
 def test_higgs_streaming_vocoder_matches_full_decode_with_codec_tail() -> None:

@@ -115,6 +115,25 @@ python benchmarks/higgs_tts/performance.py \
   --duration 60
 ```
 
+For generated-audio regression checks, generate WAV files named `00.wav`,
+`01.wav`, and so on from every line in `sample_text.txt`, using the same seed
+and ap2 adapter on both revisions. The comparison gate uses Whisper content
+WER, Wav2Vec2 acoustic embeddings, and duration drift:
+
+```bash
+python benchmarks/higgs_tts/compare_audio.py \
+  --baseline-dir results/audio_ab/pre_rebase_ap2 \
+  --candidate-dir results/audio_ab/candidate_ap2 \
+  --texts benchmarks/higgs_tts/sample_text.txt \
+  --whisper-model /models/whisper-small \
+  --embedding-model /models/wav2vec2-base \
+  --output results/audio_ab/comparison.json
+```
+
+The default gate permits at most 3% paired WER, 2.5 percentage points of WER
+regression against the source text, 25% p85 duration drift, and requires
+Wav2Vec2 cosine similarity of at least 0.97 on average and 0.94 per sample.
+
 For a CPU-only plumbing check:
 
 ```bash
