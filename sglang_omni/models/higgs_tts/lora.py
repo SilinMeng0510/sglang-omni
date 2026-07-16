@@ -80,8 +80,7 @@ class DynamicLoraCache:
         validate_lora_adapter_model(resolved, self._serve_model_name)
         if len(self._refs_by_path) >= self._max_cached_adapters:
             raise ValueError(
-                "Dynamic LoRA cache is full "
-                f"({self._max_cached_adapters} adapters)"
+                "Dynamic LoRA cache is full " f"({self._max_cached_adapters} adapters)"
             )
 
         from sglang.srt.lora.lora_registry import LoRARef

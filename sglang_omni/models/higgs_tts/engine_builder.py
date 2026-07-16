@@ -113,9 +113,11 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         return model_runner_mod.HiggsTTSModelRunner(model_worker, output_proc)
 
     def make_adapters(self, model: Any) -> tuple[Any, Any]:
-        request_builder, result_adapter = request_builders.make_higgs_scheduler_adapters(
-            model,
-            max_new_tokens_cap=self.max_new_tokens,
+        request_builder, result_adapter = (
+            request_builders.make_higgs_scheduler_adapters(
+                model,
+                max_new_tokens_cap=self.max_new_tokens,
+            )
         )
         if not self.enable_dynamic_lora:
             return request_builder, result_adapter

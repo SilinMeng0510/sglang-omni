@@ -2,7 +2,6 @@ from pathlib import Path
 
 import pytest
 
-from benchmarks.higgs_tts.compare_audio import normalized_words, word_errors
 from benchmarks.higgs_tts.common import (
     BYTES_PER_SECOND,
     continuity,
@@ -10,6 +9,7 @@ from benchmarks.higgs_tts.common import (
     speech_payload,
     stats,
 )
+from benchmarks.higgs_tts.compare_audio import normalized_words, word_errors
 from benchmarks.higgs_tts.gallery_server import RangeRequestHandler
 from benchmarks.higgs_tts.performance import load_prompts
 
