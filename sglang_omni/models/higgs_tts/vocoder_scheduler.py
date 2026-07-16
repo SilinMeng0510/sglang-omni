@@ -29,9 +29,30 @@ class _HiggsStreamState:
     num_codebooks: int | None = None
     codebook_size: int | None = None
     initial_codec_chunk_frames: int = 0
+    next_emit_frame: int = 0
+    startup_full_chunks_emitted: int = 0
 
 
-class HiggsStreamingVocoderScheduler(StreamingVocoderBase[_HiggsStreamState, None]):
+@dataclass
+class _ContextDecodeTask:
+    request_id: str
+    state: _HiggsStreamState
+    codes_TN: torch.Tensor
+    counts_T: torch.Tensor
+    audio_offset_samples: int
+    emit_frames: int
+    phase: str
+
+
+@dataclass
+class _ContextStepPlan:
+    tasks: list[_ContextDecodeTask]
+    masked: bool
+
+
+class HiggsStreamingVocoderScheduler(
+    StreamingVocoderBase[_HiggsStreamState, _ContextStepPlan]
+):
     """Decode Higgs codec rows incrementally, with batched final decode."""
 
     def __init__(
@@ -44,6 +65,16 @@ class HiggsStreamingVocoderScheduler(StreamingVocoderBase[_HiggsStreamState, Non
         stream_holdback_tokens: int = 4,
         max_batch_size: int = 4,
         max_batch_wait_ms: int = 2,
+        full_context_streaming: bool = False,
+        context_frames: int = 9,
+        startup_full_chunk_frames: int = 8,
+        startup_full_chunk_count: int = 3,
+        startup_reduced_context_frames: int = 6,
+        startup_reduced_left_context_frames: int = 9,
+        startup_reduced_context_until_frames: int = 11,
+        startup_masked_delay_rows: int = 8,
+        startup_masked_emit_frames: int = 3,
+        startup_masked_until_frames: int = 8,
     ) -> None:
         if stream_stride <= 0 or stream_followup_stride <= 0:
             raise ValueError("stream_stride and stream_followup_stride must be > 0")
@@ -58,6 +89,23 @@ class HiggsStreamingVocoderScheduler(StreamingVocoderBase[_HiggsStreamState, Non
         self._stream_overlap_tokens = int(stream_overlap_tokens)
         self._stream_holdback_tokens = int(stream_holdback_tokens)
         self._samples_per_frame = self._resolve_samples_per_frame(codec)
+        self._full_context_streaming = bool(full_context_streaming)
+        self._context_frames = int(context_frames)
+        self._startup_full_chunk_frames = int(startup_full_chunk_frames)
+        self._startup_full_chunk_count = int(startup_full_chunk_count)
+        self._startup_reduced_context_frames = int(startup_reduced_context_frames)
+        self._startup_reduced_left_context_frames = int(
+            startup_reduced_left_context_frames
+        )
+        self._startup_reduced_context_until_frames = int(
+            startup_reduced_context_until_frames
+        )
+        self._startup_masked_delay_rows = int(startup_masked_delay_rows)
+        self._startup_masked_emit_frames = int(startup_masked_emit_frames)
+        self._startup_masked_until_frames = int(startup_masked_until_frames)
+        if self._full_context_streaming and not hasattr(codec, "decode_masked_batch"):
+            raise TypeError("full-context Higgs streaming requires decode_masked_batch")
+        self._can_batch_stream_chunks = self._full_context_streaming
 
         super().__init__(
             self._vocode_payload,
@@ -236,6 +284,154 @@ class HiggsStreamingVocoderScheduler(StreamingVocoderBase[_HiggsStreamState, Non
             emitted_initial_chunk=use_initial_chunk and not is_final,
         )
         return delta
+
+    def select_step_participants(self) -> list[tuple[str, _HiggsStreamState]]:
+        tasks = [
+            task
+            for request_id, state in self._stream_state_items()
+            if (task := self._prepare_context_task(request_id, state)) is not None
+        ]
+        if not tasks:
+            return []
+        tasks.sort(key=lambda task: task.state.next_emit_frame)
+        lead_key = self._context_task_key(tasks[0])
+        selected = [task for task in tasks if self._context_task_key(task) == lead_key]
+        return [
+            (task.request_id, task.state) for task in selected[: self._max_batch_size]
+        ]
+
+    def build_step_plan(
+        self, participants: list[tuple[str, _HiggsStreamState]]
+    ) -> _ContextStepPlan:
+        tasks = []
+        for request_id, state in participants:
+            task = self._prepare_context_task(request_id, state)
+            if task is None:
+                raise RuntimeError(f"Higgs stream {request_id!r} became unready")
+            tasks.append(task)
+        return _ContextStepPlan(
+            tasks=tasks, masked=tasks[0].phase == "partial_masked_delay"
+        )
+
+    def run_step(
+        self,
+        participants: list[tuple[str, _HiggsStreamState]],
+        plan: _ContextStepPlan,
+    ) -> dict[str, torch.Tensor]:
+        del participants
+        codes = [task.codes_TN for task in plan.tasks]
+        audios = (
+            self._codec.decode_masked_batch(
+                codes, [task.counts_T for task in plan.tasks]
+            )
+            if plan.masked
+            else self._codec.decode_batch(codes)
+        )
+        out: dict[str, torch.Tensor] = {}
+        for task, audio in zip(plan.tasks, audios):
+            samples_per_frame = self._samples_per_frame or max(
+                int(audio.shape[-1]) // max(int(task.codes_TN.shape[0]), 1), 1
+            )
+            start = task.audio_offset_samples
+            end = start + task.emit_frames * samples_per_frame
+            delta = audio[start:end].detach().to(torch.float32).contiguous()
+            task.state.next_emit_frame += task.emit_frames
+            task.state.emitted_raw_frames = task.state.next_emit_frame
+            if task.phase == "full_startup":
+                task.state.startup_full_chunks_emitted += 1
+            if delta.numel():
+                out[task.request_id] = delta
+        return out
+
+    def _prepare_context_task(
+        self, request_id: str, state: _HiggsStreamState
+    ) -> _ContextDecodeTask | None:
+        if not self._full_context_streaming or not state.delayed_rows:
+            return None
+        num_codebooks, codebook_size = self._require_stream_contract(state, request_id)
+        next_frame = state.next_emit_frame
+        cache_len = len(state.delayed_rows)
+        if next_frame < self._startup_masked_until_frames:
+            emit_frames = min(
+                self._startup_masked_emit_frames,
+                self._startup_masked_until_frames - next_frame,
+            )
+            frame_start = max(0, next_frame - self._context_frames)
+            frame_end = next_frame + self._startup_masked_delay_rows
+            if cache_len < frame_end:
+                return None
+            phase = "partial_masked_delay"
+        else:
+            if next_frame < self._startup_reduced_context_until_frames:
+                emit_frames = min(
+                    self._startup_full_chunk_frames,
+                    self._startup_reduced_context_until_frames - next_frame,
+                )
+                left_context = self._startup_reduced_left_context_frames
+                right_context = self._startup_reduced_context_frames
+                phase = "full_reduced_context"
+            elif state.startup_full_chunks_emitted < self._startup_full_chunk_count:
+                emit_frames = self._startup_full_chunk_frames
+                left_context = self._context_frames
+                right_context = self._context_frames
+                phase = "full_startup"
+            else:
+                emit_frames = max(1, self._stream_stride - num_codebooks + 1)
+                left_context = self._context_frames
+                right_context = self._context_frames
+                phase = "full_context"
+            frame_start = max(0, next_frame - left_context)
+            frame_end = next_frame + emit_frames + right_context
+            if cache_len < frame_end + num_codebooks - 1:
+                return None
+
+        codes, counts = self._gather_rvq_window(
+            state.delayed_rows,
+            frame_start=frame_start,
+            frame_end=frame_end,
+            num_codebooks=num_codebooks,
+        )
+        codec_vocab = codebook_size - 2
+        codes = torch.where(codes >= codec_vocab, torch.zeros_like(codes), codes)
+        codes = torch.clamp(codes, 0, codec_vocab - 1)
+        return _ContextDecodeTask(
+            request_id=request_id,
+            state=state,
+            codes_TN=codes,
+            counts_T=counts,
+            audio_offset_samples=(next_frame - frame_start)
+            * (self._samples_per_frame or 1),
+            emit_frames=emit_frames,
+            phase=phase,
+        )
+
+    @staticmethod
+    def _context_task_key(task: _ContextDecodeTask) -> tuple[Any, ...]:
+        return (
+            task.phase,
+            tuple(task.codes_TN.shape),
+            task.audio_offset_samples,
+            task.emit_frames,
+        )
+
+    @staticmethod
+    def _gather_rvq_window(
+        delayed_rows: list[torch.Tensor],
+        *,
+        frame_start: int,
+        frame_end: int,
+        num_codebooks: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        codes = torch.zeros((frame_end - frame_start, num_codebooks), dtype=torch.long)
+        counts = torch.empty((frame_end - frame_start,), dtype=torch.long)
+        for output_frame, frame in enumerate(range(frame_start, frame_end)):
+            count = min(num_codebooks, max(len(delayed_rows) - frame, 0))
+            if count <= 0:
+                raise ValueError(f"Higgs frame {frame} has no available codebooks")
+            counts[output_frame] = count
+            for codebook in range(count):
+                codes[output_frame, codebook] = delayed_rows[frame + codebook][codebook]
+        return codes, counts
 
     def stream_payload(self, request_id: str, waveform: torch.Tensor) -> dict[str, Any]:
         del request_id

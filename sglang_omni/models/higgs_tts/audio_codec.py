@@ -275,5 +275,68 @@ class HiggsAudioCodec:
             error_label="decode_batch",
         )
 
+    @torch.no_grad()
+    def decode_masked_batch(
+        self,
+        codes_list: list[torch.Tensor],
+        codebook_counts_list: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        """Decode leading, partially available RVQ codebooks.
+
+        Missing residual codebooks contribute zero to the quantized latent;
+        token id zero would instead add a learned embedding and corrupt the
+        low-latency startup audio.
+        """
+        if len(codes_list) != len(codebook_counts_list):
+            raise ValueError("codes and codebook counts must have equal batch size")
+        if not codes_list:
+            return []
+
+        out: list[torch.Tensor | None] = [None] * len(codes_list)
+        buckets: dict[tuple[int, int], list[int]] = {}
+        for idx, (codes, counts) in enumerate(zip(codes_list, codebook_counts_list)):
+            if codes.ndim != 2:
+                raise ValueError(f"codes must be [T, N], got {tuple(codes.shape)}")
+            if counts.shape != codes.shape[:1]:
+                raise ValueError(
+                    f"codebook counts must be [T], got {tuple(counts.shape)}"
+                )
+            buckets.setdefault(tuple(codes.shape), []).append(idx)
+
+        quantizers = self.model.quantizer.quantizers
+        for indices in buckets.values():
+            codes = torch.stack([codes_list[i] for i in indices]).to(
+                device=self.device, dtype=torch.long
+            )
+            counts = torch.stack([codebook_counts_list[i] for i in indices]).to(
+                device=self.device, dtype=torch.long
+            )
+            num_codebooks = int(codes.shape[2])
+            if num_codebooks > len(quantizers):
+                raise ValueError(
+                    f"got {num_codebooks} codebooks but codec has {len(quantizers)}"
+                )
+            if torch.any(counts < 1) or torch.any(counts > num_codebooks):
+                raise ValueError(f"codebook counts must be within [1, {num_codebooks}]")
+
+            quantized = None
+            for codebook in range(int(counts.max().item())):
+                contribution = quantizers[codebook].decode(codes[:, :, codebook])
+                contribution = contribution * (counts > codebook).to(
+                    contribution.dtype
+                ).unsqueeze(1)
+                quantized = (
+                    contribution if quantized is None else quantized + contribution
+                )
+            assert quantized is not None
+            acoustic = self.model.fc2(quantized.transpose(1, 2)).transpose(1, 2)
+            audio = self.model.acoustic_decoder(acoustic).squeeze(1).cpu()
+            for idx, waveform in zip(indices, audio):
+                out[idx] = waveform
+
+        if any(waveform is None for waveform in out):
+            raise RuntimeError("decode_masked_batch did not produce every waveform")
+        return [waveform for waveform in out if waveform is not None]
+
 
 __all__ = ["HiggsAudioCodec"]

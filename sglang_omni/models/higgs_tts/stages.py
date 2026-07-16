@@ -448,6 +448,7 @@ def create_vocoder_executor(
     stream_followup_stride: int = 75,
     stream_overlap_tokens: int = 8,
     stream_holdback_tokens: int = 4,
+    full_context_streaming: bool = False,
 ):
     """Decode Higgs delayed codes to a mono 24 kHz waveform.
 
@@ -464,6 +465,7 @@ def create_vocoder_executor(
         stream_followup_stride=stream_followup_stride,
         stream_overlap_tokens=stream_overlap_tokens,
         stream_holdback_tokens=stream_holdback_tokens,
+        full_context_streaming=full_context_streaming,
     )
 
 

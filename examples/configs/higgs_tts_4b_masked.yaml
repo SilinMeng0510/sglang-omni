@@ -13,7 +13,8 @@ lora_max_rank: 32
 # Keep autoregressive generation and waveform decoding in separate processes.
 separate_vocoder_process: true
 
-# The rebased upstream streaming vocoder supersedes the original masked-delay
-# tuning. Raw PCM requests select its one-frame startup path automatically.
+# Use masked-delay startup and short steady-state chunks for continuous PCM
+# playback under rolling concurrency.
 vocoder_stream_stride: 32
 vocoder_stream_followup_stride: 32
+vocoder_full_context_streaming: true

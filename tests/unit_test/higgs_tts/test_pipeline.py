@@ -974,6 +974,23 @@ class _FakeUnevenHiggsStreamingCodec:
         return [self.decode(codes) for codes in codes_list]
 
 
+class _FakeMaskedHiggsStreamingCodec(_FakeUnevenHiggsStreamingCodec):
+    def __init__(self) -> None:
+        super().__init__(tail_samples=0)
+        self.masked_batch_sizes: list[int] = []
+
+    def decode_masked_batch(
+        self,
+        codes_list: list[torch.Tensor],
+        counts_list: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        self.masked_batch_sizes.append(len(codes_list))
+        assert all(
+            torch.equal(counts, torch.tensor([3, 2, 1])) for counts in counts_list
+        )
+        return [self.decode(codes) for codes in codes_list]
+
+
 def _higgs_stream_payload(
     request_id: str,
     *,
@@ -1123,6 +1140,45 @@ def test_higgs_streaming_vocoder_honors_initial_codec_chunk_frames() -> None:
     audio = np.frombuffer(messages[0].data["audio_waveform"], dtype=np.float32)
     assert audio.size == 4
     assert codec.decode_inputs[0].shape[0] == 1
+
+
+def test_higgs_masked_startup_coalesces_ready_requests() -> None:
+    codec = _FakeMaskedHiggsStreamingCodec()
+    scheduler = HiggsStreamingVocoderScheduler(
+        codec,
+        full_context_streaming=True,
+        startup_masked_delay_rows=3,
+        startup_masked_emit_frames=2,
+        startup_masked_until_frames=2,
+    )
+    raw_codes = torch.arange(1, 13, dtype=torch.long).reshape(4, 3)
+    delayed = apply_delay_pattern(raw_codes)
+    for request_id in ("a", "b"):
+        scheduler._on_streaming_new_request(
+            request_id,
+            _higgs_stream_payload(
+                request_id,
+                stream=True,
+                delayed_rows=delayed.tolist(),
+                codebook_size=64,
+            ),
+        )
+
+    scheduler.on_stream_chunk_batch(
+        [
+            (request_id, _higgs_stream_item(delayed[row], codebook_size=64))
+            for row in range(3)
+            for request_id in ("a", "b")
+        ]
+    )
+
+    streams = [msg for msg in _drain_higgs_outbox(scheduler) if msg.type == "stream"]
+    assert codec.masked_batch_sizes == [2]
+    assert {msg.request_id for msg in streams} == {"a", "b"}
+    assert all(
+        np.frombuffer(msg.data["audio_waveform"], dtype=np.float32).size == 10
+        for msg in streams
+    )
 
 
 def test_higgs_streaming_vocoder_matches_full_decode_with_codec_tail() -> None:
