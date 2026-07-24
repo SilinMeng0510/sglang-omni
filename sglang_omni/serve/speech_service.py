@@ -298,7 +298,9 @@ class SpeechRequestValidator:
         return GenerateRequest(
             model=request.model or self.default_model,
             prompt=_build_speech_prompt(request, reference_descriptors),
-            sampling=_build_sampling_params(request),
+            sampling=_build_sampling_params(
+                request, model_name=request.model or self.default_model or ""
+            ),
             stage_params=request.stage_params,
             extra_params=_build_extra_params(request),
             stream=request.stream,
@@ -741,10 +743,22 @@ def _build_tts_params(
     return tts_params
 
 
-def _build_sampling_params(request: CreateSpeechRequest) -> SamplingParams:
-    sampling = SamplingParams(
-        temperature=0.8, top_p=0.8, top_k=30, repetition_penalty=1.1
-    )
+def _build_sampling_params(
+    request: CreateSpeechRequest, *, model_name: str = ""
+) -> SamplingParams:
+    if "higgs" in model_name.lower():
+        # Higgs-tuned defaults from the pre-OSS serving line. The S2-Pro values
+        # below (top_p=0.8/top_k=30) over-sharpen Higgs cb0 sampling at typical
+        # temperatures and cause intermittent run-on generations that only stop
+        # at the max_new_tokens cap (~81.6s of audio).
+        sampling = SamplingParams(
+            temperature=0.8, top_p=0.95, top_k=50, repetition_penalty=1.0
+        )
+    else:
+        # S2-Pro-tuned defaults
+        sampling = SamplingParams(
+            temperature=0.8, top_p=0.8, top_k=30, repetition_penalty=1.1
+        )
     if request.max_new_tokens is not None:
         sampling.max_new_tokens = request.max_new_tokens
     if request.temperature is not None:

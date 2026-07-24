@@ -859,3 +859,52 @@ def test_file_reference_rejects_symlink_escape(tmp_path: Path) -> None:
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.param == "ref_audio"
+
+
+def test_sampling_defaults_higgs_uses_tuned_values() -> None:
+    sampling = speech_service._build_sampling_params(
+        CreateSpeechRequest(input="hello"),
+        model_name="bosonai/higgs-tts-3-4b",
+    )
+
+    assert sampling.temperature == 0.8
+    assert sampling.top_p == 0.95
+    assert sampling.top_k == 50
+    assert sampling.repetition_penalty == 1.0
+
+
+def test_sampling_defaults_non_higgs_uses_s2pro_values() -> None:
+    sampling = speech_service._build_sampling_params(
+        CreateSpeechRequest(input="hello"),
+        model_name="fishaudio/s2-pro",
+    )
+
+    assert sampling.temperature == 0.8
+    assert sampling.top_p == 0.8
+    assert sampling.top_k == 30
+    assert sampling.repetition_penalty == 1.1
+
+
+def test_sampling_defaults_explicit_fields_override_higgs_defaults() -> None:
+    sampling = speech_service._build_sampling_params(
+        CreateSpeechRequest(
+            input="hello", temperature=0.7, top_p=0.5, top_k=7, seed=3
+        ),
+        model_name="bosonai/higgs-tts-3-4b",
+    )
+
+    assert sampling.temperature == 0.7
+    assert sampling.top_p == 0.5
+    assert sampling.top_k == 7
+    assert sampling.seed == 3
+
+
+def test_build_generate_request_resolves_higgs_defaults_from_default_model() -> None:
+    service = SpeechRequestValidator(default_model="bosonai/higgs-tts-3-4b")
+
+    gen_req = service.build_generate_request(
+        CreateSpeechRequest(input="hello"), validate=False
+    )
+
+    assert gen_req.sampling.top_p == 0.95
+    assert gen_req.sampling.top_k == 50
