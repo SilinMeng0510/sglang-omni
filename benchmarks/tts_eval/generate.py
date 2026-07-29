@@ -131,7 +131,9 @@ async def generate_samples(
                         row["is_success"] = True
                         row["error"] = None
                         break
-                    except Exception as exc:  # noqa: BLE001 - retry any request/write failure
+                    except (
+                        Exception
+                    ) as exc:  # noqa: BLE001 - retry any request/write failure
                         row["error"] = str(exc)
                         if attempt < retries:
                             await asyncio.sleep(2**attempt)
