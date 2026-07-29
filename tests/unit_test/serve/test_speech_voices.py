@@ -15,7 +15,8 @@ from sglang_omni.scheduling.speaker_cache import SpeakerArtifactCache, SpeakerCa
 from sglang_omni.serve import create_app
 from sglang_omni.serve.openai_api import VoiceUploadBodyLimitMiddleware
 from sglang_omni.serve.speech_errors import SpeechAPIError
-from sglang_omni.serve.speech_service import SpeechRequestValidator
+from sglang_omni.serve import speech_service
+from sglang_omni.serve.speech_service import HOUSE_VOICE_ASSET, SpeechRequestValidator
 from sglang_omni.serve.speech_voices import SpeakerSampleStore
 
 
@@ -635,3 +636,80 @@ def _reference_wav(
     t = np.arange(sample_count, dtype=np.float32) / DEFAULT_SAMPLE_RATE
     audio = amplitude * np.sin(2.0 * np.pi * frequency * t)
     return encode_wav(audio.astype(np.float32), DEFAULT_SAMPLE_RATE)
+
+
+def test_default_voice_request_carries_the_house_reference(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+    client_impl = RecordingSpeechClient()
+    client = TestClient(create_app(client_impl, model_name="tts"))
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={"model": "tts", "input": "hello", "response_format": "wav"},
+    )
+
+    assert response.status_code == 200
+    prompt = client_impl.requests[-1].prompt
+    # No reference supplied, so the packaged clip fills in and the voice is a
+    # fixed one instead of whatever the model picks.
+    assert prompt["text"] == "hello"
+    reference = prompt["references"][0]
+    assert reference["media_type"] == "audio/mpeg"
+    assert base64.b64decode(reference["data"]) == HOUSE_VOICE_ASSET.read_bytes()
+
+
+def test_lora_request_keeps_its_own_voice(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+    client_impl = RecordingSpeechClient()
+    client = TestClient(create_app(client_impl, model_name="tts"))
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "tts",
+            "input": "hello",
+            "response_format": "wav",
+            "lora_adapter": {"path": "/adapters/some-voice/peft"},
+        },
+    )
+
+    assert response.status_code == 200
+    # The adapter is itself a voice; adding the house reference would pull the
+    # output between the two.
+    assert client_impl.requests[-1].prompt == "hello"
+
+
+def test_caller_reference_wins_over_the_house_voice(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+    client_impl = RecordingSpeechClient()
+    client = TestClient(create_app(client_impl, model_name="tts"))
+
+    own_clip = "data:audio/wav;base64," + base64.b64encode(_reference_wav()).decode()
+    response = client.post(
+        "/v1/audio/speech",
+        json={"model": "tts", "input": "hello", "ref_audio": own_clip, "ref_text": "mine"},
+    )
+
+    assert response.status_code == 200
+    reference = client_impl.requests[-1].prompt["references"][0]
+    assert reference["text"] == "mine"
+    assert reference["media_type"] != "audio/mpeg"
+
+
+def test_house_voice_absent_falls_back_to_reference_free(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+    monkeypatch.setattr(speech_service, "HOUSE_VOICE_ASSET", tmp_path / "missing.mp3")
+    speech_service._house_voice_ref_audio.cache_clear()
+    client_impl = RecordingSpeechClient()
+    client = TestClient(create_app(client_impl, model_name="tts"))
+
+    try:
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "tts", "input": "hello", "response_format": "wav"},
+        )
+
+        assert response.status_code == 200
+        assert client_impl.requests[-1].prompt == "hello"
+    finally:
+        speech_service._house_voice_ref_audio.cache_clear()

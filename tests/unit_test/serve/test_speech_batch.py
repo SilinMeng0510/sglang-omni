@@ -16,6 +16,16 @@ from sglang_omni.serve.openai_api import _create_speech_batch_with_disconnect_wa
 from sglang_omni.serve.speech_service import SpeechRequestValidator
 
 
+def _prompt_text(prompt: Any) -> Any:
+    """Text of a speech prompt.
+
+    A request carrying a reference voice - which now includes a plain
+    default-voice request, filled in with the packaged house clip - arrives as
+    ``{"text": ..., "references": [...]}`` rather than a bare string.
+    """
+    return prompt["text"] if isinstance(prompt, dict) else prompt
+
+
 class RecordingBatchSpeechClient:
     def __init__(self) -> None:
         self.requests: list[Any] = []
@@ -35,7 +45,7 @@ class RecordingBatchSpeechClient:
         del request_id, speed, allow_format_fallback
         self.requests.append(request)
         return SpeechResult(
-            audio_bytes=f"audio:{request.prompt}".encode(),
+            audio_bytes=f"audio:{_prompt_text(request.prompt)}".encode(),
             mime_type=f"audio/{response_format}",
             format=response_format,
         )
@@ -95,13 +105,13 @@ class MixedBatchSpeechClient:
         allow_format_fallback: bool = True,
     ) -> SpeechResult:
         del request_id, speed, allow_format_fallback
-        self.requests.append(request.prompt)
-        if request.prompt == "slow":
+        self.requests.append(_prompt_text(request.prompt))
+        if _prompt_text(request.prompt) == "slow":
             await asyncio.sleep(0.01)
-        if request.prompt == "fail":
+        if _prompt_text(request.prompt) == "fail":
             raise ClientError("model failed")
         return SpeechResult(
-            audio_bytes=f"audio:{request.prompt}".encode(),
+            audio_bytes=f"audio:{_prompt_text(request.prompt)}".encode(),
             mime_type=f"audio/{response_format}",
             format=response_format,
         )
@@ -155,7 +165,7 @@ def test_batch_speech_preserves_order_and_item_errors() -> None:
     assert body["results"][2]["media_type"] == "audio/pcm"
     assert body["results"][3]["error"]["param"] == "items.3.input"
     assert body["results"][4]["error"]["param"] == "items.4.input"
-    assert [request.prompt for request in client_impl.requests] == ["first", "third"]
+    assert [_prompt_text(request.prompt) for request in client_impl.requests] == ["first", "third"]
 
 
 def test_batch_speech_rejects_invalid_envelope_before_item_work() -> None:
@@ -206,7 +216,7 @@ def test_batch_speech_item_null_voice_inherits_default_voice() -> None:
 
     assert response.status_code == 200
     assert response.json()["succeeded"] == 1
-    assert [request.prompt for request in client_impl.requests] == ["one"]
+    assert [_prompt_text(request.prompt) for request in client_impl.requests] == ["one"]
     assert client_impl.requests[0].metadata["tts_params"]["voice"] == "default"
 
 
@@ -376,7 +386,7 @@ def test_batch_speech_accepts_item_model_override() -> None:
     body = response.json()
     assert body["succeeded"] == 3
     assert body["failed"] == 0
-    assert [request.prompt for request in client_impl.requests] == [
+    assert [_prompt_text(request.prompt) for request in client_impl.requests] == [
         "first",
         "wrong model",
         "third",

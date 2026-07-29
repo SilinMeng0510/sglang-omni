@@ -8,6 +8,7 @@ import base64
 import binascii
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -61,6 +62,15 @@ MAX_SPEECH_INPUT_CHARS = 4096
 MAX_REFERENCE_AUDIO_BYTES = 10 * 1024 * 1024
 _REFERENCE_AUDIO_FIELDS = ("audio_path", "ref_audio", "audio")
 RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES = 1
+# Mirrors speech_voices.DEFAULT_VOICE_PRESETS[0]; kept as a literal because that
+# module is imported lazily (it pulls in numpy/safetensors).
+DEFAULT_SPEECH_VOICE = "default"
+# Reference clip used when a request asks for the default voice and brings no
+# reference of its own, so that voice is a fixed one rather than whatever the
+# model picks. Shipped as a package asset: callers (notably the API gateway,
+# which used to inline it on every request) name the voice instead of re-sending
+# ~72 KB of audio, worth ~34 ms of time-to-first-audio over a WAN hop.
+HOUSE_VOICE_ASSET = Path(__file__).parent / "assets" / "default_female.mp3"
 _ReferenceCacheKey = tuple[Any, ...]
 
 
@@ -243,6 +253,13 @@ class SpeechRequestValidator:
         uploaded_voice = self._resolve_uploaded_voice_reference(request)
 
         ref_audio = request.ref_audio
+        if (
+            ref_audio is None
+            and not request.references
+            and uploaded_voice is None
+            and _wants_house_voice(request)
+        ):
+            ref_audio = _house_voice_ref_audio()
         if ref_audio is not None:
             descriptor = self._load_media_reference_descriptor(
                 ref_audio, param="ref_audio"
@@ -554,7 +571,7 @@ class SpeechRequestValidator:
             or request.references
         ):
             return None
-        if not request.voice or request.voice.lower() == "default":
+        if not request.voice or request.voice.lower() == DEFAULT_SPEECH_VOICE:
             return None
         uploaded_voice = self.voice_store.resolve_reference(request.voice)
         if uploaded_voice is None and self.requires_uploaded_voice_for_named_voice:
@@ -849,6 +866,34 @@ def _reference_descriptors_from_request(
             ref["text"] = request.ref_text
         references.append(ref)
     return references
+
+
+def _wants_house_voice(request: CreateSpeechRequest) -> bool:
+    """Whether to fill in the house voice for this request.
+
+    Only for a plain default-voice request. A LoRA adapter is itself a voice, so
+    pairing it with this reference would pull the output between the two.
+    """
+    if request.lora_adapter is not None:
+        return False
+    voice = request.voice or DEFAULT_SPEECH_VOICE
+    return voice.lower() == DEFAULT_SPEECH_VOICE
+
+
+@lru_cache(maxsize=1)
+def _house_voice_ref_audio() -> str | None:
+    """The packaged clip as a ``data:`` URI, or None if this build lacks it."""
+    try:
+        encoded = base64.b64encode(HOUSE_VOICE_ASSET.read_bytes()).decode("ascii")
+    except OSError:
+        logger.warning(
+            "House voice asset is unreadable (%s); default-voice requests fall "
+            "back to reference-free synthesis",
+            HOUSE_VOICE_ASSET,
+            exc_info=True,
+        )
+        return None
+    return f"data:audio/mpeg;base64,{encoded}"
 
 
 def _media_reference_from_descriptor(descriptor: dict[str, str]) -> str:

@@ -26,6 +26,15 @@ from sglang_omni.serve.speech_ws import (
 )
 
 
+def _prompt_text(prompt: Any) -> Any:
+    """Text of a speech prompt.
+
+    A request carrying a reference voice - which now includes a plain
+    default-voice request, filled in with the packaged house clip - arrives as
+    ``{"text": ..., "references": [...]}`` rather than a bare string.
+    """
+    return prompt["text"] if isinstance(prompt, dict) else prompt
+
 class StreamingSpeechClient:
     def __init__(self, *, sample_rate: int = 24000) -> None:
         self.sample_rate = sample_rate
@@ -36,7 +45,7 @@ class StreamingSpeechClient:
         return {"running": True}
 
     async def generate(self, request: Any, request_id: str | None = None):
-        self.generated_prompts.append(request.prompt)
+        self.generated_prompts.append(_prompt_text(request.prompt))
         yield GenerateChunk(
             request_id=request_id or "speech-ws",
             modality="audio",
@@ -55,7 +64,7 @@ class StreamingSpeechClient:
         allow_format_fallback: bool = True,
     ) -> SpeechResult:
         del request_id, speed, allow_format_fallback
-        self.speech_prompts.append(request.prompt)
+        self.speech_prompts.append(_prompt_text(request.prompt))
         return SpeechResult(
             audio_bytes=b"RIFF",
             mime_type=f"audio/{response_format}",
