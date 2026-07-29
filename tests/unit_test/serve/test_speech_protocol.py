@@ -887,9 +887,7 @@ def test_sampling_defaults_non_higgs_uses_s2pro_values() -> None:
 
 def test_sampling_defaults_explicit_fields_override_higgs_defaults() -> None:
     sampling = speech_service._build_sampling_params(
-        CreateSpeechRequest(
-            input="hello", temperature=0.7, top_p=0.5, top_k=7, seed=3
-        ),
+        CreateSpeechRequest(input="hello", temperature=0.7, top_p=0.5, top_k=7, seed=3),
         model_name="bosonai/higgs-tts-3-4b",
     )
 
