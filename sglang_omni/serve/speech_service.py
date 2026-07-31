@@ -7,6 +7,7 @@ import asyncio
 import base64
 import binascii
 import logging
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -682,6 +683,10 @@ class SpeechRequestValidator:
                     f"{param} must be an http, https, data, file:// URL, or local path",
                     param=param,
                 )
+            # A bare base64 audio blob has no URL scheme; treat it as inline
+            # data, never as a filesystem path (open() -> ENAMETOOLONG).
+            if _is_bare_base64_audio(value):
+                return {"data": value, "media_type": "audio/wav"}
             return {"audio_path": str(Path(value).expanduser().resolve())}
         try:
             return self.reference_connector.load_resource(
@@ -894,6 +899,22 @@ def _house_voice_ref_audio() -> str | None:
         )
         return None
     return f"data:audio/mpeg;base64,{encoded}"
+
+
+_BARE_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+
+def _is_bare_base64_audio(value: str) -> bool:
+    """True for a long, pure-base64 blob. Guards ref_audio: a bare base64 audio
+    string carries no URL scheme, so it must not be treated as a filesystem path
+    (open() would raise ENAMETOOLONG). Matches the historical tolerant behaviour
+    dropped when the speech API was rewritten in #659. No real path is this long.
+    """
+    return (
+        len(value) >= 256
+        and len(value) % 4 == 0
+        and _BARE_BASE64_RE.match(value) is not None
+    )
 
 
 def _media_reference_from_descriptor(descriptor: dict[str, str]) -> str:
