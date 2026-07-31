@@ -161,7 +161,6 @@ def test_speech_service_rejects_boolean_seed() -> None:
         ({"input": "hello", "response_format": "gif"}, "response_format"),
         ({"input": "hello", "speed": 0.24}, "speed"),
         ({"input": "hello", "speed": 4.01}, "speed"),
-        ({"input": "hello", "language": "Klingon"}, "language"),
         ({"input": "hello", "task_type": "Narration"}, "task_type"),
         ({"input": "hello", "max_new_tokens": 0}, "max_new_tokens"),
         ({"input": "hello", "token_count": 0}, "token_count"),

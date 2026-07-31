@@ -52,3 +52,6 @@ benchmarks/HIGGS_TTS_*.md
 benchmarks/higgs_tts/results/
 .claude/*
 !.claude/skills/
+
+# Packaged default-voice transcripts are real assets, not scratch files
+!sglang_omni/serve/assets/default/*.txt

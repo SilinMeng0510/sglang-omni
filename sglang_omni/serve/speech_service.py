@@ -9,7 +9,6 @@ import binascii
 import logging
 import re
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -66,12 +65,6 @@ RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES = 1
 # Mirrors speech_voices.DEFAULT_VOICE_PRESETS[0]; kept as a literal because that
 # module is imported lazily (it pulls in numpy/safetensors).
 DEFAULT_SPEECH_VOICE = "default"
-# Reference clip used when a request asks for the default voice and brings no
-# reference of its own, so that voice is a fixed one rather than whatever the
-# model picks. Shipped as a package asset: callers (notably the API gateway,
-# which used to inline it on every request) name the voice instead of re-sending
-# ~72 KB of audio, worth ~34 ms of time-to-first-audio over a WAN hop.
-HOUSE_VOICE_ASSET = Path(__file__).parent / "assets" / "default_female.mp3"
 _ReferenceCacheKey = tuple[Any, ...]
 
 
@@ -254,13 +247,6 @@ class SpeechRequestValidator:
         uploaded_voice = self._resolve_uploaded_voice_reference(request)
 
         ref_audio = request.ref_audio
-        if (
-            ref_audio is None
-            and not request.references
-            and uploaded_voice is None
-            and _wants_house_voice(request)
-        ):
-            ref_audio = _house_voice_ref_audio()
         if ref_audio is not None:
             descriptor = self._load_media_reference_descriptor(
                 ref_audio, param="ref_audio"
@@ -565,14 +551,12 @@ class SpeechRequestValidator:
     def _resolve_uploaded_voice_reference(
         self, request: CreateSpeechRequest
     ) -> "UploadedVoiceReference | None":
-        if (
-            self.voice_store is None
-            or not self.supports_uploaded_voice_references
-            or request.ref_audio is not None
-            or request.references
-        ):
+        if request.ref_audio is not None or request.references:
             return None
-        if not request.voice or request.voice.lower() == DEFAULT_SPEECH_VOICE:
+        voice_name = request.voice or DEFAULT_SPEECH_VOICE
+        if voice_name.lower() == DEFAULT_SPEECH_VOICE:
+            return self._resolve_default_voice_reference(request)
+        if self.voice_store is None or not self.supports_uploaded_voice_references:
             return None
         uploaded_voice = self.voice_store.resolve_reference(request.voice)
         if uploaded_voice is None and self.requires_uploaded_voice_for_named_voice:
@@ -589,6 +573,26 @@ class SpeechRequestValidator:
                     param="task_type",
                 )
         return uploaded_voice
+
+    def _resolve_default_voice_reference(
+        self, request: CreateSpeechRequest
+    ) -> "UploadedVoiceReference | None":
+        """Bare default -> the packaged clip matching ``language``.
+
+        LoRA and non-Base task types stay reference-free: the adapter/task is
+        itself a voice, and pairing it with a reference would fight it.
+        """
+        if request.lora_adapter is not None:
+            return None
+        if (
+            request.task_type is not None
+            and _normalize_task_type(request.task_type) != "Base"
+        ):
+            return None
+        # Imported lazily, mirroring the DEFAULT_SPEECH_VOICE note above.
+        from sglang_omni.serve.speech_voices import packaged_default_reference
+
+        return packaged_default_reference(request.language)
 
     def _validate_raw_payload(self, payload: dict[str, Any]) -> None:
         for field_name in (
@@ -873,34 +877,6 @@ def _reference_descriptors_from_request(
     return references
 
 
-def _wants_house_voice(request: CreateSpeechRequest) -> bool:
-    """Whether to fill in the house voice for this request.
-
-    Only for a plain default-voice request. A LoRA adapter is itself a voice, so
-    pairing it with this reference would pull the output between the two.
-    """
-    if request.lora_adapter is not None:
-        return False
-    voice = request.voice or DEFAULT_SPEECH_VOICE
-    return voice.lower() == DEFAULT_SPEECH_VOICE
-
-
-@lru_cache(maxsize=1)
-def _house_voice_ref_audio() -> str | None:
-    """The packaged clip as a ``data:`` URI, or None if this build lacks it."""
-    try:
-        encoded = base64.b64encode(HOUSE_VOICE_ASSET.read_bytes()).decode("ascii")
-    except OSError:
-        logger.warning(
-            "House voice asset is unreadable (%s); default-voice requests fall "
-            "back to reference-free synthesis",
-            HOUSE_VOICE_ASSET,
-            exc_info=True,
-        )
-        return None
-    return f"data:audio/mpeg;base64,{encoded}"
-
-
 _BARE_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 
 
@@ -1049,11 +1025,10 @@ def _validate_reference_size(size_bytes: int, *, param: str) -> None:
 
 
 def _normalize_language(value: str) -> str:
-    normalized = _TTS_LANGUAGE_ALIASES.get(value.strip().lower())
-    if normalized is None:
-        supported = ", ".join(sorted(SUPPORTED_TTS_LANGUAGES))
-        raise bad_request(f"language must be one of: {supported}", param="language")
-    return normalized
+    # Known names canonicalize (chinese -> Chinese); anything else passes
+    # through verbatim — the field is a free-form hint.
+    stripped = value.strip()
+    return _TTS_LANGUAGE_ALIASES.get(stripped.lower(), stripped)
 
 
 def _normalize_task_type(value: str) -> str:

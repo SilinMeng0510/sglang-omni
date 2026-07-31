@@ -16,7 +16,8 @@ from sglang_omni.serve import create_app
 from sglang_omni.serve.openai_api import VoiceUploadBodyLimitMiddleware
 from sglang_omni.serve.speech_errors import SpeechAPIError
 from sglang_omni.serve import speech_service
-from sglang_omni.serve.speech_service import HOUSE_VOICE_ASSET, SpeechRequestValidator
+from sglang_omni.serve.speech_service import SpeechRequestValidator
+from sglang_omni.serve import speech_voices
 from sglang_omni.serve.speech_voices import SpeakerSampleStore
 
 
@@ -638,7 +639,9 @@ def _reference_wav(
     return encode_wav(audio.astype(np.float32), DEFAULT_SAMPLE_RATE)
 
 
-def test_default_voice_request_carries_the_house_reference(tmp_path: Path, monkeypatch) -> None:
+def test_default_voice_request_carries_the_packaged_reference(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
     client_impl = RecordingSpeechClient()
     client = TestClient(create_app(client_impl, model_name="tts"))
@@ -650,12 +653,16 @@ def test_default_voice_request_carries_the_house_reference(tmp_path: Path, monke
 
     assert response.status_code == 200
     prompt = client_impl.requests[-1].prompt
-    # No reference supplied, so the packaged clip fills in and the voice is a
-    # fixed one instead of whatever the model picks.
+    # No reference supplied, so the packaged default clip fills in and the
+    # voice is a fixed one instead of whatever the model picks.
     assert prompt["text"] == "hello"
     reference = prompt["references"][0]
-    assert reference["media_type"] == "audio/mpeg"
-    assert base64.b64decode(reference["data"]) == HOUSE_VOICE_ASSET.read_bytes()
+    assert reference["media_type"] == "audio/wav"
+    expected = (speech_voices.PACKAGED_VOICE_DIR / "en.wav").read_bytes()
+    assert base64.b64decode(reference["data"]) == expected
+    assert reference["uploaded_voice_name"] == "default/en"
+    # The packaged transcript rides along for cloning quality
+    assert reference["text"]
 
 
 def test_lora_request_keeps_its_own_voice(tmp_path: Path, monkeypatch) -> None:
@@ -674,12 +681,14 @@ def test_lora_request_keeps_its_own_voice(tmp_path: Path, monkeypatch) -> None:
     )
 
     assert response.status_code == 200
-    # The adapter is itself a voice; adding the house reference would pull the
-    # output between the two.
+    # The adapter is itself a voice; adding the packaged reference would pull
+    # the output between the two.
     assert client_impl.requests[-1].prompt == "hello"
 
 
-def test_caller_reference_wins_over_the_house_voice(tmp_path: Path, monkeypatch) -> None:
+def test_caller_reference_wins_over_the_packaged_default(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
     client_impl = RecordingSpeechClient()
     client = TestClient(create_app(client_impl, model_name="tts"))
@@ -693,17 +702,19 @@ def test_caller_reference_wins_over_the_house_voice(tmp_path: Path, monkeypatch)
     assert response.status_code == 200
     reference = client_impl.requests[-1].prompt["references"][0]
     assert reference["text"] == "mine"
-    assert reference["media_type"] != "audio/mpeg"
+    assert "uploaded_voice_name" not in reference
 
 
-def test_house_voice_absent_falls_back_to_reference_free(tmp_path: Path, monkeypatch) -> None:
+def test_packaged_default_absent_falls_back_to_reference_free(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
-    monkeypatch.setattr(speech_service, "HOUSE_VOICE_ASSET", tmp_path / "missing.mp3")
-    speech_service._house_voice_ref_audio.cache_clear()
-    client_impl = RecordingSpeechClient()
-    client = TestClient(create_app(client_impl, model_name="tts"))
-
+    monkeypatch.setattr(speech_voices, "PACKAGED_VOICE_DIR", tmp_path / "no-assets")
+    speech_voices._packaged_voice_reference.cache_clear()
     try:
+        client_impl = RecordingSpeechClient()
+        client = TestClient(create_app(client_impl, model_name="tts"))
+
         response = client.post(
             "/v1/audio/speech",
             json={"model": "tts", "input": "hello", "response_format": "wav"},
@@ -712,4 +723,68 @@ def test_house_voice_absent_falls_back_to_reference_free(tmp_path: Path, monkeyp
         assert response.status_code == 200
         assert client_impl.requests[-1].prompt == "hello"
     finally:
-        speech_service._house_voice_ref_audio.cache_clear()
+        speech_voices._packaged_voice_reference.cache_clear()
+
+
+def test_packaged_reference_created_at_is_content_derived() -> None:
+    a = speech_voices.packaged_default_reference("en")
+    speech_voices._packaged_voice_reference.cache_clear()
+    b = speech_voices.packaged_default_reference("en")
+    assert a is not None and b is not None
+    # Same asset content -> same created_at -> speaker artifact cache stays
+    # warm across restarts and replicas.
+    assert a.voice.created_at == b.voice.created_at
+
+
+@pytest.mark.parametrize(
+    "language,expected_stem",
+    [
+        ("zh", "zh"),
+        ("zh-cn", "zh"),
+        ("zh-CN", "zh"),
+        ("en", "en"),
+        # No packaged clip for these -> English fallback
+        ("ko", "en"),
+        ("Auto", "en"),
+        (None, "en"),
+    ],
+)
+def test_default_voice_language_selects_packaged_variant(
+    tmp_path: Path, monkeypatch, language, expected_stem
+) -> None:
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+    client_impl = RecordingSpeechClient()
+    client = TestClient(create_app(client_impl, model_name="tts"))
+
+    body = {"model": "tts", "input": "hello", "response_format": "wav"}
+    if language is not None:
+        body["language"] = language
+    response = client.post("/v1/audio/speech", json=body)
+
+    assert response.status_code == 200
+    reference = client_impl.requests[-1].prompt["references"][0]
+    expected = (
+        speech_voices.PACKAGED_VOICE_DIR / f"{expected_stem}.wav"
+    ).read_bytes()
+    assert base64.b64decode(reference["data"]) == expected
+    assert reference["uploaded_voice_name"] == f"default/{expected_stem}"
+
+
+def test_language_is_a_lenient_free_form_hint(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+    client_impl = RecordingSpeechClient()
+    client = TestClient(create_app(client_impl, model_name="tts"))
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={"model": "tts", "input": "你好", "language": "zh", "response_format": "wav"},
+    )
+
+    assert response.status_code == 200
+    request = client_impl.requests[-1]
+    reference = request.prompt["references"][0]
+    expected = (speech_voices.PACKAGED_VOICE_DIR / "zh.wav").read_bytes()
+    assert base64.b64decode(reference["data"]) == expected
+    # Detector output passes through verbatim; known full names still
+    # canonicalize (chinese -> Chinese)
+    assert request.metadata["tts_params"]["language"] == "zh"

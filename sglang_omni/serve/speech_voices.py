@@ -11,6 +11,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -37,6 +38,7 @@ VOICE_METADATA_INT_FIELDS = frozenset(
     {"created_at", "file_size", "sample_rate", "num_samples"}
 )
 VOICE_NAME_PATTERN = re.compile(r"^(?=.*[A-Za-z0-9])[A-Za-z0-9_.-]+$")
+PACKAGED_VOICE_DIR = Path(__file__).parent / "assets" / "default"
 DEFAULT_VOICE_PRESETS = ("default",)
 ACCEPTED_VOICE_UPLOAD_MIME_TYPES = frozenset(
     {
@@ -346,6 +348,58 @@ class SpeakerSampleStore:
                 param="voice",
             ) from exc
         return samples, voice.sample_rate
+
+
+def packaged_default_reference(language: str | None) -> UploadedVoiceReference | None:
+    """The packaged default-speaker clip for ``language``: the primary subtag
+    is the asset stem ("zh-CN" -> zh.wav), anything else falls back to English."""
+    stem = (language or "").strip().lower().split("-")[0]
+    if stem not in (path.stem for path in PACKAGED_VOICE_DIR.glob("*.wav")):
+        stem = "en"
+    return _packaged_voice_reference(stem)
+
+
+@lru_cache(maxsize=None)
+def _packaged_voice_reference(stem: str) -> UploadedVoiceReference | None:
+    """The bundled clip as a ``data:`` URI — raw bytes untouched, since a
+    decode/re-encode round trip would requantise the reference."""
+    asset = PACKAGED_VOICE_DIR / f"{stem}.wav"
+    try:
+        audio_bytes = asset.read_bytes()
+    except OSError:
+        logger.warning(
+            "Packaged voice asset is unreadable (%s); default-voice requests "
+            "fall back to reference-free synthesis",
+            asset,
+            exc_info=True,
+        )
+        return None
+    try:
+        ref_text = (PACKAGED_VOICE_DIR / f"{stem}.txt").read_text(encoding="utf-8")
+        ref_text = ref_text.strip() or None
+    except OSError:
+        ref_text = None
+    fingerprint = hashlib.sha256(audio_bytes).hexdigest()
+    voice = UploadedVoice(
+        # "/" is illegal in uploaded-voice names, so never collides with an upload
+        name=f"default/{stem}",
+        normalized_name=f"default/{stem}",
+        consent="packaged preset",
+        # content-derived so the speaker artifact cache survives restarts
+        created_at=int(fingerprint[:12], 16),
+        file_size=len(audio_bytes),
+        mime_type="audio/wav",
+        original_filename=asset.name,
+        sample_rate=0,
+        num_samples=0,
+        fingerprint=fingerprint,
+        file_path=asset,
+        ref_text=ref_text,
+    )
+    encoded = base64.b64encode(audio_bytes).decode("ascii")
+    return UploadedVoiceReference(
+        voice=voice, ref_audio=f"data:audio/wav;base64,{encoded}"
+    )
 
 
 def normalize_voice_name(name: str) -> str:
