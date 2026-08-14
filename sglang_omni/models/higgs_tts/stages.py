@@ -316,6 +316,9 @@ def create_preprocessing_executor(
             reference_text=reference_text_for_encoder,
             streaming_protocol=streaming_protocol,
             inject_text_ids=inject_text_ids,
+            streaming_incremental=(
+                streaming_protocol and bool(params.get("streaming_incremental", False))
+            ),
             streaming_text_token_id=adapter.text_id if streaming_protocol else None,
             streaming_audio_token_id=adapter.audio_id if streaming_protocol else None,
             streaming_text_end_token_id=(

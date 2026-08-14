@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import importlib
+import logging
 from typing import Any
 
 from sglang_omni.models.higgs_tts import request_builders
 from sglang_omni.models.higgs_tts import stages as higgs_stages
 from sglang_omni.models.higgs_tts import utils as higgs_utils
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
+
+logger = logging.getLogger(__name__)
 
 
 class HiggsTtsEngineBuilder(TtsEngineBuilder):
@@ -155,3 +158,59 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
 
     def post_scheduler_setup(self, scheduler: Any, model_runner: Any) -> None:
         model_runner.set_stream_outbox(scheduler.outbox)
+        self._install_streaming_input_handlers(scheduler)
+
+    @staticmethod
+    def _install_streaming_input_handlers(scheduler: Any) -> None:
+        """Wire incremental streaming-TTS text input into the scheduler.
+
+        ``stream_chunk`` messages carry ``{"token_ids": [...], "done": bool}``
+        from the API process (client.append_input); they extend the running
+        request's protocol inject queue and, if the request was parked as
+        input-starved, resume it. Runs on the scheduler thread — no locking.
+        """
+
+        def _maybe_resume(req_data: Any) -> None:
+            if not getattr(req_data, "input_starved", False):
+                return
+            proto = req_data.protocol_state
+            plan = proto.resume_plan()
+            if plan.starved:
+                return  # queue still empty (data-less done arrives separately)
+            req = req_data.req
+            # the starved step published a placeholder; the real injected
+            # token replaces it before the request re-enters scheduling
+            req.output_ids[-1] = int(plan.input_token_id)
+            req_data.streaming_plan = plan
+            req_data.input_starved = False
+            # False when the sweep had not parked the request yet (the chunk
+            # arrived in the same loop iteration) — it then simply continues
+            # in the running batch with the corrected published token.
+            scheduler.resume_held_request(req.rid)
+
+        def _on_input_chunk(req_data: Any, chunk: Any) -> None:
+            proto = getattr(req_data, "protocol_state", None)
+            if proto is None:
+                logger.warning(
+                    "Ignoring input chunk for non-streaming request %s",
+                    getattr(getattr(req_data, "req", None), "rid", "?"),
+                )
+                return
+            payload = getattr(chunk, "data", chunk)
+            if not isinstance(payload, dict):
+                logger.warning("Malformed streaming input chunk: %r", payload)
+                return
+            token_ids = [int(t) for t in (payload.get("token_ids") or [])]
+            done = bool(payload.get("done", False))
+            proto.append_text(token_ids, done=done)
+            _maybe_resume(req_data)
+
+        def _on_input_done(req_data: Any) -> None:
+            proto = getattr(req_data, "protocol_state", None)
+            if proto is None:
+                return
+            proto.append_text([], done=True)
+            _maybe_resume(req_data)
+
+        scheduler._stream_chunk_handler = _on_input_chunk
+        scheduler._stream_done_handler = _on_input_done

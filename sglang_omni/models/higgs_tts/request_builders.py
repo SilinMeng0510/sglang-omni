@@ -43,6 +43,14 @@ class HiggsSGLangRequestData(SGLangARRequestData):
     protocol_state: StreamingProtocolState | None = None
     # plan for the NEXT decode step, produced by the current step's collect
     streaming_plan: StepPlan | None = None
+    # incremental input ran dry: the scheduler parks this request out of
+    # decode scheduling until the input-chunk handler resumes it
+    input_starved: bool = False
+    # frozen-row watchdog (streaming protocol): the model's known runaway
+    # mode cycles endlessly through a handful of near-silence codec rows
+    # instead of reaching EOC
+    watchdog_recent_rows: list[tuple[int, ...]] = field(default_factory=list)
+    watchdog_repeat_rows: int = 0
 
 
 class _ResettableHiggsModel(Protocol):
@@ -96,6 +104,7 @@ def _build_protocol_state(state: HiggsTtsState) -> StreamingProtocolState:
     return StreamingProtocolState(
         cfg=cfg,
         inject_text_ids=[int(t) for t in (state.inject_text_ids or [])],
+        text_done=not state.streaming_incremental,
     )
 
 
@@ -129,13 +138,24 @@ def build_sglang_higgs_request(
     # vocab_size = backbone text vocab so cb0 rides sglang's standard sampler path.
     # extra_key namespaces the radix cache per ref-audio fingerprint so prompts
     # sharing the -100 placeholder prefix can never cross-contaminate KV.
+    #
+    # Incremental-streaming requests get a PRIVATE namespace (fingerprint +
+    # request id): their starve/hold/resume path radix-matches THROUGH decoded
+    # audio-row positions, whose radix keys carry only codebook-0 of the 8
+    # sampled codebooks — in a shared subtree a cb0 coincidence with another
+    # request's cached rows would silently splice in that request's KV
+    # (cb1..7 differ) and derail the stream. A private subtree can only ever
+    # match the request's own exact path.
+    extra_key = _ref_audio_fingerprint(state.reference_codes_delayed)
+    if state.streaming_incremental:
+        extra_key = f"{extra_key or 'zero-shot'}:{request_id}"
     req = Req(
         rid=request_id,
         origin_input_text="",
         origin_input_ids=input_ids_list,
         sampling_params=sampling_params,
         vocab_size=151_936,
-        extra_key=_ref_audio_fingerprint(state.reference_codes_delayed),
+        extra_key=extra_key,
         lora_id=state.lora_id,
     )
     # V1's prefill manager probes these attrs; absence triggers AttributeError.

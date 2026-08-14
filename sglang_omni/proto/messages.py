@@ -231,6 +231,40 @@ class SubmitMessage:
 
 
 @dataclass
+class InputChunkMessage:
+    """Incremental INPUT for an already-running request (API -> stage).
+
+    Carries small JSON-serializable data (e.g. streaming-TTS text token ids)
+    over the control plane directly — no relay/SHM involvement. The stage
+    routes it into the scheduler inbox as a ``stream_chunk`` /
+    ``stream_done`` incoming message for the target request.
+    """
+
+    request_id: str
+    to_stage: str
+    data: Any = None
+    is_done: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "input_chunk",
+            "request_id": self.request_id,
+            "to_stage": self.to_stage,
+            "data": self.data,
+            "is_done": self.is_done,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "InputChunkMessage":
+        return cls(
+            request_id=d["request_id"],
+            to_stage=d["to_stage"],
+            data=d.get("data"),
+            is_done=d.get("is_done", False),
+        )
+
+
+@dataclass
 class ShutdownMessage:
     """Signal graceful shutdown to a stage."""
 
@@ -325,11 +359,14 @@ def parse_message(
     | ShutdownMessage
     | ProfilerStartMessage
     | ProfilerStopMessage
+    | InputChunkMessage
 ):
     """Parse a dict into the appropriate message type."""
     msg_type = d.get("type")
     if msg_type == "data_ready":
         return DataReadyMessage.from_dict(d)
+    elif msg_type == "input_chunk":
+        return InputChunkMessage.from_dict(d)
     elif msg_type == "abort":
         return AbortMessage.from_dict(d)
     elif msg_type == "complete":

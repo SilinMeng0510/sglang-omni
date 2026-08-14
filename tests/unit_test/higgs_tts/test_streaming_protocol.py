@@ -183,9 +183,10 @@ def _machine_trace(
         plan = state.on_step_output(decision)
         # invariants: a step whose output is an audio row must advance the
         # sampler; every other step must freeze it. Text-space inputs must
-        # carry a token id.
+        # carry a token id (starved plans carry none by definition).
         assert plan.audio_advance == (plan.role is StepRole.AUDIO)
-        assert (plan.input_token_id is not None) == plan.input_is_text
+        if not plan.starved:
+            assert (plan.input_token_id is not None) == plan.input_is_text
         if generation_done or eoc_abort or plan.hard_stop:
             break
     else:  # pragma: no cover
@@ -271,6 +272,125 @@ def test_stats_counters():
     assert state.opening_waits == 2
     assert state.mid_waits == 1
     assert state.blocks >= 2
+
+
+def _machine_trace_incremental(
+    text_ids: list[int],
+    decisions: list[bool],
+    *,
+    eoc_row: int | None,
+    cfg: StreamingProtocolConfig,
+    feed_chunks: list[list[int]],
+) -> tuple[list, int]:
+    """Drive the machine with an initially-open queue fed chunk by chunk;
+    every starvation consumes the next chunk (the last one closes the queue).
+    """
+    state = StreamingProtocolState(
+        cfg=cfg, inject_text_ids=list(text_ids[1:]), text_done=False
+    )
+    state.trace.append(("inject", text_ids[0]))
+    decisions = iter(decisions)
+    chunks = iter(feed_chunks)
+    rows = 0
+    generation_done = False
+    eoc_abort = False
+    winddown_left: int | None = None
+    starvations = 0
+    for _ in range(100_000):
+        role = state.role
+        decision = None
+        if role is StepRole.DECISION:
+            decision = next(decisions)
+        elif role is StepRole.AUDIO:
+            row_idx = rows
+            rows += 1
+            if winddown_left is not None:
+                winddown_left -= 1
+                if winddown_left <= 0:
+                    generation_done = True
+            elif eoc_row is not None and row_idx == eoc_row:
+                if state.in_tail_flush:
+                    winddown_left = WINDDOWN
+                else:
+                    eoc_abort = True
+        plan = state.on_step_output(decision)
+        while plan.starved:
+            starvations += 1
+            try:
+                chunk = next(chunks)
+            except StopIteration:
+                state.append_text([], done=True)
+            else:
+                is_last = False
+                try:
+                    peek = next(chunks)
+                    chunks = iter([peek, *chunks])
+                except StopIteration:
+                    is_last = True
+                    chunks = iter([])
+                state.append_text(chunk, done=is_last)
+            plan = state.resume_plan()
+        if generation_done or eoc_abort or plan.hard_stop:
+            break
+    else:  # pragma: no cover
+        raise AssertionError("machine did not terminate")
+    assert starvations > 0, "incremental scenario never starved"
+    if eoc_row is not None and rows > eoc_row:
+        state._flush_audio_trace()
+        state.trace.append(("eoc",))
+    return state.finalize_trace(), rows
+
+
+def test_incremental_feed_matches_full_text_trace():
+    """Starvation + append/resume must produce the same protocol trace as
+    handing the machine the full text upfront."""
+    cfg = _cfg()
+    decisions = [False, True] + [True] * 80
+    full_trace, full_rows, _ = _machine_trace(
+        TEXT, list(decisions), eoc_row=70, cfg=cfg
+    )
+    # start with ONLY T0 available; feed the rest in small chunks on demand
+    rest = TEXT[1:]
+    inc_trace, inc_rows = _machine_trace_incremental(
+        [TEXT[0]],
+        list(decisions),
+        eoc_row=70,
+        cfg=cfg,
+        feed_chunks=[rest[i : i + 2] for i in range(0, len(rest), 2)],
+    )
+    assert inc_trace == full_trace
+    assert inc_rows == full_rows
+
+
+def test_starved_plan_freezes_state():
+    cfg = _cfg()
+    state = StreamingProtocolState(cfg=cfg, inject_text_ids=[], text_done=False)
+    # opening decision: wait -> WAIT_FEED needs a token -> starves
+    state.on_step_output(False)  # DECISION(wait) -> WAIT_FEED plan
+    plan = state.on_step_output(None)  # WAIT_FEED output discarded -> feed
+    assert plan.starved and plan.role is StepRole.WAIT_FEED
+    before = (state.text_pos, state.role, state.opening_waits)
+    plan2 = state.resume_plan()  # still empty: starves again, no state change
+    assert plan2.starved
+    assert (state.text_pos, state.role, state.opening_waits) == before
+    state.append_text([1234])
+    plan3 = state.resume_plan()
+    assert not plan3.starved
+    assert plan3.input_token_id == 1234
+    assert state.role is StepRole.DECISION
+
+
+def test_closed_empty_queue_sends_text_end_not_starved():
+    cfg = _cfg()
+    state = StreamingProtocolState(cfg=cfg, inject_text_ids=[], text_done=False)
+    state.on_step_output(False)
+    plan = state.on_step_output(None)
+    assert plan.starved
+    state.append_text([], done=True)
+    plan = state.resume_plan()
+    assert not plan.starved
+    assert plan.input_token_id == TEXT_END_ID
+    assert state.text_end_sent
 
 
 if __name__ == "__main__":

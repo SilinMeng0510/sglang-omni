@@ -26,6 +26,11 @@ from sglang_omni.scheduling.messages import OutgoingMessage
 
 logger = logging.getLogger(__name__)
 
+# Streaming-protocol frozen-row watchdog: 63 rows = 2.52 s at 25 Hz; a row
+# "repeats" when it matches any of the last _WATCHDOG_RECENT_ROWS rows seen.
+_WATCHDOG_FROZEN_ROWS = 63
+_WATCHDOG_RECENT_ROWS = 8
+
 
 class HiggsTTSModelRunner(ModelRunner):
     """ModelRunner for :class:`HiggsTTSModel`."""
@@ -305,10 +310,39 @@ class HiggsTTSModelRunner(ModelRunner):
             # delay-pattern winddown; the EOC row itself is kept). Tail
             # blocks finish via the sampler's EOC winddown (gen_done_after).
             eoc_abort = cb0 == EOC_ID and not proto.in_tail_flush
+            # Frozen-row watchdog: the model's known runaway mode cycles
+            # through a handful of near-silence rows forever instead of
+            # reaching EOC. Trip when every row of a 2.5 s stretch repeats
+            # one of the few recently seen rows — real speech constantly
+            # produces novel rows (trained pauses cap at ~1.5 s).
+            row = tuple(codes_N.tolist())
+            recent = data.watchdog_recent_rows
+            if row in recent:
+                data.watchdog_repeat_rows += 1
+            else:
+                data.watchdog_repeat_rows = 0
+                recent.append(row)
+                if len(recent) > _WATCHDOG_RECENT_ROWS:
+                    del recent[0]
+            if data.watchdog_repeat_rows >= _WATCHDOG_FROZEN_ROWS:
+                logger.warning(
+                    "streaming-tts %s: frozen-row watchdog tripped after %d "
+                    "identical rows; force-finishing",
+                    sched_req.request_id,
+                    data.watchdog_repeat_rows,
+                )
+                proto.fuse_tripped = True
+                eoc_abort = True
         elif role is StepRole.DECISION:
             decision = decisions.get(row_idx, False)
         plan = proto.on_step_output(decision)
         data.streaming_plan = plan
+        if plan.starved:
+            # incremental input ran dry at an injection point: publish a
+            # placeholder (overwritten at resume) and ask the scheduler to
+            # park the request until more text arrives.
+            data.input_starved = True
+            return cb0
         done = bool(gen_done_after) or eoc_abort or plan.hard_stop
         data.generation_done = done
         self._mark_sampler_finished(req, done)

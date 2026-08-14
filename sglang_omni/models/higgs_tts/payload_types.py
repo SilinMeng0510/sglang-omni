@@ -42,6 +42,10 @@ class HiggsTtsState(PipelineStateBase):
     # text tokens AFTER the first one (which rides in the prompt).
     streaming_protocol: bool = False
     inject_text_ids: list[int] | None = None
+    # incremental input: the inject queue stays OPEN after build — more
+    # tokens arrive via engine-side append messages; an empty queue stalls
+    # the request instead of injecting <|text_end|>.
+    streaming_incremental: bool = False
     # tokenizer ids the engine-side state machine needs (filled by
     # preprocessing from the checkpoint tokenizer)
     streaming_text_token_id: int | None = None
@@ -98,6 +102,8 @@ class HiggsTtsState(PipelineStateBase):
             data["streaming_text_token_id"] = self.streaming_text_token_id
             data["streaming_audio_token_id"] = self.streaming_audio_token_id
             data["streaming_text_end_token_id"] = self.streaming_text_end_token_id
+            if self.streaming_incremental:
+                data["streaming_incremental"] = True
         for key in ("top_p", "top_k", "seed"):
             value = getattr(self, key)
             if value is not None:
@@ -130,6 +136,7 @@ class HiggsTtsState(PipelineStateBase):
             lora_adapter_path=data.get("lora_adapter_path"),
             streaming_protocol=data.get("streaming_protocol", False),
             inject_text_ids=data.get("inject_text_ids"),
+            streaming_incremental=data.get("streaming_incremental", False),
             streaming_text_token_id=data.get("streaming_text_token_id"),
             streaming_audio_token_id=data.get("streaming_audio_token_id"),
             streaming_text_end_token_id=data.get("streaming_text_end_token_id"),

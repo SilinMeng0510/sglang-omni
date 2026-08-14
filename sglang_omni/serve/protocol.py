@@ -428,6 +428,10 @@ class SpeechStreamSessionConfig(BaseModel):
     speed: float = 1.0
     stream_audio: bool = False
     split_granularity: str = "sentence"
+    # Streaming-TTS model protocol: ONE engine request for the whole session,
+    # incremental text injected token-by-token as input.text arrives (no
+    # sentence batching). Requires a streaming-trained checkpoint.
+    streaming_protocol: bool = False
     task_type: str | None = None
     language: str | None = None
     instructions: str | None = None

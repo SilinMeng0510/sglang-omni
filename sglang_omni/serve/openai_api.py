@@ -212,6 +212,8 @@ def create_app(
     admin_api_key: str | None = None,
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
     architectures: list[str] | None = None,
+    model_path: str | None = None,
+    generation_stage: str | None = None,
 ) -> FastAPI:
     """Create a FastAPI application with OpenAI-compatible endpoints.
 
@@ -270,6 +272,8 @@ def create_app(
     app.state.client = client
     app.state.model_name = model_name or "sglang-omni"
     app.state.architectures = [a for a in (architectures or []) if a]
+    app.state.model_path = model_path
+    app.state.generation_stage = generation_stage
     app.state.realtime_enabled = enable_realtime
     app.state.speaker_sample_store = SpeakerSampleStore()
     app.state.speech_service = SpeechRequestValidator(
@@ -1358,6 +1362,8 @@ def _register_speech_ws(app: FastAPI) -> None:
             websocket,
             client=app.state.client,
             speech_service=app.state.speech_service,
+            model_path=app.state.model_path,
+            generation_stage=app.state.generation_stage,
         )
         await session.run()
 

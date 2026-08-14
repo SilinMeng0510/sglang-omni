@@ -6,6 +6,7 @@ stream chunk routing, abort tracking, profiling.
 
 Dispatches all compute to scheduler (OmniScheduler or SimpleScheduler).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -32,6 +33,7 @@ from sglang_omni.proto import (
     AdminResultMessage,
     CompleteMessage,
     DataReadyMessage,
+    InputChunkMessage,
     ProfilerStartMessage,
     ProfilerStopMessage,
     ShutdownMessage,
@@ -296,6 +298,8 @@ class Stage:
                 await self._on_stream_chunk(msg)
             else:
                 await self._on_data_ready(msg)
+        elif isinstance(msg, InputChunkMessage):
+            self._on_input_chunk(msg)
         elif isinstance(msg, ProfilerStartMessage):
             self._on_profiler_start(msg)
         elif isinstance(msg, ProfilerStopMessage):
@@ -683,6 +687,32 @@ class Stage:
             from_stage=msg.from_stage,
             metadata=metadata or None,
         )
+
+    def _on_input_chunk(self, msg: InputChunkMessage) -> None:
+        """Incremental input for a running request (API -> this stage).
+
+        Small JSON payloads ride the control plane directly; wrap them as a
+        StreamItem so scheduler-side stream_chunk handlers see the same shape
+        as inter-stage chunks.
+        """
+        if msg.request_id in self._aborted:
+            return
+        if msg.data is not None:
+            self.scheduler.inbox.put(
+                IncomingMessage(
+                    request_id=msg.request_id,
+                    type="stream_chunk",
+                    data=StreamItem(
+                        chunk_id=-1,  # client-input chunks are unordered
+                        data=msg.data,
+                        from_stage="__client__",
+                    ),
+                )
+            )
+        if msg.is_done:
+            self.scheduler.inbox.put(
+                IncomingMessage(request_id=msg.request_id, type="stream_done")
+            )
 
     def _route_stream_item(self, request_id: str, item: StreamItem) -> None:
         self.scheduler.inbox.put(

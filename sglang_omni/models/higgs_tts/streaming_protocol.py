@@ -65,6 +65,19 @@ class StepPlan:
     # global length fuse: no EOC within max_frames — the caller must finish
     # the request instead of scheduling another step
     hard_stop: bool = False
+    # incremental input: the machine needs the next text token but the queue
+    # is empty and upstream has not finished — the caller must HOLD the
+    # request out of decode scheduling and call ``resume_plan()`` once
+    # tokens were appended (or the queue was closed).
+    starved: bool = False
+
+
+_STARVED_PLAN_TEMPLATE = dict(
+    input_token_id=None,
+    input_is_text=True,
+    audio_advance=False,
+    starved=True,
+)
 
 
 @dataclass
@@ -81,10 +94,17 @@ class StreamingProtocolConfig:
 
 @dataclass
 class StreamingProtocolState:
-    """Host-side protocol state for one streaming request."""
+    """Host-side protocol state for one streaming request.
+
+    ``inject_text_ids`` may grow while the request runs (incremental input
+    via ``append_text``); ``text_done=False`` means the upstream text is
+    still arriving, so an empty queue STARVES the machine instead of
+    injecting ``<|text_end|>``.
+    """
 
     cfg: StreamingProtocolConfig
     inject_text_ids: list[int]
+    text_done: bool = True  # full-text requests: queue is complete at build
 
     text_pos: int = 0
     role: StepRole = StepRole.DECISION  # prefill's last position outputs a decision
@@ -115,18 +135,54 @@ class StreamingProtocolState:
             self.trace.append(("audio", self._trace_audio_run))
             self._trace_audio_run = 0
 
-    def _next_text_token(self) -> int:
-        """Pop the next queued text token, or <|text_end|> when exhausted."""
+    def append_text(self, token_ids: list[int], *, done: bool = False) -> None:
+        """Incremental input: extend the inject queue / close it."""
+        self.inject_text_ids.extend(int(t) for t in token_ids)
+        if done:
+            self.text_done = True
+
+    @property
+    def queue_empty(self) -> bool:
+        return self.text_pos >= len(self.inject_text_ids)
+
+    def _next_text_token(self) -> int | None:
+        """Pop the next queued text token, <|text_end|> when the closed queue
+        is exhausted, or ``None`` (starved) when an open queue is empty."""
         if self.text_pos < len(self.inject_text_ids):
             token = self.inject_text_ids[self.text_pos]
             self.text_pos += 1
             self._flush_audio_trace()
             self.trace.append(("inject", token))
             return token
+        if not self.text_done:
+            return None
         self.text_end_sent = True
         self._flush_audio_trace()
         self.trace.append(("text_end",))
         return self.cfg.text_end_token_id
+
+    def _feed_plan(self) -> StepPlan:
+        """Plan the injection step that follows WAIT_FEED / BLOCK_END.
+
+        Starves (role unchanged, no state consumed) when the open queue is
+        empty; ``resume_plan`` retries after tokens arrive.
+        """
+        token = self._next_text_token()
+        if token is None:
+            return StepPlan(role=self.role, **_STARVED_PLAN_TEMPLATE)
+        plan = StepPlan(
+            input_token_id=token,
+            input_is_text=True,
+            audio_advance=False,
+            role=StepRole.DECISION,
+        )
+        self.role = plan.role
+        return plan
+
+    def resume_plan(self) -> StepPlan:
+        """Re-plan after starvation once tokens were appended (or the queue
+        was closed). Only valid when the previous plan had ``starved=True``."""
+        return self._feed_plan()
 
     def _open_audio_block(self) -> StepPlan:
         """Publish <|audio|>; the next step samples the block's first row."""
@@ -184,13 +240,7 @@ class StreamingProtocolState:
                         role=StepRole.WAIT_FEED,
                     )
         elif role is StepRole.WAIT_FEED:
-            token = self._next_text_token()
-            plan = StepPlan(
-                input_token_id=token,
-                input_is_text=True,
-                audio_advance=False,
-                role=StepRole.DECISION,
-            )
+            plan = self._feed_plan()
         elif role is StepRole.AUDIO:
             self.rows_emitted += 1
             self._trace_audio_run += 1
@@ -223,13 +273,7 @@ class StreamingProtocolState:
                     role=StepRole.BLOCK_END,
                 )
         elif role is StepRole.BLOCK_END:
-            token = self._next_text_token()
-            plan = StepPlan(
-                input_token_id=token,
-                input_is_text=True,
-                audio_advance=False,
-                role=StepRole.DECISION,
-            )
+            plan = self._feed_plan()
         else:  # pragma: no cover - exhaustive enum
             raise AssertionError(f"unhandled role: {role}")
 
