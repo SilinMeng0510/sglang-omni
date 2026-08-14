@@ -19,6 +19,7 @@ from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.higgs_tts.model import _flat_sampling_attr
 from sglang_omni.models.higgs_tts.sampler import K_MAX, selected_token_logprobs
+from sglang_omni.models.higgs_tts.streaming_protocol import StepRole
 from sglang_omni.models.higgs_tts.text_tokenizer import AUDIO_PLACEHOLDER_ID
 from sglang_omni.models.higgs_tts.utils import EOC_ID
 from sglang_omni.scheduling.messages import OutgoingMessage
@@ -61,6 +62,10 @@ class HiggsTTSModelRunner(ModelRunner):
         for req in requests:
             self.model.set_request_seed(
                 req.request_id, req.data.req.sampling_params.sampling_seed
+            )
+            self.model.set_request_streaming(
+                req.request_id,
+                getattr(req.data, "protocol_state", None) is not None,
             )
         forward_batch.input_embeds = self._build_prefill_input_embeds(
             forward_batch, requests
@@ -214,6 +219,124 @@ class HiggsTTSModelRunner(ModelRunner):
         model._cg_active_seeds[:bs] = pool.seeds[rows_t]
         model._cg_active_step_count[:bs] = pool.step_count[rows_t]
 
+        # Streaming-protocol per-step masks. Offline rows / padding keep the
+        # defaults (force_text=False, audio_advance=True) so their path is
+        # unchanged.
+        force_text = [False] * bs
+        audio_advance = [True] * bs
+        for b, sched_req in enumerate(requests):
+            plan = getattr(sched_req.data, "streaming_plan", None)
+            if plan is not None:
+                force_text[b] = bool(plan.input_is_text)
+                audio_advance[b] = bool(plan.audio_advance)
+        model._cg_active_force_text[:bs] = torch.tensor(
+            force_text, dtype=torch.bool, device=model._cg_active_force_text.device
+        )
+        model._cg_active_audio_advance[:bs] = torch.tensor(
+            audio_advance,
+            dtype=torch.bool,
+            device=model._cg_active_audio_advance.device,
+        )
+
+    def lookahead_eligible(self, batch: Any) -> bool:
+        """Streaming-protocol requests must decode synchronously: the next
+        step's input token is decided by the host-side state machine during
+        collect, but the async launch publishes next_token_ids from GPU codes
+        before resolve runs — a one-step-stale text injection.
+        """
+        streaming_rids = self.model._streaming_rids
+        if streaming_rids and any(
+            getattr(req, "rid", None) in streaming_rids for req in batch.reqs
+        ):
+            return False
+        return super().lookahead_eligible(batch)
+
+    def _streaming_decisions_cpu(self, result: Any, requests: list) -> dict[int, bool]:
+        """Constrained text-head decisions ({<|text|>, <|audio|>} greedy) for
+        rows whose CURRENT step role is DECISION. Returns {row_idx: is_audio}.
+        """
+        rows: list[int] = []
+        token_ids: tuple[int, int] | None = None
+        for b, sched_req in enumerate(requests):
+            data = sched_req.data
+            proto = getattr(data, "protocol_state", None)
+            if proto is None or data.req.finished():
+                continue
+            if proto.role is StepRole.DECISION:
+                rows.append(b)
+                token_ids = (proto.cfg.text_token_id, proto.cfg.audio_token_id)
+        if not rows or token_ids is None:
+            return {}
+        hidden = result.logits_output.hidden_states
+        if hidden.ndim == 3:
+            hidden = hidden[:, -1, :]
+        sel = hidden[torch.tensor(rows, dtype=torch.long, device=hidden.device)]
+        is_audio = self.model.decision_token_is_audio(
+            sel, text_token_id=token_ids[0], audio_token_id=token_ids[1]
+        )
+        return dict(zip(rows, (bool(v) for v in is_audio.cpu().tolist())))
+
+    def _advance_streaming_request(
+        self,
+        sched_req: Any,
+        decisions: dict[int, bool],
+        row_idx: int,
+        codes_N: torch.Tensor | None,
+        gen_done_after: bool,
+    ) -> int:
+        """Consume THIS step's output for one streaming request, advance the
+        protocol machine, and return the token id to publish as the next
+        step's input (text-space token or codebook-0 of the last audio row).
+        """
+        data = sched_req.data
+        proto = data.protocol_state
+        req = data.req
+        role = proto.role
+        cb0 = 0
+        decision: bool | None = None
+        eoc_abort = False
+        if role is StepRole.AUDIO:
+            assert codes_N is not None
+            data.output_codes.append(codes_N)
+            self._emit_code_chunk(sched_req, codes_N)
+            cb0 = int(codes_N[0].item())
+            # Reference behavior: a cb0 EOC inside a NON-tail block is
+            # off-distribution and stops the stream immediately (no
+            # delay-pattern winddown; the EOC row itself is kept). Tail
+            # blocks finish via the sampler's EOC winddown (gen_done_after).
+            eoc_abort = cb0 == EOC_ID and not proto.in_tail_flush
+        elif role is StepRole.DECISION:
+            decision = decisions.get(row_idx, False)
+        plan = proto.on_step_output(decision)
+        data.streaming_plan = plan
+        done = bool(gen_done_after) or eoc_abort or plan.hard_stop
+        data.generation_done = done
+        self._mark_sampler_finished(req, done)
+        if done:
+            trace = proto.finalize_trace()
+            logger.info(
+                "streaming-tts %s finished: rows=%d blocks=%d opening_waits=%d "
+                "mid_waits=%d text_pos=%d/%d text_end_sent=%s fuse=%s "
+                "eoc_abort=%s hard_stop=%s trace_head=%s trace_tail=%s",
+                sched_req.request_id,
+                proto.rows_emitted,
+                proto.blocks,
+                proto.opening_waits,
+                proto.mid_waits,
+                proto.text_pos,
+                len(proto.inject_text_ids),
+                proto.text_end_sent,
+                proto.fuse_tripped,
+                eoc_abort,
+                plan.hard_stop,
+                trace[:30],
+                trace[-15:],
+            )
+            return cb0
+        if plan.input_is_text and plan.input_token_id is not None:
+            return int(plan.input_token_id)
+        return cb0
+
     @staticmethod
     def _extract_decode_sampling_params(forward_batch, n_real: int):
         """Pull per-row temperature / top_p / top_k off sglang's
@@ -317,6 +440,14 @@ class HiggsTTSModelRunner(ModelRunner):
         codes_BN_cpu = combined_cpu[:, :num_codebooks]
         was_done_cpu = combined_cpu[:, num_codebooks].bool().tolist()
         gen_done_after_cpu = combined_cpu[:, num_codebooks + 1].bool().tolist()
+        streaming_decisions = (
+            self._streaming_decisions_cpu(result, requests)
+            if any(
+                getattr(req.data, "protocol_state", None) is not None
+                for req in requests
+            )
+            else {}
+        )
         cb0_per_row: list[int] = []
         for b, sched_req in enumerate(requests):
             data = sched_req.data
@@ -335,6 +466,18 @@ class HiggsTTSModelRunner(ModelRunner):
                 continue
             if was_done_cpu[b]:
                 cb0_per_row.append(0)
+                continue
+            if getattr(data, "protocol_state", None) is not None:
+                codes_N = codes_BN_cpu[b].to(torch.long).clone()
+                cb0_per_row.append(
+                    self._advance_streaming_request(
+                        sched_req,
+                        streaming_decisions,
+                        b,
+                        codes_N,
+                        bool(gen_done_after_cpu[b]),
+                    )
+                )
                 continue
             codes_N = codes_BN_cpu[b].to(torch.long).clone()
             data.output_codes.append(codes_N)
@@ -411,11 +554,31 @@ class HiggsTTSModelRunner(ModelRunner):
         logprobs_BN = None
         if self._should_capture_rollout_logprobs(requests):
             logprobs_BN = self._prefill_step_logprobs(result, requests, forward_batch)
+        streaming_decisions = (
+            self._streaming_decisions_cpu(result, requests)
+            if any(
+                getattr(req.data, "protocol_state", None) is not None
+                for req in requests
+            )
+            else {}
+        )
         cb0_per_row: list[int] = []
         for b, sched_req in enumerate(requests):
             data = sched_req.data
             req = data.req
             rid = sched_req.request_id
+            if getattr(data, "protocol_state", None) is not None:
+                # Streaming protocol: the prompt's last position (first target
+                # text token) outputs the opening DECISION, not an audio row.
+                if req.is_chunked > 0 or req.finished():
+                    cb0_per_row.append(0)
+                    continue
+                cb0_per_row.append(
+                    self._advance_streaming_request(
+                        sched_req, streaming_decisions, b, None, False
+                    )
+                )
+                continue
             row = model._rid_to_row.get(rid)
             codes_log = model._output_codes.get(rid)
             if req.is_chunked > 0 or row is None or not codes_log or req.finished():

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
@@ -14,6 +15,11 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.rollout_trace import build_omni_rollout_trace
+from sglang_omni.models.higgs_tts.streaming_protocol import (
+    StepPlan,
+    StreamingProtocolConfig,
+    StreamingProtocolState,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
@@ -33,6 +39,10 @@ class HiggsSGLangRequestData(SGLangARRequestData):
     generation_done: bool = False
     engine_start_s: float = 0.0
     stream_metadata: dict[str, Any] | None = None
+    # Streaming-TTS protocol (None = offline <|tts|> request)
+    protocol_state: StreamingProtocolState | None = None
+    # plan for the NEXT decode step, produced by the current step's collect
+    streaming_plan: StepPlan | None = None
 
 
 class _ResettableHiggsModel(Protocol):
@@ -67,9 +77,36 @@ def _ref_audio_fingerprint(codes: list[list[int]] | None) -> str | None:
     return hashlib.blake2b(bytes(buf), digest_size=16).hexdigest()
 
 
+def _build_protocol_state(state: HiggsTtsState) -> StreamingProtocolState:
+    if (
+        state.streaming_text_token_id is None
+        or state.streaming_audio_token_id is None
+        or state.streaming_text_end_token_id is None
+    ):
+        raise ValueError(
+            "streaming_protocol request is missing streaming token ids "
+            "(preprocessing must run against a streaming-trained tokenizer)"
+        )
+    cfg = StreamingProtocolConfig(
+        text_token_id=int(state.streaming_text_token_id),
+        audio_token_id=int(state.streaming_audio_token_id),
+        text_end_token_id=int(state.streaming_text_end_token_id),
+        num_extra_tokens=int(state.num_codebooks) - 1,
+    )
+    return StreamingProtocolState(
+        cfg=cfg,
+        inject_text_ids=[int(t) for t in (state.inject_text_ids or [])],
+    )
+
+
 def build_sglang_higgs_request(
     state: HiggsTtsState, *, request_id: str = ""
 ) -> HiggsSGLangRequestData:
+    if state.streaming_protocol and state.return_omni_rollout:
+        raise ValueError(
+            "streaming_protocol does not support return_omni_rollout/logprob "
+            "capture yet"
+        )
     input_ids_list = list(state.prompt_token_ids)
     input_ids = torch.tensor(input_ids_list, dtype=torch.long)
 
@@ -117,6 +154,9 @@ def build_sglang_higgs_request(
         top_k=int(state.top_k) if state.top_k is not None else -1,
         return_logprob=bool(state.return_logprob),
         return_omni_rollout=bool(state.return_omni_rollout),
+        protocol_state=(
+            _build_protocol_state(state) if state.streaming_protocol else None
+        ),
     )
 
 
@@ -205,6 +245,24 @@ def make_higgs_scheduler_adapters(
     def result_adapter(data: HiggsSGLangRequestData) -> StagePayload:
         payload = data.stage_payload
         state = HiggsTtsState.from_dict(payload.data)
+        proto = data.protocol_state
+        if proto is not None:
+            logging.getLogger(__name__).info(
+                "streaming-tts %s result: rows=%d blocks=%d opening_waits=%d "
+                "mid_waits=%d text_pos=%d/%d text_end_sent=%s fuse=%s "
+                "generation_done=%s output_rows=%d",
+                payload.request_id,
+                proto.rows_emitted,
+                proto.blocks,
+                proto.opening_waits,
+                proto.mid_waits,
+                proto.text_pos,
+                len(proto.inject_text_ids),
+                proto.text_end_sent,
+                proto.fuse_tripped,
+                data.generation_done,
+                len(data.output_codes),
+            )
         apply_higgs_result(state, data)
         if data.engine_start_s:
             state.engine_time_s = _perf_counter() - data.engine_start_s
