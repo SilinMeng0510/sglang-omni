@@ -838,6 +838,13 @@ class OmniScheduler:
         into the radix tree with a lock ref, its req-pool row is released,
         and the request waits in ``_held_input_requests`` until
         ``resume_held_request`` re-admits it as a standard radix-hit extend.
+
+        A starved request whose queue was refilled BEFORE this sweep ran
+        (the input chunk landed in the same loop iteration) is repaired in
+        place instead: the real injected token replaces the placeholder in
+        BOTH ``req.output_ids`` and the batch's ``output_ids`` tensor — the
+        tensor feeds ``prepare_for_decode``'s input_ids, so fixing only the
+        Python list would silently inject the placeholder embed.
         """
         batch = self.running_batch
         reqs = getattr(batch, "reqs", None) if batch is not None else None
@@ -847,11 +854,21 @@ class OmniScheduler:
         for i, req in enumerate(reqs):
             data = getattr(req, "_omni_data", None)
             if (
-                data is not None
-                and getattr(data, "input_starved", False)
-                and not req.finished()
+                data is None
+                or not getattr(data, "input_starved", False)
+                or req.finished()
             ):
-                starved.append(i)
+                continue
+            resume_plan = getattr(data, "protocol_state").resume_plan()
+            if not resume_plan.starved:
+                token = int(resume_plan.input_token_id)
+                req.output_ids[-1] = token
+                if batch.output_ids is not None and i < len(batch.output_ids):
+                    batch.output_ids[i] = token
+                data.streaming_plan = resume_plan
+                data.input_starved = False
+                continue
+            starved.append(i)
         if not starved:
             return
         starved_set = set(starved)
@@ -876,10 +893,11 @@ class OmniScheduler:
         """Re-admit a parked input-starved request (its handler must have
         refreshed ``req.output_ids[-1]`` with the real next input token and
         cleared ``data.input_starved``). Returns False if not held."""
+        if request_id in self._aborted_request_ids:
+            # abort cleanup owns held-request teardown (tree unlock)
+            return False
         req = self._held_input_requests.pop(request_id, None)
         if req is None:
-            return False
-        if request_id in self._aborted_request_ids:
             return False
         logger.info("OmniScheduler: resuming input-starved request %s", request_id)
         with self._request_admission_lock:

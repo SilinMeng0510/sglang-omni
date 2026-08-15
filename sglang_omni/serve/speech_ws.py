@@ -322,17 +322,23 @@ class SpeechWebSocketSession:
             )
             return
         if token_ids or done:
-            delivered = await self.client.append_input(
-                self.streaming_request_id,
-                {"token_ids": token_ids, "done": done},
-                stage=self.generation_stage,
-            )
+            delivered = False
+            for attempt in range(3):
+                delivered = await self.client.append_input(
+                    self.streaming_request_id,
+                    {"token_ids": token_ids, "done": done},
+                    stage=self.generation_stage,
+                )
+                if delivered:
+                    break
+                await asyncio.sleep(0.05)
             if not delivered and not done:
                 logger.warning(
                     "streaming TTS session %s: engine request %s no longer "
-                    "accepts input (finished early?)",
+                    "accepts input (finished early?); %d token(s) dropped",
                     self.session_id,
                     self.streaming_request_id,
+                    len(token_ids),
                 )
 
     async def _start_streaming_generation(
@@ -357,6 +363,17 @@ class SpeechWebSocketSession:
         self.streaming_generation_task = asyncio.create_task(
             self._pump_streaming_audio(gen_req, request_id)
         )
+        # Block until the coordinator has registered the request: appends
+        # sent before registration are dropped (append_input -> False),
+        # which silently loses words from the middle of the utterance.
+        for _ in range(500):
+            if self.streaming_generation_task.done():
+                break  # submission failed; input.done surfaces the error
+            if await self.client.get_status(request_id) is not None:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise internal_error("streaming TTS request was not registered in time")
 
     async def _pump_streaming_audio(self, gen_req: Any, request_id: str) -> int:
         assert self.config is not None

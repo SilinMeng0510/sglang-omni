@@ -173,19 +173,22 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         def _maybe_resume(req_data: Any) -> None:
             if not getattr(req_data, "input_starved", False):
                 return
+            req = req_data.req
+            if req.rid not in scheduler._held_input_requests:
+                # Not parked yet: the chunk landed in the same loop iteration
+                # as the starving step. The pre-batch sweep repairs the
+                # request in place — it owns the batch and can fix the
+                # published-token TENSOR, which this handler cannot.
+                return
             proto = req_data.protocol_state
             plan = proto.resume_plan()
             if plan.starved:
                 return  # queue still empty (data-less done arrives separately)
-            req = req_data.req
             # the starved step published a placeholder; the real injected
             # token replaces it before the request re-enters scheduling
             req.output_ids[-1] = int(plan.input_token_id)
             req_data.streaming_plan = plan
             req_data.input_starved = False
-            # False when the sweep had not parked the request yet (the chunk
-            # arrived in the same loop iteration) — it then simply continues
-            # in the running batch with the corrected published token.
             scheduler.resume_held_request(req.rid)
 
         def _on_input_chunk(req_data: Any, chunk: Any) -> None:
