@@ -1,0 +1,727 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Streaming TTS Lab</title>
+<style>
+  /* 调色板：validated 双模式（深色优先的开发工具） */
+  :root {
+    color-scheme: dark;
+    --bg: #141413;         --surface: #1a1a19;      --raised: #222220;
+    --edge: #33332f;       --edge-soft: #2a2a27;
+    --ink: #ffffff;        --ink-2: #c3c2b7;        --ink-3: #8a897f;
+    --audio: #3987e5;      --token: #d95926;        --stall: #c98500;
+    --ok: #199e70;         --err: #e66767;          --violet: #9085e9;
+    --audio-soft: rgba(57,135,229,.16);
+    --stall-soft: rgba(201,133,0,.14);
+    --focus: rgba(57,135,229,.45);
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      color-scheme: light;
+      --bg: #f4f4f2;       --surface: #fcfcfb;      --raised: #ffffff;
+      --edge: #dddcd6;     --edge-soft: #e8e7e1;
+      --ink: #0b0b0b;      --ink-2: #52514e;        --ink-3: #8a897f;
+      --audio: #2a78d6;    --token: #eb6834;        --stall: #eda100;
+      --ok: #1baf7a;       --err: #e34948;          --violet: #4a3aa7;
+      --audio-soft: rgba(42,120,214,.12);
+      --stall-soft: rgba(237,161,0,.16);
+      --focus: rgba(42,120,214,.35);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Noto Sans CJK SC", sans-serif;
+    min-height: 100vh; padding-bottom: 48px;
+  }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 14px 22px; border-bottom: 1px solid var(--edge);
+    background: var(--surface); position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .2px; }
+  header h1 .accent { color: var(--audio); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink-3); display: inline-block; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .dot.err { background: var(--err); }
+  .spacer { flex: 1; }
+
+  main { max-width: 1240px; margin: 0 auto; padding: 18px 22px; display: grid; gap: 16px; }
+  .cols { display: grid; grid-template-columns: 340px 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 1020px) { .cols { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--edge); border-radius: 14px;
+    padding: 16px 16px 14px;
+  }
+  .card h2 {
+    margin: 0 0 12px; font-size: 13px; font-weight: 700; letter-spacing: .3px;
+    display: flex; align-items: center; gap: 8px; color: var(--ink); flex-wrap: wrap;
+  }
+  .card h2 > span:first-of-type { white-space: nowrap; }
+  .chip {
+    font-size: 11px; font-weight: 500; color: var(--ink-3);
+    border: 1px solid var(--edge); border-radius: 999px; padding: 1px 9px;
+  }
+
+  label { display: block; font-size: 12px; color: var(--ink-2); margin-bottom: 4px; }
+  .field { margin-bottom: 12px; }
+  input[type=text], input[type=number], textarea, select {
+    width: 100%; background: var(--raised); color: var(--ink);
+    border: 1px solid var(--edge); border-radius: 9px; padding: 8px 10px; font: inherit;
+  }
+  textarea { min-height: 96px; resize: vertical; font-size: 13px; }
+  input:focus-visible, textarea:focus-visible, select:focus-visible, button:focus-visible {
+    outline: 2px solid var(--focus); outline-offset: 1px;
+  }
+  .inline { display: flex; gap: 10px; }
+  .inline > .field { flex: 1; }
+  input[type=range] { width: 100%; accent-color: var(--audio); }
+  input[type=checkbox] { accent-color: var(--audio); }
+  .check { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-2); }
+  .check input { margin: 0; }
+
+  .seg { display: flex; border: 1px solid var(--edge); border-radius: 9px; overflow: hidden; }
+  .seg button {
+    flex: 1; background: transparent; color: var(--ink-2); border: 0; padding: 8px 4px;
+    font: inherit; font-size: 12.5px; cursor: pointer;
+  }
+  .seg button.on { background: var(--audio-soft); color: var(--ink); font-weight: 650; }
+  .seg button + button { border-left: 1px solid var(--edge); }
+
+  button.primary {
+    background: var(--audio); color: #fff; border: 0; border-radius: 9px;
+    padding: 10px 16px; font: inherit; font-weight: 700; cursor: pointer; width: 100%;
+  }
+  button.primary:hover { filter: brightness(1.08); }
+  button.primary:disabled { opacity: .4; cursor: not-allowed; }
+  button.ghost {
+    background: transparent; color: var(--ink-2); border: 1px solid var(--edge);
+    border-radius: 8px; padding: 6px 12px; font: inherit; font-size: 12.5px; cursor: pointer;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--ink-3); }
+
+  /* 指标块 */
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 4px 0 10px; }
+  @media (max-width: 700px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+  .stat { background: var(--raised); border: 1px solid var(--edge-soft); border-radius: 11px; padding: 10px 12px; }
+  .stat .k { font-size: 11px; color: var(--ink-3); letter-spacing: .3px; }
+  .stat .v { font-size: 21px; font-weight: 750; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .stat .v small { font-size: 12px; font-weight: 500; color: var(--ink-3); margin-left: 2px; }
+
+  canvas { display: block; width: 100%; border-radius: 10px; }
+  .canvas-wrap { position: relative; background: var(--raised); border: 1px solid var(--edge-soft); border-radius: 10px; }
+  .tip {
+    position: absolute; pointer-events: none; z-index: 3; display: none;
+    background: var(--raised); border: 1px solid var(--edge); border-radius: 8px;
+    padding: 6px 9px; font-size: 12px; color: var(--ink); box-shadow: 0 4px 16px rgba(0,0,0,.35);
+    white-space: nowrap;
+  }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 8px 2px 2px; font-size: 12px; color: var(--ink-2); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+
+  .log {
+    background: var(--raised); border: 1px solid var(--edge-soft); border-radius: 10px;
+    max-height: 180px; overflow-y: auto; padding: 8px 10px; font-size: 11.5px; line-height: 1.7;
+    color: var(--ink-2);
+  }
+  .log .t { color: var(--ink-3); margin-right: 8px; font-variant-numeric: tabular-nums; }
+  .log .tok { color: var(--token); }
+  .log .aud { color: var(--audio); }
+  .log .ok { color: var(--ok); }
+  .log .err { color: var(--err); }
+  .log .warn { color: var(--stall); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--edge-soft); font-variant-numeric: tabular-nums; }
+  th { color: var(--ink-3); font-size: 11px; font-weight: 600; letter-spacing: .4px; }
+  td .mode-tag { font-size: 11px; border-radius: 6px; padding: 1px 7px; border: 1px solid var(--edge); color: var(--ink-2); }
+  tr.best td { color: var(--ink); }
+  td button { padding: 3px 9px; font-size: 11.5px; }
+  .empty { color: var(--ink-3); font-size: 12.5px; padding: 14px 4px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Streaming <span class="accent">TTS</span> Lab</h1>
+  <span class="chip">PR #53 · offline / streaming / incremental</span>
+  <span class="spacer"></span>
+  <label style="margin:0" for="base">服务地址</label>
+  <input type="text" id="base" value="http://127.0.0.1:8111" style="width:230px" />
+  <span class="dot" id="connDot" title="服务状态"></span>
+  <span id="connText" style="font-size:12px;color:var(--ink-3)">未连接</span>
+</header>
+
+<main>
+<div class="cols">
+  <!-- ====================== 左列：配置 + 发起 ====================== -->
+  <div style="display:grid;gap:16px">
+    <div class="card">
+      <h2>音色与采样</h2>
+      <div class="field">
+        <label for="refFile">参考音频（可选 · 留空用服务端默认音色）</label>
+        <input type="file" id="refFile" accept="audio/*" />
+      </div>
+      <div class="field">
+        <label for="refText">参考音频文字（配合参考音频）</label>
+        <input type="text" id="refText" placeholder="reference transcript…" />
+      </div>
+      <div class="inline">
+        <div class="field"><label for="temp">temperature</label><input type="number" id="temp" value="0.8" step="0.05" min="0" max="2" /></div>
+        <div class="field"><label for="topk">top_k</label><input type="number" id="topk" value="50" step="1" min="0" /></div>
+        <div class="field"><label for="seed">seed（空=随机）</label><input type="number" id="seed" placeholder="—" /></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>HTTP 单次请求 <span class="chip">/v1/audio/speech</span></h2>
+      <div class="field">
+        <label>生成协议</label>
+        <div class="seg" id="segProto">
+          <button class="on" data-v="offline">offline</button>
+          <button data-v="streaming">streaming 协议</button>
+        </div>
+      </div>
+      <div class="field check">
+        <input type="checkbox" id="httpStreamOut" checked />
+        <span>流式输出（PCM 分块返回，可测 TTFA）</span>
+      </div>
+      <div class="field">
+        <label for="httpText">文本</label>
+        <textarea id="httpText">The quick brown fox jumps over the lazy dog. Streaming text to speech keeps latency low even for long passages.</textarea>
+      </div>
+      <button class="primary" id="httpRun">▶ 运行 HTTP 请求</button>
+    </div>
+
+    <div class="card">
+      <h2>WebSocket 增量输入 <span class="chip">/v1/audio/speech/stream</span></h2>
+      <div class="field">
+        <label for="wsText">文本（将按词逐个发送，模拟上游 LLM）</label>
+        <textarea id="wsText">Streaming text arrives token by token from the language model, and the speech keeps flowing while it is still being written.</textarea>
+      </div>
+      <div class="field">
+        <label>发送速率 <b id="rateVal" class="mono">8</b> 词/秒</label>
+        <input type="range" id="rate" min="2" max="30" value="8" />
+      </div>
+      <div class="field check">
+        <input type="checkbox" id="stallOn" />
+        <span>中途随机断供（模拟 LLM 卡顿 0.8–2s，触发引擎 hold/resume）</span>
+      </div>
+      <button class="primary" id="wsRun">▶ 运行增量会话</button>
+    </div>
+  </div>
+
+  <!-- ====================== 右列：可视化 ====================== -->
+  <div style="display:grid;gap:16px">
+    <div class="card">
+      <h2>本次运行
+        <span class="chip" id="runLabel">—</span>
+        <span class="spacer" style="flex:1"></span>
+        <button class="ghost" id="btnReplay" disabled>重播</button>
+        <button class="ghost" id="btnStop" disabled>停止</button>
+        <button class="ghost" id="btnSave" disabled>下载 WAV</button>
+      </h2>
+      <div class="stats">
+        <div class="stat"><div class="k">TTFA（首音频）</div><div class="v" id="stTtfa">–</div></div>
+        <div class="stat"><div class="k">总耗时</div><div class="v" id="stTotal">–</div></div>
+        <div class="stat"><div class="k">音频时长</div><div class="v" id="stAudio">–</div></div>
+        <div class="stat"><div class="k">生成速率</div><div class="v" id="stRtf">–</div></div>
+      </div>
+
+      <div class="canvas-wrap" style="margin-bottom:10px">
+        <canvas id="timeline" height="118"></canvas>
+        <div class="tip" id="tlTip"></div>
+      </div>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--token)"></span>文本 token 发送</span>
+        <span><span class="sw" style="background:var(--audio)"></span>音频块到达</span>
+        <span><span class="sw" style="background:var(--stall);opacity:.55"></span>断供区间</span>
+        <span><span class="sw" style="background:var(--violet)"></span>TTFA</span>
+      </div>
+
+      <div class="canvas-wrap" style="margin-top:12px">
+        <canvas id="wave" height="96"></canvas>
+      </div>
+
+      <div style="margin-top:12px">
+        <label style="margin-bottom:6px">事件日志</label>
+        <div class="log mono" id="log"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>历史对比 <span class="chip">同参数下比较三种模式的延迟画像</span>
+        <span class="spacer" style="flex:1"></span>
+        <button class="ghost" id="btnClearHist">清空</button>
+      </h2>
+      <div id="histWrap"><div class="empty">还没有运行记录 — 跑一次任意模式即可。</div></div>
+    </div>
+  </div>
+</div>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const now = () => performance.now() / 1000;
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+// ---------------------------------------------------------------- 服务器状态
+async function pollHealth() {
+  const dot = $("connDot"), txt = $("connText");
+  try {
+    const r = await fetch($("base").value.replace(/\/$/, "") + "/v1/models", { signal: AbortSignal.timeout(2500) });
+    if (r.ok) { dot.className = "dot ok"; txt.textContent = "已连接"; return; }
+    throw 0;
+  } catch { dot.className = "dot err"; txt.textContent = "无法连接"; }
+}
+pollHealth(); setInterval(pollHealth, 5000);
+
+// ---------------------------------------------------------------- 参考音频
+let refB64 = null;
+$("refFile").addEventListener("change", () => {
+  const f = $("refFile").files[0];
+  if (!f) { refB64 = null; return; }
+  const rd = new FileReader();
+  rd.onload = () => { refB64 = rd.result.split(",")[1]; logLine("ok", `参考音频已加载：${f.name}（${(f.size/1024).toFixed(0)} KB）`); };
+  rd.readAsDataURL(f);
+});
+function refPayload() {
+  if (!refB64) return {};
+  const ref = { data: refB64, media_type: "audio/wav" };
+  if ($("refText").value.trim()) ref.text = $("refText").value.trim();
+  return { references: [ref] };
+}
+function samplingPayload() {
+  const p = { temperature: parseFloat($("temp").value) || 0.8, top_k: parseInt($("topk").value) || 50 };
+  if ($("seed").value !== "") p.seed = parseInt($("seed").value);
+  return p;
+}
+
+// ---------------------------------------------------------------- 音频播放（流式 PCM 调度）
+const SR = 24000;
+let actx = null, playHead = 0, playT0 = null;
+function ensureCtx() { if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)(); return actx; }
+let liveSources = [];
+function playPcm(f32) {
+  const ctx = ensureCtx();
+  if (ctx.state === "suspended") ctx.resume();
+  const buf = ctx.createBuffer(1, f32.length, SR);
+  buf.copyToChannel(f32, 0);
+  const src = ctx.createBufferSource();
+  src.buffer = buf; src.connect(ctx.destination);
+  const t = Math.max(ctx.currentTime + 0.06, playHead);
+  src.start(t); playHead = t + buf.duration;
+  if (playT0 === null) playT0 = t;
+  liveSources.push(src);
+  src.onended = () => { liveSources = liveSources.filter(s => s !== src); };
+}
+function stopPlayback() { liveSources.forEach(s => { try { s.stop(); } catch {} }); liveSources = []; playHead = 0; playT0 = null; }
+function i16ToF32(ab) {
+  const i16 = new Int16Array(ab);
+  const f = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f[i] = i16[i] / 32768;
+  return f;
+}
+
+// ---------------------------------------------------------------- 运行状态与事件流
+// run = { mode, t0, events:[{t,type,info}], stalls:[[t0,t1]], samples:Float32[], ttfa, total, done }
+let run = null, history = [], runCounter = 0;
+const MODE_NAMES = { offline: "offline", offstream: "offline+流出", proto: "streaming 协议", protostream: "streaming+流出", ws: "WS 增量" };
+
+function newRun(mode, label) {
+  stopPlayback();
+  run = { id: ++runCounter, mode, t0: now(), events: [], stalls: [], chunks: [], samples: [], sampleCount: 0,
+          ttfa: null, total: null, done: false, err: null };
+  $("runLabel").textContent = label;
+  $("log").innerHTML = "";
+  ["stTtfa","stTotal","stAudio","stRtf"].forEach(id => $(id).textContent = "–");
+  $("btnStop").disabled = false; $("btnReplay").disabled = true; $("btnSave").disabled = true;
+  drawAll();
+}
+function ev(type, info) {
+  if (!run) return;
+  const t = now() - run.t0;
+  run.events.push({ t, type, info });
+  if (type === "audio" && run.ttfa === null) { run.ttfa = t; $("stTtfa").textContent = fmtS(t); }
+  scheduleDraw();
+  return t;
+}
+function pushAudio(ab) {
+  const f32 = i16ToF32(ab);
+  if (!f32.length) return;
+  ev("audio", `${(f32.length / SR).toFixed(2)}s`);
+  run.samples.push(f32); run.sampleCount += f32.length;
+  playPcm(f32);
+  $("stAudio").textContent = fmtS(run.sampleCount / SR);
+  scheduleDraw();
+}
+function finishRun(errMsg) {
+  if (!run || run.done) return;
+  run.done = true; run.err = errMsg || null;
+  run.total = now() - run.t0;
+  $("stTotal").textContent = fmtS(run.total);
+  const audioS = run.sampleCount / SR;
+  if (audioS > 0 && run.total > run.ttfa) {
+    const speed = audioS / (run.total - (run.ttfa ?? 0));
+    $("stRtf").textContent = speed.toFixed(1) + "×"; // 相对实时
+  }
+  $("btnStop").disabled = true;
+  $("btnReplay").disabled = run.sampleCount === 0;
+  $("btnSave").disabled = run.sampleCount === 0;
+  logLine(errMsg ? "err" : "ok", errMsg ? `失败：${errMsg}` : `完成 · 音频 ${fmtS(audioS)} · 总耗时 ${fmtS(run.total)}`);
+  history.unshift({ id: run.id, mode: run.mode, ttfa: run.ttfa, total: run.total, audio: audioS,
+                    err: run.err, samples: run.samples.slice() });
+  if (history.length > 12) history.pop();
+  renderHistory();
+  drawAll();
+}
+function fmtS(s) { return s == null ? "–" : (s >= 10 ? s.toFixed(1) : s.toFixed(2)) + "s"; }
+
+// ---------------------------------------------------------------- 日志
+let logN = 0;
+function logLine(cls, text) {
+  if (logN > 400) return;
+  logN++;
+  const el = $("log");
+  const t = run ? (now() - run.t0).toFixed(2) : "0.00";
+  el.insertAdjacentHTML("beforeend", `<div><span class="t">${t}s</span><span class="${cls}">${text}</span></div>`);
+  el.scrollTop = el.scrollHeight;
+}
+
+// ---------------------------------------------------------------- HTTP 模式
+document.querySelectorAll("#segProto button").forEach(b => b.addEventListener("click", () => {
+  document.querySelectorAll("#segProto button").forEach(x => x.classList.toggle("on", x === b));
+}));
+$("httpRun").addEventListener("click", async () => {
+  const proto = document.querySelector("#segProto .on").dataset.v;
+  const streamOut = $("httpStreamOut").checked;
+  const mode = proto === "offline" ? (streamOut ? "offstream" : "offline") : (streamOut ? "protostream" : "proto");
+  newRun(mode, `HTTP · ${MODE_NAMES[mode]}`);
+  $("httpRun").disabled = true;
+  logN = 0;
+  const body = { input: $("httpText").value, ...samplingPayload(), ...refPayload() };
+  if (proto === "streaming") body.streaming_protocol = true;
+  if (streamOut) { body.stream = true; body.response_format = "pcm"; } else { body.response_format = "wav"; }
+  ev("token", "全文提交"); logLine("tok", `POST /v1/audio/speech（${MODE_NAMES[mode]}，${body.input.length} 字符）`);
+  try {
+    const r = await fetch($("base").value.replace(/\/$/, "") + "/v1/audio/speech", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
+    if (streamOut) {
+      const reader = r.body.getReader();
+      let carry = new Uint8Array(0);
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const buf = new Uint8Array(carry.length + value.length);
+        buf.set(carry); buf.set(value, carry.length);
+        const usable = buf.length - (buf.length % 2);
+        pushAudio(buf.slice(0, usable).buffer);
+        carry = buf.slice(usable);
+      }
+    } else {
+      const ab = await r.arrayBuffer();
+      ev("audio", "整段返回");
+      const ctx = ensureCtx();
+      const decoded = await ctx.decodeAudioData(ab.slice(0));
+      const ch = decoded.getChannelData(0);
+      run.samples.push(Float32Array.from(ch)); run.sampleCount += ch.length;
+      $("stAudio").textContent = fmtS(decoded.duration);
+      playPcm(Float32Array.from(ch));
+    }
+    finishRun();
+  } catch (e) { finishRun(String(e.message || e)); }
+  $("httpRun").disabled = false;
+});
+
+// ---------------------------------------------------------------- WS 增量模式
+let wsAbort = null;
+$("rate").addEventListener("input", () => $("rateVal").textContent = $("rate").value);
+$("wsRun").addEventListener("click", async () => {
+  newRun("ws", "WebSocket · 增量输入");
+  $("wsRun").disabled = true;
+  logN = 0;
+  const base = $("base").value.replace(/\/$/, "").replace(/^http/, "ws");
+  const rate = parseInt($("rate").value);
+  const doStall = $("stallOn").checked;
+  const text = $("wsText").value;
+  let ws;
+  const abort = { on: false };
+  wsAbort = abort;
+  try {
+    ws = await new Promise((res, rej) => {
+      const s = new WebSocket(base + "/v1/audio/speech/stream");
+      s.binaryType = "arraybuffer";
+      s.onopen = () => res(s);
+      s.onerror = () => rej(new Error("WebSocket 连接失败（服务端是否装了 websockets 包？）"));
+    });
+  } catch (e) { finishRun(e.message); $("wsRun").disabled = false; return; }
+
+  const doneP = new Promise(resolve => {
+    ws.onmessage = m => {
+      if (m.data instanceof ArrayBuffer) { pushAudio(m.data); return; }
+      const evt = JSON.parse(m.data);
+      if (evt.type === "session.configured") logLine("ok", "session.configured");
+      else if (evt.type === "audio.start") logLine("aud", `audio.start（${evt.sample_rate} Hz）`);
+      else if (evt.type === "session.done") { logLine("ok", "session.done"); resolve(null); }
+      else if (evt.type === "error") resolve(evt.message || "server error");
+      else logLine("warn", JSON.stringify(evt).slice(0, 120));
+    };
+    ws.onclose = () => resolve(run && run.done ? null : "连接中断");
+  });
+
+  ws.send(JSON.stringify({ type: "session.config", session: {
+    streaming_protocol: true, stream_audio: true, response_format: "pcm",
+    ...samplingPayload(), ...refPayload() } }));
+
+  // 模拟 LLM 逐词喂入；t0 重置为第一个词发出时刻（真实 TTFA 语义）
+  const words = text.trim().split(/\s+/);
+  const stallAt = doStall ? new Set([...Array(Math.max(1, Math.round(words.length / 9)))].map(
+      () => 2 + Math.floor(Math.random() * (words.length - 4)))) : new Set();
+  (async () => {
+    for (let i = 0; i < words.length && !abort.on; i++) {
+      if (stallAt.has(i)) {
+        const dur = 0.8 + Math.random() * 1.2;
+        const s0 = now() - run.t0;
+        logLine("warn", `模拟断供 ${dur.toFixed(1)}s（词 #${i}）`);
+        await sleep(dur * 1000);
+        run.stalls.push([s0, now() - run.t0]);
+        scheduleDraw();
+      }
+      const chunk = (i === 0 ? "" : " ") + words[i];
+      if (i === 0) { run.t0 = now(); run.events.length = 0; }  // TTFA 从第一个 token 起算
+      ws.send(JSON.stringify({ type: "input.text", text: chunk }));
+      ev("token", words[i]);
+      if (i % 5 === 0) logLine("tok", `input.text: “${words[i]}”（#${i + 1}/${words.length}）`);
+      await sleep(1000 / rate);
+    }
+    if (!abort.on) { ws.send(JSON.stringify({ type: "input.done" })); logLine("tok", "input.done"); ev("done", "输入结束"); }
+  })();
+
+  const err = await doneP;
+  try { ws.close(); } catch {}
+  finishRun(err);
+  $("wsRun").disabled = false;
+});
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ---------------------------------------------------------------- 控制按钮
+$("btnStop").addEventListener("click", () => {
+  if (wsAbort) wsAbort.on = true;
+  stopPlayback();
+  finishRun("手动停止");
+});
+$("btnReplay").addEventListener("click", () => { if (run) replaySamples(run.samples); });
+$("btnSave").addEventListener("click", () => { if (run) downloadWav(run.samples, `tts_${run.mode}_${run.id}.wav`); });
+$("btnClearHist").addEventListener("click", () => { history = []; renderHistory(); });
+function replaySamples(chunks) {
+  stopPlayback();
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  const all = new Float32Array(total);
+  let o = 0; chunks.forEach(c => { all.set(c, o); o += c.length; });
+  playPcm(all);
+}
+function downloadWav(chunks, name) {
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  const buf = new ArrayBuffer(44 + total * 2), dv = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, "RIFF"); dv.setUint32(4, 36 + total * 2, true); ws(8, "WAVEfmt ");
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, SR, true); dv.setUint32(28, SR * 2, true); dv.setUint16(32, 2, true);
+  dv.setUint16(34, 16, true); ws(36, "data"); dv.setUint32(40, total * 2, true);
+  let o = 44;
+  chunks.forEach(c => { for (let i = 0; i < c.length; i++) { dv.setInt16(o, Math.max(-1, Math.min(1, c[i])) * 32767, true); o += 2; } });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+  a.download = name; a.click(); URL.revokeObjectURL(a.href);
+}
+
+// ---------------------------------------------------------------- 时间轴（双泳道）
+const tl = $("timeline"), tctx = tl.getContext("2d");
+const wv = $("wave"), wctx = wv.getContext("2d");
+let drawPending = false;
+function scheduleDraw() { if (!drawPending) { drawPending = true; requestAnimationFrame(() => { drawPending = false; drawAll(); }); } }
+function fitCanvas(c, h) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth;
+  if (c.width !== w * dpr || c.height !== h * dpr) { c.width = w * dpr; c.height = h * dpr; }
+  return [w, h, dpr];
+}
+function drawAll() { drawTimeline(); drawWave(); }
+
+function drawTimeline() {
+  const [w, h, dpr] = fitCanvas(tl, 118);
+  tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  tctx.clearRect(0, 0, w, h);
+  const padL = 66, padR = 14, laneTokY = 34, laneAudY = 76, laneH = 16;
+  const inkSoft = css("--ink-3"), edge = css("--edge-soft");
+  tctx.font = "11px ui-sans-serif, system-ui";
+  tctx.fillStyle = inkSoft;
+  tctx.fillText("文本输入", 8, laneTokY + 4);
+  tctx.fillText("音频到达", 8, laneAudY + 4);
+  if (!run || (!run.events.length && !run.stalls.length)) {
+    tctx.fillStyle = inkSoft; tctx.fillText("等待运行…", padL, h / 2);
+    return;
+  }
+  const tEnd = Math.max(0.8, run.done ? run.total : now() - run.t0);
+  const X = t => padL + (t / tEnd) * (w - padL - padR);
+  // 网格（recessive）
+  tctx.strokeStyle = edge; tctx.lineWidth = 1;
+  const step = tEnd > 24 ? 5 : tEnd > 8 ? 2 : 1;
+  for (let s = 0; s <= tEnd; s += step) {
+    tctx.beginPath(); tctx.moveTo(X(s), 14); tctx.lineTo(X(s), h - 16); tctx.stroke();
+    tctx.fillStyle = inkSoft; tctx.fillText(s + "s", X(s) + 3, h - 5);
+  }
+  // 断供区间
+  tctx.fillStyle = css("--stall-soft");
+  run.stalls.forEach(([a, b]) => tctx.fillRect(X(a), 14, Math.max(2, X(b) - X(a)), h - 30));
+  // 事件 ticks
+  const tokC = css("--token"), audC = css("--audio");
+  run.events.forEach(e => {
+    if (e.type === "token") { tctx.fillStyle = tokC; tctx.fillRect(X(e.t) - 1, laneTokY - laneH / 2, 2, laneH); }
+    else if (e.type === "audio") { tctx.fillStyle = audC; tctx.fillRect(X(e.t) - 1, laneAudY - laneH / 2, 2, laneH); }
+    else if (e.type === "done") {
+      tctx.strokeStyle = tokC; tctx.setLineDash([3, 3]);
+      tctx.beginPath(); tctx.moveTo(X(e.t), 14); tctx.lineTo(X(e.t), h - 16); tctx.stroke(); tctx.setLineDash([]);
+    }
+  });
+  // TTFA 竖线
+  if (run.ttfa != null) {
+    const vx = X(run.ttfa);
+    tctx.strokeStyle = css("--violet"); tctx.lineWidth = 2;
+    tctx.beginPath(); tctx.moveTo(vx, 12); tctx.lineTo(vx, h - 16); tctx.stroke();
+    tctx.fillStyle = css("--violet");
+    tctx.fillText("TTFA " + fmtS(run.ttfa), Math.min(vx + 5, w - 86), 20);
+  }
+}
+// 悬浮提示
+tl.addEventListener("mousemove", e => {
+  const tip = $("tlTip");
+  if (!run || !run.events.length) { tip.style.display = "none"; return; }
+  const rect = tl.getBoundingClientRect();
+  const padL = 66, padR = 14;
+  const tEnd = Math.max(0.8, run.done ? run.total : now() - run.t0);
+  const t = ((e.clientX - rect.left - padL) / (rect.width - padL - padR)) * tEnd;
+  let best = null, bd = 1e9;
+  run.events.forEach(ev2 => { const d = Math.abs(ev2.t - t); if (d < bd) { bd = d; best = ev2; } });
+  if (!best || bd > tEnd * 0.03) { tip.style.display = "none"; return; }
+  tip.style.display = "block";
+  tip.style.left = (e.clientX - rect.left + 12) + "px";
+  tip.style.top = (e.clientY - rect.top - 10) + "px";
+  const kind = best.type === "token" ? "文本" : best.type === "audio" ? "音频块" : "事件";
+  tip.textContent = `${best.t.toFixed(2)}s · ${kind}${best.info ? " · " + best.info : ""}`;
+});
+tl.addEventListener("mouseleave", () => $("tlTip").style.display = "none");
+
+// ---------------------------------------------------------------- 波形
+function drawWave() {
+  const [w, h, dpr] = fitCanvas(wv, 96);
+  wctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  wctx.clearRect(0, 0, w, h);
+  if (!run || !run.sampleCount) {
+    wctx.fillStyle = css("--ink-3"); wctx.font = "11px ui-sans-serif, system-ui";
+    wctx.fillText("波形（收到音频后显示）", 10, h / 2);
+    return;
+  }
+  const total = run.sampleCount, per = Math.max(1, Math.floor(total / w));
+  wctx.fillStyle = css("--audio");
+  let ci = 0, off = 0;
+  const sampleAt = i => {
+    while (ci < run.samples.length && i >= off + run.samples[ci].length) { off += run.samples[ci].length; ci++; }
+    return ci < run.samples.length ? run.samples[ci][i - off] : 0;
+  };
+  for (let x = 0; x < w; x++) {
+    let mn = 1, mx = -1;
+    const s0 = x * per, s1 = Math.min(total, s0 + per);
+    for (let i = s0; i < s1; i += Math.max(1, Math.floor(per / 24))) {
+      const v = sampleAt(i); if (v < mn) mn = v; if (v > mx) mx = v;
+    }
+    if (mx < mn) continue;
+    const y0 = h / 2 - mx * (h / 2 - 5), y1 = h / 2 - mn * (h / 2 - 5);
+    wctx.fillRect(x, y0, 1, Math.max(1, y1 - y0));
+  }
+  // 播放头
+  if (actx && playT0 !== null && playHead > playT0) {
+    const p = Math.min(1, (actx.currentTime - playT0) / (total / SR));
+    if (p > 0 && p <= 1) {
+      wctx.fillStyle = css("--violet");
+      wctx.fillRect(p * w - 1, 4, 2, h - 8);
+      requestAnimationFrame(scheduleDraw);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- 历史对比
+function renderHistory() {
+  const wrap = $("histWrap");
+  if (!history.length) { wrap.innerHTML = '<div class="empty">还没有运行记录 — 跑一次任意模式即可。</div>'; return; }
+  const bestTtfa = Math.min(...history.filter(r => r.ttfa != null && !r.err).map(r => r.ttfa));
+  let rows = history.map(r => `
+    <tr class="${r.ttfa === bestTtfa && !r.err ? "best" : ""}">
+      <td>#${r.id}</td>
+      <td><span class="mode-tag">${MODE_NAMES[r.mode] || r.mode}</span></td>
+      <td>${r.err ? `<span style="color:var(--err)">失败</span>` : fmtS(r.ttfa)}${r.ttfa === bestTtfa && !r.err ? " ★" : ""}</td>
+      <td>${fmtS(r.total)}</td>
+      <td>${fmtS(r.audio)}</td>
+      <td>${r.audio && r.total ? (r.audio / r.total).toFixed(1) + "×" : "–"}</td>
+      <td><button class="ghost" onclick="replayHist(${r.id})">播放</button>
+          <button class="ghost" onclick="saveHist(${r.id})">WAV</button></td>
+    </tr>`).join("");
+  wrap.innerHTML = `<table>
+    <thead><tr><th>#</th><th>模式</th><th>TTFA</th><th>总耗时</th><th>音频时长</th><th>音频/耗时</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+window.replayHist = id => { const r = history.find(x => x.id === id); if (r) replaySamples(r.samples); };
+window.saveHist = id => { const r = history.find(x => x.id === id); if (r) downloadWav(r.samples, `tts_${r.mode}_${r.id}.wav`); };
+
+window.addEventListener("resize", scheduleDraw);
+drawAll();
+
+// ---------------------------------------------------------------- 自动化冒烟（?autotest=1，供无头浏览器/CI 使用）
+(async function autotest() {
+  const q = new URLSearchParams(location.search);
+  if (!q.get("autotest")) return;
+  const short = "Hello, this is an automated smoke test.";
+  const wait = async (pred, timeoutS, what) => {
+    const t0 = now();
+    while (!pred()) {
+      if (now() - t0 > timeoutS) throw new Error("timeout waiting for " + what);
+      await sleep(200);
+    }
+  };
+  try {
+    console.log("AUTOTEST start");
+    // 1) HTTP streaming 协议 + 流式输出
+    $("httpText").value = short;
+    document.querySelector('#segProto [data-v="streaming"]').click();
+    $("httpStreamOut").checked = true;
+    $("httpRun").click();
+    await wait(() => run && run.mode === "protostream" && run.done, 120, "http run");
+    if (run.err) throw new Error("http run failed: " + run.err);
+    if (!(run.sampleCount > SR)) throw new Error("http run produced <1s audio");
+    console.log(`AUTOTEST http ok ttfa=${run.ttfa?.toFixed(2)} audio=${(run.sampleCount / SR).toFixed(1)}s`);
+    // 2) WS 增量
+    $("wsText").value = "Incremental websocket smoke test with several words to inject.";
+    $("stallOn").checked = true;
+    $("wsRun").click();
+    await wait(() => run && run.mode === "ws" && run.done, 180, "ws run");
+    if (run.err) throw new Error("ws run failed: " + run.err);
+    if (!(run.sampleCount > SR)) throw new Error("ws run produced <1s audio");
+    console.log(`AUTOTEST ws ok ttfa=${run.ttfa?.toFixed(2)} audio=${(run.sampleCount / SR).toFixed(1)}s stalls=${run.stalls.length}`);
+    console.log("AUTOTEST PASS");
+    document.title = "AUTOTEST PASS";
+  } catch (e) {
+    console.log("AUTOTEST FAIL: " + (e.message || e));
+    document.title = "AUTOTEST FAIL";
+  }
+})();
+</script>
+</body>
+</html>
