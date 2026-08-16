@@ -153,7 +153,7 @@
   <span class="chip">PR #53 · offline / streaming / incremental</span>
   <span class="spacer"></span>
   <label style="margin:0" for="base">服务地址</label>
-  <input type="text" id="base" value="http://127.0.0.1:8111" style="width:230px" />
+  <input type="text" id="base" style="width:230px" />
   <span class="dot" id="connDot" title="服务状态"></span>
   <span id="connText" style="font-size:12px;color:var(--ink-3)">未连接</span>
 </header>
@@ -271,6 +271,14 @@
 const $ = id => document.getElementById(id);
 const now = () => performance.now() / 1000;
 const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+// 默认服务地址跟随页面来源主机：通过机器 IP 打开页面时自动指向同机的 8111，
+// 端口转发（localhost）场景同样正确。?api=… 可覆盖。
+{
+  const q = new URLSearchParams(location.search);
+  const host = location.hostname || "127.0.0.1";
+  $("base").value = q.get("api") || `http://${host}:8111`;
+}
 
 // ---------------------------------------------------------------- 服务器状态
 async function pollHealth() {
