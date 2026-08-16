@@ -1,81 +1,118 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for stable-prefix incremental tokenization."""
+"""Tests for canonical safe-prefix incremental tokenization."""
 
 from __future__ import annotations
 
 import os
 import random
+import re
 
 import pytest
 
-from sglang_omni.serve.incremental_text import (
-    StablePrefixTokenizer,
-    derive_hold_params,
-)
+from sglang_omni.serve.incremental_text import StablePrefixTokenizer
 
 _CKPT_TOKENIZER = os.environ.get(
     "HIGGS_STREAMING_TOKENIZER_JSON",
     "/hot-data/checkpoints/TTS/927fdf6881844516b1682f3134c06c9a/step_08000/tokenizer.json",
 )
 
-
-def _simple_encode(text: str) -> list[int]:
-    """Deterministic fake encoder: one id per character."""
-    return [ord(c) for c in text]
+# fake pre-tokenizer: a piece is [spaces]word, trailing spaces their own piece
+_FAKE_PIECE_RE = re.compile(r"\s*\S+|\s+")
 
 
-def test_holds_back_until_boundary():
-    tok = StablePrefixTokenizer(_simple_encode)
+def _fake_pre_tokenize(text: str) -> list[tuple[int, int]]:
+    return [m.span() for m in _FAKE_PIECE_RE.finditer(text)]
+
+
+def _fake_encode_full(text: str):
+    """One id per character."""
+    return [ord(c) for c in text], [(i, i + 1) for i in range(len(text))]
+
+
+def _make(**kwargs) -> StablePrefixTokenizer:
+    return StablePrefixTokenizer(_fake_encode_full, _fake_pre_tokenize, **kwargs)
+
+
+def test_complete_pieces_release_immediately():
+    # large guard suppresses soft commits: only piece completion releases
+    tok = _make(guard_tokens=100)
     assert tok.push("Hel") == []
     assert tok.push("lo") == []
-    # the space is a boundary: "Hello" is released, " wor" stays buffered
-    released = tok.push(" wor")
-    assert released == _simple_encode("Hello")
+    # the space starts a new piece -> "Hello" is complete and releases
+    assert tok.push(" wor") == [ord(c) for c in "Hello"]
     assert tok.pending_text == " wor"
+    assert tok.released_text == "Hello"
 
 
-def test_space_attaches_forward():
-    tok = StablePrefixTokenizer(_simple_encode)
-    tok.push("Hello wor")
-    # a second space closes " wor" -> " world" pattern
-    released = tok.push("ld again")
-    assert released == _simple_encode(" world")
-    assert tok.pending_text == " again"
-
-
-def test_cjk_punct_boundary_needs_following_char():
-    tok = StablePrefixTokenizer(_simple_encode)
-    assert tok.push("你好。") == []  # trailing punct could extend (e.g. 。。)
-    released = tok.push("再")
-    assert released == _simple_encode("你好。")
-    assert tok.pending_text == "再"
+def test_soft_commit_inside_trailing_piece():
+    tok = _make(guard_tokens=4)
+    # first sight of the piece: no previous tokenization to agree with
+    assert tok.push("abcdefgh") == []
+    # second push: LCP with previous = 8, guard keeps 4 behind the tip of 9
+    assert tok.push("i") == [ord(c) for c in "abcde"]
+    assert tok.pending_text == "fghi"
+    assert tok.released_text == "abcde"
+    # committed chars stay part of the piece and are not re-released
+    assert tok.push("j") == [ord("f")]
+    assert tok.flush() == [ord(c) for c in "ghij"]
+    assert tok.released_text == "abcdefghij"
+    assert tok.pending_text == ""
 
 
 def test_flush_releases_everything():
-    tok = StablePrefixTokenizer(_simple_encode)
+    tok = _make()
     tok.push("no boundary here")
     tail = tok.flush()
-    assert tail == _simple_encode(" here")  # after "no boundary" released at space
+    assert tail == [ord(c) for c in " here"]  # "no boundary" released at spaces
     assert tok.pending_text == ""
     assert tok.flush() == []
 
 
-def test_fallback_cut_on_overlong_unpunctuated_run():
-    tok = StablePrefixTokenizer(_simple_encode, max_hold_chars=8, fallback_hold_chars=2)
-    text = "计算机科学与技术专业"  # 10 chars, no punct
-    released = tok.push(text)
-    assert released == _simple_encode(text[:-2])
-    assert tok.pending_text == text[-2:]
-
-
-def test_released_plus_flush_reconstructs_text():
-    tok = StablePrefixTokenizer(_simple_encode)
-    text = "The quick brown fox. 你好，世界！Jumps over 13 lazy dogs?"
+def test_reconstruction_invariant_under_random_chunking():
+    rng = random.Random(7)
+    text = "The quick brown fox. 你好，世界！Jumps over 13 lazy dogs?  end"
+    tok = _make()
     out: list[int] = []
-    for ch in text:
-        out.extend(tok.push(ch))
+    i = 0
+    while i < len(text):
+        step = rng.randint(1, 5)
+        out.extend(tok.push(text[i : i + step]))
+        i += step
+        assert tok.released_text + tok.pending_text == text[:i]
     out.extend(tok.flush())
-    assert out == _simple_encode(text) or "".join(chr(t) for t in out) == text
+    assert "".join(chr(t) for t in out) == text
+
+
+def test_guard_breach_seals_and_recovers():
+    """An encoder whose early ids flip once the piece grows long must trip
+    the committed-prefix verification, seal, and keep the text lossless."""
+
+    def breach_encode_full(text: str):
+        ids = [ord(c) for c in text]
+        if len(text) >= 10:
+            ids[0] = 9999  # canonical tokenization rewrites the first token
+        return ids, [(i, i + 1) for i in range(len(text))]
+
+    tok = StablePrefixTokenizer(breach_encode_full, _fake_pre_tokenize, guard_tokens=4)
+    tok.push("abcdefgh")
+    released = tok.push("i")  # commits "abcde"
+    assert released == [ord(c) for c in "abcde"]
+    out = tok.push("jk")  # len 11 -> id flip inside the committed prefix
+    assert tok.guard_breaches == 1
+    tail = tok.flush()
+    # committed text was sealed; remainder re-tokenized fresh (len < 10)
+    assert tok.released_text == "abcdefghijk"
+    assert "".join(chr(t) for t in out + tail) == "fghijk"
+
+
+def test_forced_reseal_bounds_buffer_growth():
+    tok = _make(guard_tokens=2, max_buffer_chars=16)
+    for ch in "abcdefghijklmnopqrstuvwxyz":
+        tok.push(ch)
+    assert tok.forced_reseals >= 1
+    assert len(tok.pending_text) <= 16
+    tok.flush()
+    assert tok.released_text == "abcdefghijklmnopqrstuvwxyz"
 
 
 @pytest.mark.skipif(
@@ -83,26 +120,31 @@ def test_released_plus_flush_reconstructs_text():
 )
 class TestWithRealTokenizer:
     @pytest.fixture(scope="class")
-    def encode(self):
+    def raw(self):
         from tokenizers import Tokenizer
 
-        raw = Tokenizer.from_file(_CKPT_TOKENIZER)
+        return Tokenizer.from_file(_CKPT_TOKENIZER)
 
+    @pytest.fixture(scope="class")
+    def make(self, raw):
+        def _factory() -> StablePrefixTokenizer:
+            def encode_full(s: str):
+                enc = raw.encode(s, add_special_tokens=False)
+                return enc.ids, enc.offsets
+
+            def pre_tokenize(s: str):
+                return [span for _, span in raw.pre_tokenizer.pre_tokenize_str(s)]
+
+            return StablePrefixTokenizer(encode_full, pre_tokenize)
+
+        return _factory
+
+    @pytest.fixture(scope="class")
+    def canonical(self, raw):
         def _enc(s: str) -> list[int]:
             return raw.encode(s, add_special_tokens=False).ids
 
         return _enc
-
-    @pytest.fixture(scope="class")
-    def decode(self):
-        from tokenizers import Tokenizer
-
-        raw = Tokenizer.from_file(_CKPT_TOKENIZER)
-
-        def _dec(ids: list[int]) -> str:
-            return raw.decode(ids)
-
-        return _dec
 
     TEXTS = [
         "The quick brown fox jumps over the lazy dog. It keeps latency low "
@@ -110,23 +152,31 @@ class TestWithRealTokenizer:
         "你好，这是一段流式语音合成的测试。导航开始，全程二十公里，预计需要十二分钟。",
         "Mixed 中英 mixed text with numbers 3.14 and abbreviations e.g. NASA! "
         "以及很长的一段没有标点的中文内容测试回退切分逻辑是否可靠",
+        "こんにちは、音声合成のストリーミングテストです。サーバーの遅延を確認します",
+        "internationalization antidisestablishmentarianism "
+        "Donaudampfschifffahrtsgesellschaftskapitän 12345678901234567890",
+        "spaced   out\t\ttabs\n\nand    newlines end",
     ]
 
-    def test_char_by_char_matches_canonical_at_boundaries(self, encode, decode):
+    def test_char_by_char_stream_is_exactly_canonical(self, make, canonical):
         for text in self.TEXTS:
-            tok = StablePrefixTokenizer(encode)
+            tok = make()
             out: list[int] = []
             for ch in text:
                 out.extend(tok.push(ch))
             out.extend(tok.flush())
-            # released stream must decode back to the exact original text
-            assert decode(out) == text
+            # not merely lossless: token-for-token identical to the offline
+            # full-text tokenization (zero distribution shift), and the
+            # empirical guard was never breached
+            assert out == canonical(text), text
+            assert tok.guard_breaches == 0
+            assert tok.forced_reseals == 0
 
-    def test_random_chunking_is_deterministic_and_lossless(self, encode, decode):
+    def test_random_chunking_is_exactly_canonical(self, make, canonical):
         rng = random.Random(0)
         for text in self.TEXTS:
             for _ in range(5):
-                tok = StablePrefixTokenizer(encode)
+                tok = make()
                 out: list[int] = []
                 i = 0
                 while i < len(text):
@@ -134,43 +184,14 @@ class TestWithRealTokenizer:
                     out.extend(tok.push(text[i : i + step]))
                     i += step
                 out.extend(tok.flush())
-                assert decode(out) == text
+                assert out == canonical(text), text
+                assert tok.guard_breaches == 0
 
-    def test_derived_hold_covers_vocab_tokens(self):
-        from tokenizers import Tokenizer
-
-        raw = Tokenizer.from_file(_CKPT_TOKENIZER)
-        hold = derive_hold_params(raw)
-        # the forced-cut holdback must cover the longest letter-bearing
-        # vocab token (CJK tokens reach 7 chars in Qwen3; code-identifier
-        # tokens reach the 40s), and stay within the configured cap
-        assert 7 <= hold.fallback_hold_chars <= 64
-        assert hold.max_hold_chars == hold.fallback_hold_chars * 3
-        # the CJK window is much tighter than the global one
-        assert 2 <= hold.cjk_hold_chars <= hold.fallback_hold_chars
-        # cached: second call returns the same params
-        assert derive_hold_params(raw) == hold
-
-    def test_cjk_continuous_release_before_punctuation(self, encode, decode):
-        """Unpunctuated Chinese must release well before any punctuation
-        arrives, with the vocab-derived CJK holdback — and losslessly."""
-        from tokenizers import Tokenizer
-
-        raw = Tokenizer.from_file(_CKPT_TOKENIZER)
-        hold = derive_hold_params(raw)
-
-        def encode_full(s):
-            enc = raw.encode(s, add_special_tokens=False)
-            return enc.ids, enc.offsets
-
+    def test_unpunctuated_cjk_releases_continuously(self, make, canonical):
+        """A boundary-free CJK run is a single pre-token: only the guard
+        commit path can release it, and it must do so long before the end."""
         text = "人工智能语音合成技术在实时对话场景中的应用越来越广泛而且效果显著"
-        tok = StablePrefixTokenizer(
-            encode,
-            max_hold_chars=hold.max_hold_chars,
-            fallback_hold_chars=hold.fallback_hold_chars,
-            cjk_hold_chars=hold.cjk_hold_chars,
-            encode_full=encode_full,
-        )
+        tok = make()
         out: list[int] = []
         first_release_at = None
         for i, ch in enumerate(text):
@@ -179,23 +200,47 @@ class TestWithRealTokenizer:
                 first_release_at = i
             out.extend(released)
         out.extend(tok.flush())
-        # released long before the end despite zero punctuation
-        assert first_release_at is not None
-        assert first_release_at <= hold.cjk_hold_chars + 3
-        # and the stream is lossless
-        assert decode(out) == text
-        # holdback honored: pending tail stayed short after each release
-        assert tok.pending_text == ""
+        assert first_release_at is not None and first_release_at <= 12
+        assert out == canonical(text)
+        assert tok.guard_breaches == 0
 
-    def test_space_boundary_cuts_are_canonical(self, encode):
-        # pure-Latin text with spaces: incremental must equal full encode
-        text = "Streaming text to speech keeps the time to first audio low"
-        tok = StablePrefixTokenizer(encode)
+    def test_unpunctuated_kana_releases_continuously(self, make, canonical):
+        # kana had no release window under the old vocab-derived scheme;
+        # the pre-tokenizer + guard path must handle it like any script
+        text = "きょうはとてもいいてんきですねさんぽにいきましょうかそれともうちでやすみましょうか"
+        tok = make()
+        out: list[int] = []
+        first_release_at = None
+        for i, ch in enumerate(text):
+            released = tok.push(ch)
+            if released and first_release_at is None:
+                first_release_at = i
+            out.extend(released)
+        out.extend(tok.flush())
+        assert first_release_at is not None and first_release_at <= 14
+        assert out == canonical(text)
+        assert tok.guard_breaches == 0
+
+    def test_emoji_and_multibyte_are_lossless(self, make, raw):
+        # ZWJ emoji split across byte-level tokens: the shared-character
+        # cut check must keep every release on a character boundary
+        text = "family: 👨‍👩‍👧‍👦 flags 🇯🇵🇺🇸 done. 好👍的"
+        tok = make()
         out: list[int] = []
         for ch in text:
             out.extend(tok.push(ch))
         out.extend(tok.flush())
-        assert out == encode(text)
+        assert raw.decode(out) == text
+
+    def test_word_stream_is_exactly_canonical(self, make, canonical):
+        # LLM-style word-sized chunks (the production arrival pattern)
+        text = self.TEXTS[0]
+        tok = make()
+        out: list[int] = []
+        for m in re.finditer(r"\S+\s*", text):
+            out.extend(tok.push(m.group(0)))
+        out.extend(tok.flush())
+        assert out == canonical(text)
 
 
 if __name__ == "__main__":

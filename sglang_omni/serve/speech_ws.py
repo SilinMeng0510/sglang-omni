@@ -23,10 +23,7 @@ from sglang_omni.client.audio import (
     encode_pcm,
     select_audio_delta,
 )
-from sglang_omni.serve.incremental_text import (
-    StablePrefixTokenizer,
-    derive_hold_params,
-)
+from sglang_omni.serve.incremental_text import StablePrefixTokenizer
 from sglang_omni.serve.protocol import CreateSpeechRequest, SpeechStreamSessionConfig
 from sglang_omni.serve.speech_errors import SpeechAPIError, bad_request, internal_error
 from sglang_omni.serve.speech_service import (
@@ -56,8 +53,8 @@ _TOKENIZER_CACHE: dict[str, Any] = {}
 
 
 def _load_cached_tokenizer(path: str) -> Any:
-    """Process-wide tokenizer cache: the vocab scan in derive_hold_params and
-    the tokenizer load itself should run once, not per WebSocket session."""
+    """Process-wide tokenizer cache: the tokenizer load should run once,
+    not per WebSocket session."""
     cached = _TOKENIZER_CACHE.get(path)
     if cached is None:
         from tokenizers import Tokenizer
@@ -253,25 +250,17 @@ class SpeechWebSocketSession:
         checkpoint_dir = resolve_checkpoint(self.model_path)
         raw = _load_cached_tokenizer(os.path.join(checkpoint_dir, "tokenizer.json"))
 
-        def _encode(text: str) -> list[int]:
-            return raw.encode(text, add_special_tokens=False).ids
-
         def _encode_full(text: str):
             enc = raw.encode(text, add_special_tokens=False)
             return enc.ids, enc.offsets
 
-        # holdbacks sized to the model vocab's longest tokens, so a released
-        # token can never be one a later character could have merged into;
-        # the short CJK window enables continuous release inside
-        # unpunctuated Chinese runs instead of waiting for punctuation
-        hold = derive_hold_params(raw)
-        self.stream_tokenizer = StablePrefixTokenizer(
-            _encode,
-            max_hold_chars=hold.max_hold_chars,
-            fallback_hold_chars=hold.fallback_hold_chars,
-            cjk_hold_chars=hold.cjk_hold_chars,
-            encode_full=_encode_full,
-        )
+        def _pre_tokenize(text: str):
+            return [span for _, span in raw.pre_tokenizer.pre_tokenize_str(text)]
+
+        # canonical safe-prefix release: complete pre-tokens are exact, the
+        # trailing pre-token commits behind a small token guard, so the
+        # injected stream matches the offline full-text tokenization
+        self.stream_tokenizer = StablePrefixTokenizer(_encode_full, _pre_tokenize)
         return self.stream_tokenizer
 
     async def _handle_streaming_input_text(self, payload: dict[str, Any]) -> None:
@@ -298,6 +287,15 @@ class SpeechWebSocketSession:
         self.streaming_input_done = True
         tokenizer = self._load_stream_tokenizer()
         released = tokenizer.flush()
+        if tokenizer.guard_breaches or tokenizer.forced_reseals:
+            # non-canonical seams should be ~never; watch this in prod logs
+            logger.warning(
+                "streaming session %s released non-canonical seams: "
+                "guard_breaches=%d forced_reseals=%d",
+                self.session_id,
+                tokenizer.guard_breaches,
+                tokenizer.forced_reseals,
+            )
         await self._dispatch_released_tokens(released, done=True)
         total_bytes = 0
         failed = False
