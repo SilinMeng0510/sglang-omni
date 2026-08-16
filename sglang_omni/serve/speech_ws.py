@@ -23,7 +23,10 @@ from sglang_omni.client.audio import (
     encode_pcm,
     select_audio_delta,
 )
-from sglang_omni.serve.incremental_text import StablePrefixTokenizer
+from sglang_omni.serve.incremental_text import (
+    StablePrefixTokenizer,
+    derive_hold_params,
+)
 from sglang_omni.serve.protocol import CreateSpeechRequest, SpeechStreamSessionConfig
 from sglang_omni.serve.speech_errors import SpeechAPIError, bad_request, internal_error
 from sglang_omni.serve.speech_service import (
@@ -47,6 +50,21 @@ MAX_BUFFERED_RECEIVE_BYTES_DURING_GENERATION = (
 SENTENCE_BOUNDARIES = frozenset(".!?。！？")
 CLAUSE_BOUNDARIES = frozenset(".!?。！？,，;；")
 SUPPORTED_SPLIT_GRANULARITIES = frozenset({"sentence", "clause"})
+
+
+_TOKENIZER_CACHE: dict[str, Any] = {}
+
+
+def _load_cached_tokenizer(path: str) -> Any:
+    """Process-wide tokenizer cache: the vocab scan in derive_hold_params and
+    the tokenizer load itself should run once, not per WebSocket session."""
+    cached = _TOKENIZER_CACHE.get(path)
+    if cached is None:
+        from tokenizers import Tokenizer
+
+        cached = Tokenizer.from_file(path)
+        _TOKENIZER_CACHE[path] = cached
+    return cached
 
 
 def new_speech_ws_id(prefix: str) -> str:
@@ -230,17 +248,30 @@ class SpeechWebSocketSession:
             )
         import os
 
-        from tokenizers import Tokenizer
-
         from sglang_omni.utils.checkpoint import resolve_checkpoint
 
         checkpoint_dir = resolve_checkpoint(self.model_path)
-        raw = Tokenizer.from_file(os.path.join(checkpoint_dir, "tokenizer.json"))
+        raw = _load_cached_tokenizer(os.path.join(checkpoint_dir, "tokenizer.json"))
 
         def _encode(text: str) -> list[int]:
             return raw.encode(text, add_special_tokens=False).ids
 
-        self.stream_tokenizer = StablePrefixTokenizer(_encode)
+        def _encode_full(text: str):
+            enc = raw.encode(text, add_special_tokens=False)
+            return enc.ids, enc.offsets
+
+        # holdbacks sized to the model vocab's longest tokens, so a released
+        # token can never be one a later character could have merged into;
+        # the short CJK window enables continuous release inside
+        # unpunctuated Chinese runs instead of waiting for punctuation
+        hold = derive_hold_params(raw)
+        self.stream_tokenizer = StablePrefixTokenizer(
+            _encode,
+            max_hold_chars=hold.max_hold_chars,
+            fallback_hold_chars=hold.fallback_hold_chars,
+            cjk_hold_chars=hold.cjk_hold_chars,
+            encode_full=_encode_full,
+        )
         return self.stream_tokenizer
 
     async def _handle_streaming_input_text(self, payload: dict[str, Any]) -> None:

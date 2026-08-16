@@ -8,7 +8,10 @@ import random
 
 import pytest
 
-from sglang_omni.serve.incremental_text import StablePrefixTokenizer
+from sglang_omni.serve.incremental_text import (
+    StablePrefixTokenizer,
+    derive_hold_params,
+)
 
 _CKPT_TOKENIZER = os.environ.get(
     "HIGGS_STREAMING_TOKENIZER_JSON",
@@ -132,6 +135,57 @@ class TestWithRealTokenizer:
                     i += step
                 out.extend(tok.flush())
                 assert decode(out) == text
+
+    def test_derived_hold_covers_vocab_tokens(self):
+        from tokenizers import Tokenizer
+
+        raw = Tokenizer.from_file(_CKPT_TOKENIZER)
+        hold = derive_hold_params(raw)
+        # the forced-cut holdback must cover the longest letter-bearing
+        # vocab token (CJK tokens reach 7 chars in Qwen3; code-identifier
+        # tokens reach the 40s), and stay within the configured cap
+        assert 7 <= hold.fallback_hold_chars <= 64
+        assert hold.max_hold_chars == hold.fallback_hold_chars * 3
+        # the CJK window is much tighter than the global one
+        assert 2 <= hold.cjk_hold_chars <= hold.fallback_hold_chars
+        # cached: second call returns the same params
+        assert derive_hold_params(raw) == hold
+
+    def test_cjk_continuous_release_before_punctuation(self, encode, decode):
+        """Unpunctuated Chinese must release well before any punctuation
+        arrives, with the vocab-derived CJK holdback — and losslessly."""
+        from tokenizers import Tokenizer
+
+        raw = Tokenizer.from_file(_CKPT_TOKENIZER)
+        hold = derive_hold_params(raw)
+
+        def encode_full(s):
+            enc = raw.encode(s, add_special_tokens=False)
+            return enc.ids, enc.offsets
+
+        text = "人工智能语音合成技术在实时对话场景中的应用越来越广泛而且效果显著"
+        tok = StablePrefixTokenizer(
+            encode,
+            max_hold_chars=hold.max_hold_chars,
+            fallback_hold_chars=hold.fallback_hold_chars,
+            cjk_hold_chars=hold.cjk_hold_chars,
+            encode_full=encode_full,
+        )
+        out: list[int] = []
+        first_release_at = None
+        for i, ch in enumerate(text):
+            released = tok.push(ch)
+            if released and first_release_at is None:
+                first_release_at = i
+            out.extend(released)
+        out.extend(tok.flush())
+        # released long before the end despite zero punctuation
+        assert first_release_at is not None
+        assert first_release_at <= hold.cjk_hold_chars + 3
+        # and the stream is lossless
+        assert decode(out) == text
+        # holdback honored: pending tail stayed short after each release
+        assert tok.pending_text == ""
 
     def test_space_boundary_cuts_are_canonical(self, encode):
         # pure-Latin text with spaces: incremental must equal full encode
