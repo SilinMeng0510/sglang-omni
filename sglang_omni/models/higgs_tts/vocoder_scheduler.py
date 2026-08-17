@@ -60,7 +60,6 @@ class HiggsStreamingVocoderScheduler(
         codec: HiggsAudioCodec,
         *,
         stream_stride: int = 75,
-        stream_followup_stride: int = 75,
         stream_overlap_tokens: int = 8,
         stream_holdback_tokens: int = 4,
         max_batch_size: int = 4,
@@ -78,8 +77,8 @@ class HiggsStreamingVocoderScheduler(
         startup_masked_emit_frames: int = 3,
         startup_masked_until_frames: int = 8,
     ) -> None:
-        if stream_stride <= 0 or stream_followup_stride <= 0:
-            raise ValueError("stream_stride and stream_followup_stride must be > 0")
+        if stream_stride <= 0:
+            raise ValueError("stream_stride must be > 0")
         if stream_overlap_tokens < 0:
             raise ValueError("stream_overlap_tokens must be >= 0")
         if stream_holdback_tokens < 0:
@@ -99,7 +98,6 @@ class HiggsStreamingVocoderScheduler(
 
         self._codec = codec
         self._stream_stride = int(stream_stride)
-        self._stream_followup_stride = int(stream_followup_stride)
         self._stream_overlap_tokens = int(stream_overlap_tokens)
         self._stream_holdback_tokens = int(stream_holdback_tokens)
         self._samples_per_frame = self._resolve_samples_per_frame(codec)
@@ -242,7 +240,7 @@ class HiggsStreamingVocoderScheduler(
         if emit_until_raw < state.emitted_raw_frames or (
             emit_until_raw == state.emitted_raw_frames and not can_flush_codec_tail
         ):
-            state.next_decode_rows = delayed_count + self._stream_followup_stride
+            state.next_decode_rows = delayed_count + self._stream_stride
             return None
 
         window_start_raw = max(
@@ -269,11 +267,11 @@ class HiggsStreamingVocoderScheduler(
         else:
             delta = audio[trim_samples:].contiguous()
         if delta.numel() == 0:
-            state.next_decode_rows = delayed_count + self._stream_followup_stride
+            state.next_decode_rows = delayed_count + self._stream_stride
             return None
 
         state.emitted_raw_frames = emit_until_raw
-        state.next_decode_rows = delayed_count + self._stream_followup_stride
+        state.next_decode_rows = delayed_count + self._stream_stride
         return delta
 
     def select_step_participants(self) -> list[tuple[str, _HiggsStreamState]]:

@@ -1059,7 +1059,6 @@ def test_higgs_steady_window_carries_receptive_field_context() -> None:
     scheduler = HiggsStreamingVocoderScheduler(
         codec,
         stream_stride=8,  # steady emit = 6 frames
-        stream_followup_stride=8,
         startup_low_latency=False,
     )
     payload = _higgs_stream_payload(
@@ -1090,7 +1089,6 @@ def test_higgs_startup_low_latency_flag_controls_first_emissions() -> None:
         scheduler = HiggsStreamingVocoderScheduler(
             codec,
             stream_stride=8,
-            stream_followup_stride=8,
             startup_low_latency=low_latency,
         )
         payload = _higgs_stream_payload(
@@ -1213,7 +1211,6 @@ def test_higgs_streaming_vocoder_matches_full_decode_with_codec_tail() -> None:
     scheduler = HiggsStreamingVocoderScheduler(
         codec,
         stream_stride=3,
-        stream_followup_stride=2,
         stream_overlap_tokens=1,
         stream_holdback_tokens=0,
     )

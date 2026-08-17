@@ -44,7 +44,6 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     # steady emission = stride - num_codebooks + 1 frames; pure cadence
     # knob (quality is bounded by vocoder_context_frames, not chunk size)
     vocoder_stream_stride: int = Field(default=32, ge=1)
-    vocoder_stream_followup_stride: int = Field(default=32, ge=1)
     # True = K8/M3 startup schedule (reduced lookahead for fast TTFA);
     # False = uniform stride emission from frame zero
     vocoder_startup_low_latency: bool = True
@@ -125,7 +124,6 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             if stage.name == "vocoder":
                 stage.factory_args.update(
                     stream_stride=self.vocoder_stream_stride,
-                    stream_followup_stride=self.vocoder_stream_followup_stride,
                     startup_low_latency=self.vocoder_startup_low_latency,
                     context_frames=self.vocoder_context_frames,
                     startup_masked_delay_rows=self.vocoder_startup_masked_delay_rows,
