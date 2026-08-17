@@ -107,7 +107,7 @@
   button.ghost:hover { color: var(--ink); border-color: var(--ink-3); }
 
   /* stat tiles */
-  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 4px 0 10px; }
+  .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 4px 0 10px; }
   @media (max-width: 700px) { .stats { grid-template-columns: repeat(2, 1fr); } }
   .stat { background: var(--raised); border: 1px solid var(--edge-soft); border-radius: 11px; padding: 10px 12px; }
   .stat .k { font-size: 11px; color: var(--ink-3); letter-spacing: .3px; }
@@ -241,6 +241,7 @@
       </h2>
       <div class="stats">
         <div class="stat"><div class="k">TTFA (first audio)</div><div class="v" id="stTtfa">–</div></div>
+        <div class="stat"><div class="k">Heard at (speaker)</div><div class="v" id="stHeard">–</div></div>
         <div class="stat"><div class="k">Total time</div><div class="v" id="stTotal">–</div></div>
         <div class="stat"><div class="k">Audio length</div><div class="v" id="stAudio">–</div></div>
         <div class="stat"><div class="k">Gen speed</div><div class="v" id="stRtf">–</div></div>
@@ -255,6 +256,7 @@
         <span><span class="sw" style="background:var(--audio)"></span>audio chunks arrived</span>
         <span><span class="sw" style="background:var(--stall);opacity:.55"></span>stall window</span>
         <span><span class="sw" style="background:var(--violet)"></span>TTFA</span>
+        <span><span class="sw" style="background:var(--ok)"></span>audible start</span>
       </div>
 
       <div class="canvas-wrap" style="margin-top:12px">
@@ -339,6 +341,10 @@ function playPcm(f32) {
   // hold the first chunk for the prebuffer: a little start delay buys jitter immunity
   const prebuf = playHead === 0 ? parseInt($("prebuf").value) / 1000 : 0;
   const t = Math.max(ctx.currentTime + 0.06 + prebuf, playHead);
+  if (run && !run.done && run.ttfp === null) {
+    run.ttfp = now() - run.t0 + (t - ctx.currentTime);
+    $("stHeard").textContent = fmtS(run.ttfp);
+  }
   src.start(t); playHead = t + buf.duration;
   if (playT0 === null) playT0 = t;
   liveSources.push(src);
@@ -360,10 +366,10 @@ const MODE_NAMES = { offline: "offline", offstream: "offline+stream", proto: "st
 function newRun(mode, label) {
   stopPlayback();
   run = { id: ++runCounter, mode, t0: now(), events: [], stalls: [], chunks: [], samples: [], sampleCount: 0,
-          ttfa: null, total: null, done: false, err: null, sim: false };
+          ttfa: null, ttfp: null, total: null, done: false, err: null, sim: false };
   $("runLabel").textContent = label;
   $("log").innerHTML = "";
-  ["stTtfa","stTotal","stAudio","stRtf"].forEach(id => $(id).textContent = "–");
+  ["stTtfa","stHeard","stTotal","stAudio","stRtf"].forEach(id => $(id).textContent = "–");
   $("btnStop").disabled = false; $("btnReplay").disabled = true; $("btnSave").disabled = true;
   drawAll();
 }
@@ -398,7 +404,7 @@ function finishRun(errMsg) {
   $("btnReplay").disabled = run.sampleCount === 0;
   $("btnSave").disabled = run.sampleCount === 0;
   logLine(errMsg ? "err" : "ok", errMsg ? `failed: ${errMsg}` : `done · audio ${fmtS(audioS)} · total ${fmtS(run.total)}`);
-  history.unshift({ id: run.id, mode: run.mode, sim: run.sim, ttfa: run.ttfa, total: run.total,
+  history.unshift({ id: run.id, mode: run.mode, sim: run.sim, ttfa: run.ttfa, ttfp: run.ttfp, total: run.total,
                     audio: audioS, err: run.err, samples: run.samples.slice() });
   if (history.length > 12) history.pop();
   renderHistory();
@@ -671,6 +677,14 @@ function drawTimeline() {
     tctx.fillStyle = css("--violet");
     tctx.fillText("TTFA " + fmtS(run.ttfa), Math.min(vx + 5, w - 86), 20);
   }
+  // audible-start marker (first chunk + scheduling headroom + prebuffer)
+  if (run.ttfp != null) {
+    const px = X(run.ttfp);
+    tctx.strokeStyle = css("--ok"); tctx.lineWidth = 2;
+    tctx.beginPath(); tctx.moveTo(px, 12); tctx.lineTo(px, h - 16); tctx.stroke();
+    tctx.fillStyle = css("--ok");
+    tctx.fillText("heard " + fmtS(run.ttfp), Math.min(px + 5, w - 96), 32);
+  }
 }
 // hover tooltip
 tl.addEventListener("mousemove", e => {
@@ -739,6 +753,7 @@ function renderHistory() {
       <td>#${r.id}</td>
       <td><span class="mode-tag">${MODE_NAMES[r.mode] || r.mode}${r.sim ? " · wait-all-tokens" : ""}</span></td>
       <td>${r.err ? `<span style="color:var(--err)">failed</span>` : fmtS(r.ttfa)}${r.ttfa === bestTtfa && !r.err ? " ★" : ""}</td>
+      <td>${fmtS(r.ttfp)}</td>
       <td>${fmtS(r.total)}</td>
       <td>${fmtS(r.audio)}</td>
       <td>${r.audio && r.total ? (r.audio / r.total).toFixed(1) + "×" : "–"}</td>
@@ -746,7 +761,7 @@ function renderHistory() {
           <button class="ghost" onclick="saveHist(${r.id})">WAV</button></td>
     </tr>`).join("");
   wrap.innerHTML = `<table>
-    <thead><tr><th>#</th><th>Mode</th><th>TTFA</th><th>Total</th><th>Audio</th><th>Audio/Total</th><th></th></tr></thead>
+    <thead><tr><th>#</th><th>Mode</th><th>TTFA</th><th>Heard</th><th>Total</th><th>Audio</th><th>Audio/Total</th><th></th></tr></thead>
     <tbody>${rows}</tbody></table>`;
 }
 window.replayHist = id => { const r = history.find(x => x.id === id); if (r) replaySamples(r.samples); };
