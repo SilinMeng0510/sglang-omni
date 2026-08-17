@@ -180,6 +180,14 @@
     </div>
 
     <div class="card">
+      <h2>上游 LLM 模拟 <span class="chip">token 逐个产出</span></h2>
+      <div class="field" style="margin-bottom:2px">
+        <label>token 间隔 <b id="rateVal" class="mono">100</b> ms/token <span id="rateTps" style="color:var(--ink-3)">（≈10 tok/s）</span></label>
+        <input type="range" id="rate" min="20" max="400" step="10" value="100" />
+      </div>
+    </div>
+
+    <div class="card">
       <h2>HTTP 单次请求 <span class="chip">/v1/audio/speech</span></h2>
       <div class="field">
         <label>生成协议</label>
@@ -192,6 +200,10 @@
         <input type="checkbox" id="httpStreamOut" checked />
         <span>流式输出（PCM 分块返回，可测 TTFA）</span>
       </div>
+      <div class="field check">
+        <input type="checkbox" id="httpSimLLM" />
+        <span>模拟上游 LLM：按上方节奏等 token 全部到齐后才发请求（TTFA 从首 token 起算，可与增量模式对比）</span>
+      </div>
       <div class="field">
         <label for="httpText">文本</label>
         <textarea id="httpText">The quick brown fox jumps over the lazy dog. Streaming text to speech keeps latency low even for long passages.</textarea>
@@ -202,12 +214,8 @@
     <div class="card">
       <h2>WebSocket 增量输入 <span class="chip">/v1/audio/speech/stream</span></h2>
       <div class="field">
-        <label for="wsText">文本（将按词逐个发送，模拟上游 LLM）</label>
+        <label for="wsText">文本（按上方节奏逐 token 发送，边到边合成）</label>
         <textarea id="wsText">Streaming text arrives token by token from the language model, and the speech keeps flowing while it is still being written.</textarea>
-      </div>
-      <div class="field">
-        <label>发送速率 <b id="rateVal" class="mono">8</b> 词/秒</label>
-        <input type="range" id="rate" min="2" max="30" value="8" />
       </div>
       <div class="field check">
         <input type="checkbox" id="stallOn" />
@@ -346,7 +354,7 @@ const MODE_NAMES = { offline: "offline", offstream: "offline+流出", proto: "st
 function newRun(mode, label) {
   stopPlayback();
   run = { id: ++runCounter, mode, t0: now(), events: [], stalls: [], chunks: [], samples: [], sampleCount: 0,
-          ttfa: null, total: null, done: false, err: null };
+          ttfa: null, total: null, done: false, err: null, sim: false };
   $("runLabel").textContent = label;
   $("log").innerHTML = "";
   ["stTtfa","stTotal","stAudio","stRtf"].forEach(id => $(id).textContent = "–");
@@ -384,8 +392,8 @@ function finishRun(errMsg) {
   $("btnReplay").disabled = run.sampleCount === 0;
   $("btnSave").disabled = run.sampleCount === 0;
   logLine(errMsg ? "err" : "ok", errMsg ? `失败：${errMsg}` : `完成 · 音频 ${fmtS(audioS)} · 总耗时 ${fmtS(run.total)}`);
-  history.unshift({ id: run.id, mode: run.mode, ttfa: run.ttfa, total: run.total, audio: audioS,
-                    err: run.err, samples: run.samples.slice() });
+  history.unshift({ id: run.id, mode: run.mode, sim: run.sim, ttfa: run.ttfa, total: run.total,
+                    audio: audioS, err: run.err, samples: run.samples.slice() });
   if (history.length > 12) history.pop();
   renderHistory();
   drawAll();
@@ -403,21 +411,69 @@ function logLine(cls, text) {
   el.scrollTop = el.scrollHeight;
 }
 
+// ---------------------------------------------------------------- 上游 LLM 模拟
+// 近似 LLM token 粒度：CJK/假名/谚文一字一 token，拉丁按 ≤4 字符一段，
+// 前导空白并入后续 token（与 BPE 的 " word" 习惯一致）
+const CJK_RE = /[⺀-鿿぀-ヿ가-힯豈-﫿]/;
+function pseudoTokens(text) {
+  const toks = [];
+  let i = 0;
+  while (i < text.length) {
+    let j = i;
+    while (j < text.length && /\s/.test(text[j])) j++;
+    if (j >= text.length) { toks.push(text.slice(i)); break; }
+    if (CJK_RE.test(text[j])) { toks.push(text.slice(i, j + 1)); i = j + 1; continue; }
+    let k = j;
+    while (k < text.length && !/\s/.test(text[k]) && !CJK_RE.test(text[k]) && k - j < 4) k++;
+    toks.push(text.slice(i, k)); i = k;
+  }
+  return toks;
+}
+function msPerToken() { return parseInt($("rate").value); }
+function updateRateLabel() {
+  $("rateVal").textContent = $("rate").value;
+  $("rateTps").textContent = `（≈${(1000 / msPerToken()).toFixed(0)} tok/s）`;
+}
+$("rate").addEventListener("input", updateRateLabel);
+updateRateLabel();
+
 // ---------------------------------------------------------------- HTTP 模式
 document.querySelectorAll("#segProto button").forEach(b => b.addEventListener("click", () => {
   document.querySelectorAll("#segProto button").forEach(x => x.classList.toggle("on", x === b));
 }));
+let httpAbort = null;
 $("httpRun").addEventListener("click", async () => {
   const proto = document.querySelector("#segProto .on").dataset.v;
   const streamOut = $("httpStreamOut").checked;
+  const simLLM = $("httpSimLLM").checked;
   const mode = proto === "offline" ? (streamOut ? "offstream" : "offline") : (streamOut ? "protostream" : "proto");
-  newRun(mode, `HTTP · ${MODE_NAMES[mode]}`);
+  newRun(mode, `HTTP · ${MODE_NAMES[mode]}${simLLM ? " · 候全部 token" : ""}`);
+  run.sim = simLLM;
   $("httpRun").disabled = true;
   logN = 0;
+  const abort = { on: false };
+  httpAbort = abort;
   const body = { input: $("httpText").value, ...samplingPayload(), ...refPayload() };
   if (proto === "streaming") body.streaming_protocol = true;
   if (streamOut) { body.stream = true; body.response_format = "pcm"; } else { body.response_format = "wav"; }
-  ev("token", "全文提交"); logLine("tok", `POST /v1/audio/speech（${MODE_NAMES[mode]}，${body.input.length} 字符）`);
+  if (simLLM) {
+    // 全文进的公平对比：请求要等模拟 LLM 吐完全部 token 才能发出，
+    // TTFA 与增量模式一样从第一个 token 起算
+    const toks = pseudoTokens(body.input);
+    const ms = msPerToken();
+    logLine("tok", `模拟 LLM：${toks.length} token @ ${ms}ms/token，到齐后发请求`);
+    for (let i = 0; i < toks.length && !abort.on; i++) {
+      if (i === 0) { run.t0 = now(); run.events.length = 0; }  // TTFA 从首 token 起算
+      ev("token", toks[i]);
+      await sleep(ms);
+    }
+    if (abort.on) { $("httpRun").disabled = false; return; }
+    ev("done", "token 全部到齐 → 发起请求");
+    logLine("tok", `token 全部到齐（${fmtS(now() - run.t0)}），发起 HTTP 请求`);
+  } else {
+    ev("token", "全文提交");
+  }
+  logLine("tok", `POST /v1/audio/speech（${MODE_NAMES[mode]}，${body.input.length} 字符）`);
   try {
     const r = await fetch($("base").value.replace(/\/$/, "") + "/v1/audio/speech", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -451,13 +507,12 @@ $("httpRun").addEventListener("click", async () => {
 
 // ---------------------------------------------------------------- WS 增量模式
 let wsAbort = null;
-$("rate").addEventListener("input", () => $("rateVal").textContent = $("rate").value);
 $("wsRun").addEventListener("click", async () => {
   newRun("ws", "WebSocket · 增量输入");
   $("wsRun").disabled = true;
   logN = 0;
   const base = $("base").value.replace(/\/$/, "").replace(/^http/, "ws");
-  const rate = parseInt($("rate").value);
+  const ms = msPerToken();
   const doStall = $("stallOn").checked;
   const text = $("wsText").value;
   let ws;
@@ -489,26 +544,26 @@ $("wsRun").addEventListener("click", async () => {
     streaming_protocol: true, stream_audio: true, response_format: "pcm",
     ...samplingPayload(), ...refPayload() } }));
 
-  // 模拟 LLM 逐词喂入；t0 重置为第一个词发出时刻（真实 TTFA 语义）
-  const words = text.trim().split(/\s+/);
-  const stallAt = doStall ? new Set([...Array(Math.max(1, Math.round(words.length / 9)))].map(
-      () => 2 + Math.floor(Math.random() * (words.length - 4)))) : new Set();
+  // 模拟 LLM 逐 token 喂入；t0 重置为第一个 token 发出时刻（真实 TTFA 语义）
+  const toks = pseudoTokens(text.trim());
+  const stallAt = doStall ? new Set([...Array(Math.max(1, Math.round(toks.length / 20)))].map(
+      () => 3 + Math.floor(Math.random() * Math.max(1, toks.length - 6)))) : new Set();
+  logLine("tok", `模拟 LLM：${toks.length} token @ ${ms}ms/token`);
   (async () => {
-    for (let i = 0; i < words.length && !abort.on; i++) {
+    for (let i = 0; i < toks.length && !abort.on; i++) {
       if (stallAt.has(i)) {
         const dur = 0.8 + Math.random() * 1.2;
         const s0 = now() - run.t0;
-        logLine("warn", `模拟断供 ${dur.toFixed(1)}s（词 #${i}）`);
+        logLine("warn", `模拟断供 ${dur.toFixed(1)}s（token #${i}）`);
         await sleep(dur * 1000);
         run.stalls.push([s0, now() - run.t0]);
         scheduleDraw();
       }
-      const chunk = (i === 0 ? "" : " ") + words[i];
       if (i === 0) { run.t0 = now(); run.events.length = 0; }  // TTFA 从第一个 token 起算
-      ws.send(JSON.stringify({ type: "input.text", text: chunk }));
-      ev("token", words[i]);
-      if (i % 5 === 0) logLine("tok", `input.text: “${words[i]}”（#${i + 1}/${words.length}）`);
-      await sleep(1000 / rate);
+      ws.send(JSON.stringify({ type: "input.text", text: toks[i] }));
+      ev("token", toks[i]);
+      if (i % 10 === 0) logLine("tok", `input.text: “${toks[i].trim()}”（#${i + 1}/${toks.length}）`);
+      await sleep(ms);
     }
     if (!abort.on) { ws.send(JSON.stringify({ type: "input.done" })); logLine("tok", "input.done"); ev("done", "输入结束"); }
   })();
@@ -523,6 +578,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // ---------------------------------------------------------------- 控制按钮
 $("btnStop").addEventListener("click", () => {
   if (wsAbort) wsAbort.on = true;
+  if (httpAbort) httpAbort.on = true;
   stopPlayback();
   finishRun("手动停止");
 });
@@ -674,7 +730,7 @@ function renderHistory() {
   let rows = history.map(r => `
     <tr class="${r.ttfa === bestTtfa && !r.err ? "best" : ""}">
       <td>#${r.id}</td>
-      <td><span class="mode-tag">${MODE_NAMES[r.mode] || r.mode}</span></td>
+      <td><span class="mode-tag">${MODE_NAMES[r.mode] || r.mode}${r.sim ? " · 候全部 token" : ""}</span></td>
       <td>${r.err ? `<span style="color:var(--err)">失败</span>` : fmtS(r.ttfa)}${r.ttfa === bestTtfa && !r.err ? " ★" : ""}</td>
       <td>${fmtS(r.total)}</td>
       <td>${fmtS(r.audio)}</td>
@@ -723,6 +779,17 @@ drawAll();
     if (run.err) throw new Error("ws run failed: " + run.err);
     if (!(run.sampleCount > SR)) throw new Error("ws run produced <1s audio");
     console.log(`AUTOTEST ws ok ttfa=${run.ttfa?.toFixed(2)} audio=${(run.sampleCount / SR).toFixed(1)}s stalls=${run.stalls.length}`);
+    // 3) HTTP offline + 模拟 LLM（候全部 token 后发请求）
+    $("httpText").value = short;
+    $("rate").value = 20; updateRateLabel();
+    document.querySelector('#segProto [data-v="offline"]').click();
+    $("httpStreamOut").checked = true;
+    $("httpSimLLM").checked = true;
+    $("httpRun").click();
+    await wait(() => run && run.mode === "offstream" && run.sim && run.done, 120, "http sim run");
+    if (run.err) throw new Error("http sim run failed: " + run.err);
+    if (!(run.sampleCount > SR)) throw new Error("http sim run produced <1s audio");
+    console.log(`AUTOTEST httpsim ok ttfa=${run.ttfa?.toFixed(2)} audio=${(run.sampleCount / SR).toFixed(1)}s`);
     console.log("AUTOTEST PASS");
     document.title = "AUTOTEST PASS";
   } catch (e) {
