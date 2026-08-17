@@ -186,7 +186,7 @@
         <input type="range" id="rate" min="20" max="400" step="10" value="20" />
       </div>
       <div class="field" style="margin-bottom:2px">
-        <label>Playback prebuffer <b id="prebufVal" class="mono">400</b> ms <span style="color:var(--ink-3)">(absorbs startup arrival jitter; 0 = play on arrival)</span></label>
+        <label>Playback prebuffer <b id="prebufVal" class="mono">400</b> ms <span style="color:var(--ink-3)">(hold this much audio before starting; 0 = play on arrival)</span></label>
         <input type="range" id="prebuf" min="0" max="600" step="20" value="400" />
       </div>
     </div>
@@ -331,16 +331,32 @@ const SR = 24000;
 let actx = null, playHead = 0, playT0 = null;
 function ensureCtx() { if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)(); return actx; }
 let liveSources = [];
+let pendingChunks = [], pendingDur = 0;
 function playPcm(f32) {
+  // content-based prebuffer: hold chunks until this much AUDIO is banked,
+  // then start — same jitter protection as a fixed delay, earlier start
+  // whenever generation outpaces real time
+  const prebufSec = parseInt($("prebuf").value) / 1000;
+  if (playHead === 0 && pendingDur + f32.length / SR < prebufSec) {
+    pendingChunks.push(f32); pendingDur += f32.length / SR;
+    return;
+  }
+  flushPendingPlayback();
+  schedulePcm(f32);
+}
+function flushPendingPlayback() {
+  const queued = pendingChunks;
+  pendingChunks = []; pendingDur = 0;
+  queued.forEach(schedulePcm);
+}
+function schedulePcm(f32) {
   const ctx = ensureCtx();
   if (ctx.state === "suspended") ctx.resume();
   const buf = ctx.createBuffer(1, f32.length, SR);
   buf.copyToChannel(f32, 0);
   const src = ctx.createBufferSource();
   src.buffer = buf; src.connect(ctx.destination);
-  // hold the first chunk for the prebuffer: a little start delay buys jitter immunity
-  const prebuf = playHead === 0 ? parseInt($("prebuf").value) / 1000 : 0;
-  const t = Math.max(ctx.currentTime + 0.06 + prebuf, playHead);
+  const t = Math.max(ctx.currentTime + 0.06, playHead);
   if (run && !run.done && run.ttfp === null) {
     run.ttfp = now() - run.t0 + (t - ctx.currentTime);
     $("stHeard").textContent = fmtS(run.ttfp);
@@ -350,7 +366,7 @@ function playPcm(f32) {
   liveSources.push(src);
   src.onended = () => { liveSources = liveSources.filter(s => s !== src); };
 }
-function stopPlayback() { liveSources.forEach(s => { try { s.stop(); } catch {} }); liveSources = []; playHead = 0; playT0 = null; }
+function stopPlayback() { liveSources.forEach(s => { try { s.stop(); } catch {} }); liveSources = []; playHead = 0; playT0 = null; pendingChunks = []; pendingDur = 0; }
 function i16ToF32(ab) {
   const i16 = new Int16Array(ab);
   const f = new Float32Array(i16.length);
@@ -392,6 +408,7 @@ function pushAudio(ab) {
 }
 function finishRun(errMsg) {
   if (!run || run.done) return;
+  flushPendingPlayback();
   run.done = true; run.err = errMsg || null;
   run.total = now() - run.t0;
   $("stTotal").textContent = fmtS(run.total);
