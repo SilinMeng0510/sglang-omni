@@ -38,16 +38,9 @@ class HiggsSGLangRequestData(SGLangARRequestData):
     generation_done: bool = False
     engine_start_s: float = 0.0
     stream_metadata: dict[str, Any] | None = None
-    # Streaming-TTS protocol (None = offline <|tts|> request)
     protocol_state: StreamingProtocolState | None = None
-    # plan for the NEXT decode step, produced by the current step's collect
     streaming_plan: StepPlan | None = None
-    # incremental input ran dry: the scheduler parks this request out of
-    # decode scheduling until the input-chunk handler resumes it
     input_starved: bool = False
-    # frozen-row watchdog (streaming protocol): the model's known runaway
-    # mode cycles endlessly through a handful of near-silence codec rows
-    # instead of reaching EOC
     watchdog_recent_rows: list[tuple[int, ...]] = field(default_factory=list)
     watchdog_repeat_rows: int = 0
 
@@ -137,11 +130,6 @@ def build_sglang_higgs_request(
     # vocab_size = backbone text vocab so cb0 rides sglang's standard sampler path.
     # extra_key namespaces the radix cache per ref-audio fingerprint so prompts
     # sharing the -100 placeholder prefix can never cross-contaminate KV.
-    #
-    # Incremental requests get a private radix namespace: their
-    # resume path radix-matches THROUGH audio rows, whose keys carry
-    # only codebook-0 — a cb0 coincidence in a shared subtree would
-    # splice another request's KV into the stream.
     extra_key = _ref_audio_fingerprint(state.reference_codes_delayed)
     if state.streaming_incremental:
         extra_key = f"{extra_key or 'zero-shot'}:{request_id}"
