@@ -41,14 +41,8 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     lora_max_rank: int = Field(default=32, ge=1)
     lora_max_cached_adapters: int = Field(default=8, ge=1)
     separate_vocoder_process: bool = False
-    # steady emission = stride - num_codebooks + 1 frames; pure cadence
-    # knob (quality is bounded by vocoder_context_frames, not chunk size)
     vocoder_stream_stride: int = Field(default=32, ge=1)
-    # True = K8/M3 startup schedule (reduced lookahead for fast TTFA);
-    # False = uniform stride emission from frame zero
     vocoder_startup_masked: bool = True
-    # steady decode context per side; 11 >= the codec decoder receptive
-    # field (+-10.4 frames), decoupling chunk size from quality
     vocoder_context_frames: int = Field(default=11, ge=0)
     vocoder_startup_masked_delay_rows: int = Field(default=8, ge=1)
     vocoder_startup_masked_emit_frames: int = Field(default=3, ge=1)
