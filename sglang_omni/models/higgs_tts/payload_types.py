@@ -37,17 +37,10 @@ class HiggsTtsState(PipelineStateBase):
     num_codebooks: int = 8
     codebook_size: int = 1026  # 1024 data + <|boc|> + <|eoc|>
 
-    # streaming-TTS protocol (<|streaming_tts|> preamble + paced injection);
-    # False keeps the offline <|tts|> format. inject_text_ids are the target
-    # text tokens AFTER the first one (which rides in the prompt).
+    # streaming-TTS protocol
     streaming_protocol: bool = False
     inject_text_ids: list[int] | None = None
-    # incremental input: the inject queue stays OPEN after build — more
-    # tokens arrive via engine-side append messages; an empty queue stalls
-    # the request instead of injecting <|text_end|>.
     streaming_incremental: bool = False
-    # tokenizer ids the engine-side state machine needs (filled by
-    # preprocessing from the checkpoint tokenizer)
     streaming_text_token_id: int | None = None
     streaming_audio_token_id: int | None = None
     streaming_text_end_token_id: int | None = None
