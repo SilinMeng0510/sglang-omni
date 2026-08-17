@@ -71,13 +71,8 @@ class HiggsStreamingVocoderScheduler(
         max_batch_size: int = 4,
         max_batch_wait_ms: int = 2,
         low_latency_startup: bool = True,
-        # >= the DAC decoder's receptive field (+-10.4 frames at 25 Hz, from
-        # conv1 k7 + upsampling blocks [8,5,4,2,3] each with k7 residual
-        # units at dilations 1/3/9 + conv2 k7), so every steady-phase frame
-        # decodes bit-identically to the whole-utterance decode: chunk size
-        # (stream_stride) is pure emission cadence, fully decoupled from
-        # quality. The K8/M3 startup phases keep their listening-tested
-        # reduced lookahead — that is the TTFA trade, a separate decision.
+        # >= the DAC decoder's receptive field (+-10.4 frames at 25 Hz),
+        # so steady-phase chunk size never affects decode quality
         context_frames: int = 11,
         startup_full_chunk_frames: int = 8,
         startup_full_chunk_count: int = 3,
@@ -113,10 +108,6 @@ class HiggsStreamingVocoderScheduler(
         self._stream_overlap_tokens = int(stream_overlap_tokens)
         self._stream_holdback_tokens = int(stream_holdback_tokens)
         self._samples_per_frame = self._resolve_samples_per_frame(codec)
-        # streaming decode is ALWAYS masked full-context (windowed decode is
-        # only the on_stream_done tail flush); this flag merely chooses
-        # whether the first frames trade lookahead for TTFA (K8/M3 startup
-        # schedule) or hold uniform stride emission from frame zero
         self._low_latency_startup = bool(low_latency_startup)
         self._context_frames = int(context_frames)
         self._startup_full_chunk_frames = int(startup_full_chunk_frames)

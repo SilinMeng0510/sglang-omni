@@ -41,25 +41,15 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     lora_max_rank: int = Field(default=32, ge=1)
     lora_max_cached_adapters: int = Field(default=8, ge=1)
     separate_vocoder_process: bool = False
-    # steady emission = stride - num_codebooks + 1 = 25 frames (1 s), the
-    # value the masked deployment config (higgs_tts_4b_masked.yaml) has run
-    # in production. Emission size does not affect quality — every emitted
-    # frame gets the same fixed 9-frame masked contexts either side
-    # (measured same-seed spectral distance vs whole-utterance decode:
-    # 0.032 at stride 15 and 75 alike) — it only trades steady batching
-    # delay (~avg half a chunk) against vocoder calls.
+    # steady emission = stride - num_codebooks + 1 frames; pure cadence
+    # knob (quality is bounded by vocoder_context_frames, not chunk size)
     vocoder_stream_stride: int = Field(default=32, ge=1)
     vocoder_stream_followup_stride: int = Field(default=32, ge=1)
-    # Streaming decode is always masked full-context (there is no windowed
-    # streaming mode — it was audibly worse in same-seed listening A/B).
-    # This flag only chooses the startup behavior: True = the
-    # listening-tested K8/M3 schedule emits the first frames with reduced
-    # lookahead for fast TTFA; False = uniform stride emission from frame 0.
+    # True = K8/M3 startup schedule (reduced lookahead for fast TTFA);
+    # False = uniform stride emission from frame zero
     vocoder_low_latency_startup: bool = True
-    # steady-phase decode context per side; 11 >= the codec decoder's
-    # receptive field (+-10.4 frames), which makes steady chunk seams
-    # bit-exact vs whole-utterance decode — stride becomes pure cadence.
-    # Costs 2 extra frames (80 ms) of steady lookahead vs the old 9.
+    # steady decode context per side; 11 >= the codec decoder receptive
+    # field (+-10.4 frames), decoupling chunk size from quality
     vocoder_context_frames: int = Field(default=11, ge=0)
     vocoder_startup_masked_delay_rows: int = Field(default=8, ge=1)
     vocoder_startup_masked_emit_frames: int = Field(default=3, ge=1)

@@ -139,13 +139,10 @@ def build_sglang_higgs_request(
     # extra_key namespaces the radix cache per ref-audio fingerprint so prompts
     # sharing the -100 placeholder prefix can never cross-contaminate KV.
     #
-    # Incremental-streaming requests get a PRIVATE namespace (fingerprint +
-    # request id): their starve/hold/resume path radix-matches THROUGH decoded
-    # audio-row positions, whose radix keys carry only codebook-0 of the 8
-    # sampled codebooks — in a shared subtree a cb0 coincidence with another
-    # request's cached rows would silently splice in that request's KV
-    # (cb1..7 differ) and derail the stream. A private subtree can only ever
-    # match the request's own exact path.
+    # Incremental requests get a private radix namespace: their
+    # resume path radix-matches THROUGH audio rows, whose keys carry
+    # only codebook-0 — a cb0 coincidence in a shared subtree would
+    # splice another request's KV into the stream.
     extra_key = _ref_audio_fingerprint(state.reference_codes_delayed)
     if state.streaming_incremental:
         extra_key = f"{extra_key or 'zero-shot'}:{request_id}"

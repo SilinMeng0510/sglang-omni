@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import uuid
 from collections import deque
 from collections.abc import Awaitable
@@ -92,7 +93,6 @@ class SpeechWebSocketSession:
         self.speech_service = speech_service
         self.model_path = model_path
         self.generation_stage = generation_stage or "tts_engine"
-        # streaming-protocol session state
         self.stream_tokenizer: StablePrefixTokenizer | None = None
         self.streaming_generation_task: asyncio.Task[int] | None = None
         self.streaming_request_id: str | None = None
@@ -243,8 +243,6 @@ class SpeechWebSocketSession:
                 "streaming_protocol sessions are unavailable: server has no "
                 "model path configured for incremental tokenization"
             )
-        import os
-
         from sglang_omni.utils.checkpoint import resolve_checkpoint
 
         checkpoint_dir = resolve_checkpoint(self.model_path)
@@ -288,7 +286,6 @@ class SpeechWebSocketSession:
         tokenizer = self._load_stream_tokenizer()
         released = tokenizer.flush()
         if tokenizer.guard_breaches or tokenizer.forced_reseals:
-            # non-canonical seams should be ~never; watch this in prod logs
             logger.warning(
                 "streaming session %s released non-canonical seams: "
                 "guard_breaches=%d forced_reseals=%d",
