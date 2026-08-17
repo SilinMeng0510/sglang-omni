@@ -41,21 +41,21 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     lora_max_rank: int = Field(default=32, ge=1)
     lora_max_cached_adapters: int = Field(default=8, ge=1)
     separate_vocoder_process: bool = False
-    # steady emission = stride - num_codebooks + 1 = 8 frames (0.32 s), the
-    # same granularity as the listening-tested K8 startup chunks: continuous
-    # live playback with no multi-second lumps. The masked decode context is
-    # a fixed 9 frames either side, so small chunks cost bounded extra
-    # vocoder compute (~3x per frame) and zero quality — measured same-seed
-    # spectral distance 0.032 vs whole-utterance decode, identical to
-    # stride 75. Throughput deployments may raise this via a config file.
-    vocoder_stream_stride: int = Field(default=15, ge=1)
-    vocoder_stream_followup_stride: int = Field(default=15, ge=1)
-    # masked full-context decoding: every streamed chunk is decoded with the
-    # complete left context, so chunk seams carry no timbre discontinuity
-    # (windowed mode re-decodes only 8 rows of context and is audibly worse —
-    # confirmed by same-seed listening A/B). The masked path also ships its own
-    # listening-tested small-chunk startup schedule (K8/M3).
-    vocoder_full_context_streaming: bool = True
+    # steady emission = stride - num_codebooks + 1 = 25 frames (1 s), the
+    # value the masked deployment config (higgs_tts_4b_masked.yaml) has run
+    # in production. Emission size does not affect quality — every emitted
+    # frame gets the same fixed 9-frame masked contexts either side
+    # (measured same-seed spectral distance vs whole-utterance decode:
+    # 0.032 at stride 15 and 75 alike) — it only trades steady batching
+    # delay (~avg half a chunk) against vocoder calls.
+    vocoder_stream_stride: int = Field(default=32, ge=1)
+    vocoder_stream_followup_stride: int = Field(default=32, ge=1)
+    # Streaming decode is always masked full-context (there is no windowed
+    # streaming mode — it was audibly worse in same-seed listening A/B).
+    # This flag only chooses the startup behavior: True = the
+    # listening-tested K8/M3 schedule emits the first frames with reduced
+    # lookahead for fast TTFA; False = uniform stride emission from frame 0.
+    vocoder_low_latency_startup: bool = True
     vocoder_startup_masked_delay_rows: int = Field(default=8, ge=1)
     vocoder_startup_masked_emit_frames: int = Field(default=3, ge=1)
     vocoder_startup_masked_until_frames: int = Field(default=8, ge=1)
@@ -131,7 +131,7 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                 stage.factory_args.update(
                     stream_stride=self.vocoder_stream_stride,
                     stream_followup_stride=self.vocoder_stream_followup_stride,
-                    full_context_streaming=self.vocoder_full_context_streaming,
+                    low_latency_startup=self.vocoder_low_latency_startup,
                     startup_masked_delay_rows=self.vocoder_startup_masked_delay_rows,
                     startup_masked_emit_frames=self.vocoder_startup_masked_emit_frames,
                     startup_masked_until_frames=self.vocoder_startup_masked_until_frames,

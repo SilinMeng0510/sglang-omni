@@ -39,14 +39,14 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
 def test_higgs_masked_startup_config_reaches_vocoder_factory() -> None:
     config = HiggsTtsPipelineConfig(
         model_path="fake-model",
-        vocoder_full_context_streaming=True,
+        vocoder_low_latency_startup=True,
         vocoder_startup_masked_delay_rows=8,
         vocoder_startup_masked_emit_frames=3,
         vocoder_startup_masked_until_frames=8,
     )
     vocoder = next(stage for stage in config.stages if stage.name == "vocoder")
 
-    assert vocoder.factory_args["full_context_streaming"] is True
+    assert vocoder.factory_args["low_latency_startup"] is True
     assert vocoder.factory_args["startup_masked_delay_rows"] == 8
     assert vocoder.factory_args["startup_masked_emit_frames"] == 3
     assert vocoder.factory_args["startup_masked_until_frames"] == 8
@@ -875,6 +875,10 @@ def _fake_codec_fixtures(monkeypatch):
             decode_batch_sizes.append(len(codes_list))
             return [torch.arange(c.shape[0], dtype=torch.float32) for c in codes_list]
 
+        def decode_masked_batch(self, codes_list, counts_list):
+            del counts_list
+            return [torch.arange(c.shape[0], dtype=torch.float32) for c in codes_list]
+
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda p: p)
     monkeypatch.setattr(stages, "get_or_load_codec", lambda *a, **kw: FakeCodec())
     return decode_batch_sizes
@@ -963,6 +967,14 @@ class _FakeHiggsStreamingCodec:
         self.decode_batch_sizes.append(len(codes_list))
         return [self.decode(codes) for codes in codes_list]
 
+    def decode_masked_batch(
+        self,
+        codes_list: list[torch.Tensor],
+        counts_list: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        del counts_list
+        return [self.decode(codes) for codes in codes_list]
+
 
 class _FakeUnevenHiggsStreamingCodec:
     class _Model:
@@ -987,6 +999,14 @@ class _FakeUnevenHiggsStreamingCodec:
         return torch.cat([body, tail])
 
     def decode_batch(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [self.decode(codes) for codes in codes_list]
+
+    def decode_masked_batch(
+        self,
+        codes_list: list[torch.Tensor],
+        counts_list: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        del counts_list
         return [self.decode(codes) for codes in codes_list]
 
 
@@ -1052,117 +1072,52 @@ def _higgs_stream_item(
     )
 
 
-def test_higgs_streaming_vocoder_emits_compact_chunks_and_slim_final() -> None:
+def test_higgs_low_latency_startup_flag_controls_first_emissions() -> None:
+    """low_latency_startup=True front-loads small reduced-lookahead chunks
+    (K8/M3) for fast TTFA; False holds uniform stride emission from frame
+    zero (full lookahead before the first chunk)."""
     raw_codes = torch.tensor(
-        [
-            [1, 8, 9],
-            [2, 3, 10],
-            [4, 11, 12],
-            [1, 2, 3],
-        ],
-        dtype=torch.long,
+        [[i + 1, i + 8, i + 15] for i in range(20)], dtype=torch.long
     )
     delayed = apply_delay_pattern(raw_codes)
-    codec = _FakeHiggsStreamingCodec()
-    scheduler = HiggsStreamingVocoderScheduler(
-        codec,
-        stream_stride=3,
-        stream_followup_stride=2,
-        stream_holdback_tokens=0,
-    )
-    payload = _higgs_stream_payload(
-        "req",
-        stream=True,
-        delayed_rows=delayed.tolist(),
-        codebook_size=7,
-    )
 
-    scheduler._on_streaming_new_request("req", payload)
-    for idx, row in enumerate(delayed):
-        item = _higgs_stream_item(row, codebook_size=7)
-        item.chunk_id = idx
-        scheduler._on_chunk("req", item)
-    scheduler._on_done("req")
+    def first_emission(low_latency: bool):
+        codec = _FakeHiggsStreamingCodec(samples_per_frame=4)
+        scheduler = HiggsStreamingVocoderScheduler(
+            codec,
+            stream_stride=8,
+            stream_followup_stride=8,
+            low_latency_startup=low_latency,
+        )
+        payload = _higgs_stream_payload(
+            "req", stream=True, delayed_rows=delayed.tolist(), codebook_size=25
+        )
+        scheduler._on_streaming_new_request("req", payload)
+        for idx, row in enumerate(delayed):
+            item = _higgs_stream_item(row, codebook_size=25)
+            item.chunk_id = idx
+            scheduler._on_chunk("req", item)
+            streams = [m for m in _drain_higgs_outbox(scheduler) if m.type == "stream"]
+            if streams:
+                audio = np.frombuffer(
+                    streams[0].data["audio_waveform"], dtype=np.float32
+                )
+                return idx + 1, audio.size // 4
+        return None, None
 
-    messages = _drain_higgs_outbox(scheduler)
-    stream_messages = [msg for msg in messages if msg.type == "stream"]
-    result_messages = [msg for msg in messages if msg.type == "result"]
-
-    assert stream_messages
-    first_chunk = stream_messages[0].data
-    assert "audio_waveform" in first_chunk
-    assert "audio_data" not in first_chunk
-    audio = np.frombuffer(first_chunk["audio_waveform"], dtype=np.float32)
-    assert audio.shape == tuple(first_chunk["audio_waveform_shape"])
-    assert first_chunk["audio_waveform_dtype"] == "float32"
-    assert first_chunk["sample_rate"] == 24000
-    assert codec.decode_inputs
-    assert all(int(codes.max().item()) < 5 for codes in codec.decode_inputs)
-
-    assert len(result_messages) == 1
-    final_data = result_messages[0].data.data
-    assert final_data == {
-        "modality": "audio",
-        "sample_rate": 24000,
-        "usage": {
-            "prompt_tokens": 2,
-            "completion_tokens": len(delayed),
-            "total_tokens": 2 + len(delayed),
-        },
-    }
-    assert "req" not in scheduler._pending_done
-    assert "req" not in scheduler._stream_states
-
-
-def test_higgs_streaming_vocoder_honors_initial_codec_chunk_frames() -> None:
-    raw_codes = torch.tensor(
-        [
-            [1, 8, 9],
-            [2, 3, 10],
-            [4, 11, 12],
-            [1, 2, 3],
-        ],
-        dtype=torch.long,
-    )
-    delayed = apply_delay_pattern(raw_codes)
-    codec = _FakeHiggsStreamingCodec(samples_per_frame=4)
-    scheduler = HiggsStreamingVocoderScheduler(
-        codec,
-        stream_stride=8,
-        stream_followup_stride=8,
-        stream_holdback_tokens=0,
-    )
-    payload = _higgs_stream_payload(
-        "req",
-        stream=True,
-        delayed_rows=delayed.tolist(),
-        codebook_size=20,
-        initial_codec_chunk_frames=1,
-    )
-
-    scheduler._on_streaming_new_request("req", payload)
-    for idx, row in enumerate(delayed[:2]):
-        item = _higgs_stream_item(row)
-        item.chunk_id = idx
-        scheduler._on_chunk("req", item)
-    assert not _drain_higgs_outbox(scheduler)
-
-    item = _higgs_stream_item(delayed[2])
-    item.chunk_id = 2
-    scheduler._on_chunk("req", item)
-    messages = _drain_higgs_outbox(scheduler)
-
-    assert len(messages) == 1
-    audio = np.frombuffer(messages[0].data["audio_waveform"], dtype=np.float32)
-    assert audio.size == 4
-    assert codec.decode_inputs[0].shape[0] == 1
+    rows_fast, frames_fast = first_emission(True)
+    rows_uniform, frames_uniform = first_emission(False)
+    # K8/M3: 3 frames emitted as soon as 8 delayed rows are buffered
+    assert (rows_fast, frames_fast) == (8, 3)
+    # uniform: the first chunk is a full steady chunk with full lookahead
+    assert frames_uniform == 6
+    assert rows_uniform > rows_fast
 
 
 def test_higgs_masked_startup_coalesces_ready_requests() -> None:
     codec = _FakeMaskedHiggsStreamingCodec()
     scheduler = HiggsStreamingVocoderScheduler(
         codec,
-        full_context_streaming=True,
         startup_masked_delay_rows=3,
         startup_masked_emit_frames=2,
         startup_masked_until_frames=2,
@@ -1200,7 +1155,6 @@ def test_higgs_masked_startup_coalesces_ready_requests() -> None:
 def test_higgs_masked_startup_keeps_configured_lookahead() -> None:
     scheduler = HiggsStreamingVocoderScheduler(
         _FakeMaskedHiggsStreamingCodec(),
-        full_context_streaming=True,
         startup_masked_delay_rows=8,
         startup_masked_emit_frames=3,
         startup_masked_until_frames=8,
@@ -1223,7 +1177,6 @@ def test_higgs_masked_startup_holds_back_eoc_adjacent_final_frame() -> None:
     delayed = apply_delay_pattern(raw_codes)
     scheduler = HiggsStreamingVocoderScheduler(
         _FakeMaskedHiggsStreamingCodec(),
-        full_context_streaming=True,
         startup_masked_delay_rows=3,
         startup_masked_emit_frames=3,
         startup_masked_until_frames=3,
@@ -1314,102 +1267,21 @@ def test_higgs_non_streaming_vocoder_drops_final_frame_and_codec_tail() -> None:
     assert bool((audio < 10_000).all())
 
 
-def test_higgs_initial_codec_chunk_frames_controls_first_chunk_only() -> None:
-    raw_codes = torch.tensor(
-        [
-            [1, 2, 3],
-            [4, 5, 6],
-            [7, 8, 9],
-            [10, 11, 12],
-            [13, 14, 15],
-            [16, 17, 18],
-        ],
-        dtype=torch.long,
-    )
-    delayed = apply_delay_pattern(raw_codes)
-    scheduler = HiggsStreamingVocoderScheduler(
-        _FakeUnevenHiggsStreamingCodec(),
-        stream_stride=6,
-        stream_followup_stride=3,
-        stream_overlap_tokens=1,
-        stream_holdback_tokens=4,
-    )
-    payload = _higgs_stream_payload(
-        "req",
-        stream=True,
-        delayed_rows=delayed.tolist(),
-        codebook_size=64,
-        initial_codec_chunk_frames=1,
-    )
-
-    scheduler._on_streaming_new_request("req", payload)
-    for row in delayed[:3]:
-        scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=64))
-
-    first_streams = [
-        msg for msg in _drain_higgs_outbox(scheduler) if msg.type == "stream"
-    ]
-    assert len(first_streams) == 1
-
-    for row in delayed[3:5]:
-        scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=64))
-
-    assert _drain_higgs_outbox(scheduler) == []
-
-
-def test_higgs_initial_chunk_resumes_after_followup_boundary() -> None:
-    raw_codes = torch.arange(1, 43, dtype=torch.long).reshape(14, 3)
-    delayed = apply_delay_pattern(raw_codes)
-    scheduler = HiggsStreamingVocoderScheduler(
-        _FakeUnevenHiggsStreamingCodec(),
-        stream_stride=8,
-        stream_followup_stride=4,
-        stream_overlap_tokens=1,
-        stream_holdback_tokens=0,
-    )
-    payload = _higgs_stream_payload(
-        "req",
-        stream=True,
-        delayed_rows=delayed.tolist(),
-        codebook_size=64,
-        initial_codec_chunk_frames=1,
-    )
-
-    scheduler._on_streaming_new_request("req", payload)
-    for row in delayed[:3]:
-        scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=64))
-
-    first_streams = [
-        msg for msg in _drain_higgs_outbox(scheduler) if msg.type == "stream"
-    ]
-    assert len(first_streams) == 1
-
-    for row in delayed[3:7]:
-        scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=64))
-    assert _drain_higgs_outbox(scheduler) == []
-
-    for row in delayed[7:11]:
-        scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=64))
-    assert _drain_higgs_outbox(scheduler) == []
-
-    scheduler._on_chunk("req", _higgs_stream_item(delayed[11], codebook_size=64))
-    second_streams = [
-        msg for msg in _drain_higgs_outbox(scheduler) if msg.type == "stream"
-    ]
-    assert len(second_streams) == 1
-
-
 def test_higgs_stream_contract_change_rejects_chunk_without_buffering() -> None:
-    scheduler = HiggsStreamingVocoderScheduler(_FakeHiggsStreamingCodec())
-    payload = _higgs_stream_payload("req", stream=True, delayed_rows=[[1, 2, 3]])
-    scheduler._on_streaming_new_request("req", payload)
-
+    # coalesced delivery surfaces contract violations as error messages and
+    # aborts the request instead of raising into the caller
     row = torch.tensor([1, 2, 3], dtype=torch.long)
-    with pytest.raises(ValueError, match="num_codebooks changed for"):
-        scheduler._on_chunk("req", _higgs_stream_item(row, num_codebooks=4))
-    with pytest.raises(ValueError, match="codebook_size changed for"):
-        scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=21))
-    assert scheduler._stream_states["req"].delayed_rows == []
+    for kwargs, needle in (
+        ({"num_codebooks": 4}, "num_codebooks changed for"),
+        ({"codebook_size": 21}, "codebook_size changed for"),
+    ):
+        scheduler = HiggsStreamingVocoderScheduler(_FakeHiggsStreamingCodec())
+        payload = _higgs_stream_payload("req", stream=True, delayed_rows=[[1, 2, 3]])
+        scheduler._on_streaming_new_request("req", payload)
+        scheduler._on_chunk("req", _higgs_stream_item(row, **kwargs))
+        errors = [m for m in _drain_higgs_outbox(scheduler) if m.type == "error"]
+        assert errors and needle in str(errors[0].data)
+        assert "req" not in scheduler._stream_states
 
 
 def test_higgs_stream_contract_requires_integer_values() -> None:
@@ -1419,9 +1291,10 @@ def test_higgs_stream_contract_requires_integer_values() -> None:
 
     item = _higgs_stream_item(torch.tensor([1, 2, 3], dtype=torch.long))
     item.metadata["num_codebooks"] = "three"
-    with pytest.raises(TypeError, match="must include integer"):
-        scheduler._on_chunk("req", item)
-    assert scheduler._stream_states["req"].delayed_rows == []
+    scheduler._on_chunk("req", item)
+    errors = [m for m in _drain_higgs_outbox(scheduler) if m.type == "error"]
+    assert errors and "must include integer" in str(errors[0].data)
+    assert "req" not in scheduler._stream_states
 
 
 def test_higgs_streaming_payload_missing_contract_fields_errors() -> None:

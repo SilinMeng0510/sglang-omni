@@ -70,7 +70,7 @@ class HiggsStreamingVocoderScheduler(
         stream_holdback_tokens: int = 4,
         max_batch_size: int = 4,
         max_batch_wait_ms: int = 2,
-        full_context_streaming: bool = False,
+        low_latency_startup: bool = True,
         context_frames: int = 9,
         startup_full_chunk_frames: int = 8,
         startup_full_chunk_count: int = 3,
@@ -106,7 +106,11 @@ class HiggsStreamingVocoderScheduler(
         self._stream_overlap_tokens = int(stream_overlap_tokens)
         self._stream_holdback_tokens = int(stream_holdback_tokens)
         self._samples_per_frame = self._resolve_samples_per_frame(codec)
-        self._full_context_streaming = bool(full_context_streaming)
+        # streaming decode is ALWAYS masked full-context (windowed decode is
+        # only the on_stream_done tail flush); this flag merely chooses
+        # whether the first frames trade lookahead for TTFA (K8/M3 startup
+        # schedule) or hold uniform stride emission from frame zero
+        self._low_latency_startup = bool(low_latency_startup)
         self._context_frames = int(context_frames)
         self._startup_full_chunk_frames = int(startup_full_chunk_frames)
         self._startup_full_chunk_count = int(startup_full_chunk_count)
@@ -120,9 +124,9 @@ class HiggsStreamingVocoderScheduler(
         self._startup_masked_delay_rows = int(startup_masked_delay_rows)
         self._startup_masked_emit_frames = int(startup_masked_emit_frames)
         self._startup_masked_until_frames = int(startup_masked_until_frames)
-        if self._full_context_streaming and not hasattr(codec, "decode_masked_batch"):
-            raise TypeError("full-context Higgs streaming requires decode_masked_batch")
-        self._can_batch_stream_chunks = self._full_context_streaming
+        if not hasattr(codec, "decode_masked_batch"):
+            raise TypeError("Higgs streaming requires decode_masked_batch")
+        self._can_batch_stream_chunks = True
 
         super().__init__(
             self._vocode_payload,
@@ -373,12 +377,12 @@ class HiggsStreamingVocoderScheduler(
     def _prepare_context_task(
         self, request_id: str, state: _HiggsStreamState
     ) -> _ContextDecodeTask | None:
-        if not self._full_context_streaming or not state.delayed_rows:
+        if not state.delayed_rows:
             return None
         num_codebooks, codebook_size = self._require_stream_contract(state, request_id)
         next_frame = state.next_emit_frame
         cache_len = len(state.delayed_rows)
-        if next_frame < self._startup_masked_until_frames:
+        if self._low_latency_startup and next_frame < self._startup_masked_until_frames:
             emit_frames = min(
                 self._startup_masked_emit_frames,
                 self._startup_masked_until_frames - next_frame,
@@ -397,7 +401,10 @@ class HiggsStreamingVocoderScheduler(
                 return None
             phase = "partial_masked_delay"
         else:
-            if next_frame < self._startup_reduced_context_until_frames:
+            if (
+                self._low_latency_startup
+                and next_frame < self._startup_reduced_context_until_frames
+            ):
                 emit_frames = min(
                     self._startup_full_chunk_frames,
                     self._startup_reduced_context_until_frames - next_frame,
@@ -405,7 +412,10 @@ class HiggsStreamingVocoderScheduler(
                 left_context = self._startup_reduced_left_context_frames
                 right_context = self._startup_reduced_context_frames
                 phase = "full_reduced_context"
-            elif state.startup_full_chunks_emitted < self._startup_full_chunk_count:
+            elif (
+                self._low_latency_startup
+                and state.startup_full_chunks_emitted < self._startup_full_chunk_count
+            ):
                 emit_frames = self._startup_full_chunk_frames
                 left_context = self._context_frames
                 right_context = self._context_frames
