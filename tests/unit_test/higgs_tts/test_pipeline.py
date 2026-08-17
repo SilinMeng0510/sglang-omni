@@ -39,14 +39,14 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
 def test_higgs_masked_startup_config_reaches_vocoder_factory() -> None:
     config = HiggsTtsPipelineConfig(
         model_path="fake-model",
-        vocoder_low_latency_startup=True,
+        vocoder_startup_low_latency=True,
         vocoder_startup_masked_delay_rows=8,
         vocoder_startup_masked_emit_frames=3,
         vocoder_startup_masked_until_frames=8,
     )
     vocoder = next(stage for stage in config.stages if stage.name == "vocoder")
 
-    assert vocoder.factory_args["low_latency_startup"] is True
+    assert vocoder.factory_args["startup_low_latency"] is True
     assert vocoder.factory_args["context_frames"] == 11
     assert vocoder.factory_args["startup_masked_delay_rows"] == 8
     assert vocoder.factory_args["startup_masked_emit_frames"] == 3
@@ -1060,7 +1060,7 @@ def test_higgs_steady_window_carries_receptive_field_context() -> None:
         codec,
         stream_stride=8,  # steady emit = 6 frames
         stream_followup_stride=8,
-        low_latency_startup=False,
+        startup_low_latency=False,
     )
     payload = _higgs_stream_payload(
         "req", stream=True, delayed_rows=delayed.tolist(), codebook_size=45
@@ -1076,8 +1076,8 @@ def test_higgs_steady_window_carries_receptive_field_context() -> None:
     assert interior, [t.shape[0] for t in codec.decode_inputs]
 
 
-def test_higgs_low_latency_startup_flag_controls_first_emissions() -> None:
-    """low_latency_startup=True front-loads small reduced-lookahead chunks
+def test_higgs_startup_low_latency_flag_controls_first_emissions() -> None:
+    """startup_low_latency=True front-loads small reduced-lookahead chunks
     (K8/M3) for fast TTFA; False holds uniform stride emission from frame
     zero (full lookahead before the first chunk)."""
     raw_codes = torch.tensor(
@@ -1091,7 +1091,7 @@ def test_higgs_low_latency_startup_flag_controls_first_emissions() -> None:
             codec,
             stream_stride=8,
             stream_followup_stride=8,
-            low_latency_startup=low_latency,
+            startup_low_latency=low_latency,
         )
         payload = _higgs_stream_payload(
             "req", stream=True, delayed_rows=delayed.tolist(), codebook_size=25

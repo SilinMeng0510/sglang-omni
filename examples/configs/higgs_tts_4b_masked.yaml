@@ -19,7 +19,7 @@ separate_vocoder_process: true
 # K8/M4 was also tested, but its latency gain was too small to pursue.
 vocoder_stream_stride: 32
 vocoder_stream_followup_stride: 32
-vocoder_low_latency_startup: true
+vocoder_startup_low_latency: true
 vocoder_startup_masked_delay_rows: 8
 vocoder_startup_masked_emit_frames: 3
 vocoder_startup_masked_until_frames: 8

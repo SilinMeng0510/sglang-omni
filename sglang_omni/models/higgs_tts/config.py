@@ -47,7 +47,7 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     vocoder_stream_followup_stride: int = Field(default=32, ge=1)
     # True = K8/M3 startup schedule (reduced lookahead for fast TTFA);
     # False = uniform stride emission from frame zero
-    vocoder_low_latency_startup: bool = True
+    vocoder_startup_low_latency: bool = True
     # steady decode context per side; 11 >= the codec decoder receptive
     # field (+-10.4 frames), decoupling chunk size from quality
     vocoder_context_frames: int = Field(default=11, ge=0)
@@ -126,7 +126,7 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                 stage.factory_args.update(
                     stream_stride=self.vocoder_stream_stride,
                     stream_followup_stride=self.vocoder_stream_followup_stride,
-                    low_latency_startup=self.vocoder_low_latency_startup,
+                    startup_low_latency=self.vocoder_startup_low_latency,
                     context_frames=self.vocoder_context_frames,
                     startup_masked_delay_rows=self.vocoder_startup_masked_delay_rows,
                     startup_masked_emit_frames=self.vocoder_startup_masked_emit_frames,
