@@ -180,10 +180,14 @@
     </div>
 
     <div class="card">
-      <h2>上游 LLM 模拟 <span class="chip">token 逐个产出</span></h2>
-      <div class="field" style="margin-bottom:2px">
+      <h2>节奏控制 <span class="chip">LLM 输出 · 播放缓冲</span></h2>
+      <div class="field">
         <label>token 间隔 <b id="rateVal" class="mono">100</b> ms/token <span id="rateTps" style="color:var(--ink-3)">（≈10 tok/s）</span></label>
         <input type="range" id="rate" min="20" max="400" step="10" value="100" />
+      </div>
+      <div class="field" style="margin-bottom:2px">
+        <label>播放预缓冲 <b id="prebufVal" class="mono">60</b> ms <span style="color:var(--ink-3)">（抗网络抖动，0=到即播）</span></label>
+        <input type="range" id="prebuf" min="0" max="500" step="20" value="60" />
       </div>
     </div>
 
@@ -332,7 +336,9 @@ function playPcm(f32) {
   buf.copyToChannel(f32, 0);
   const src = ctx.createBufferSource();
   src.buffer = buf; src.connect(ctx.destination);
-  const t = Math.max(ctx.currentTime + 0.06, playHead);
+  // 首块额外压一段预缓冲，用一点起播延迟换网络抖动下的不断流
+  const prebuf = playHead === 0 ? parseInt($("prebuf").value) / 1000 : 0;
+  const t = Math.max(ctx.currentTime + 0.06 + prebuf, playHead);
   src.start(t); playHead = t + buf.duration;
   if (playT0 === null) playT0 = t;
   liveSources.push(src);
@@ -436,6 +442,7 @@ function updateRateLabel() {
 }
 $("rate").addEventListener("input", updateRateLabel);
 updateRateLabel();
+$("prebuf").addEventListener("input", () => $("prebufVal").textContent = $("prebuf").value);
 
 // ---------------------------------------------------------------- HTTP 模式
 document.querySelectorAll("#segProto button").forEach(b => b.addEventListener("click", () => {

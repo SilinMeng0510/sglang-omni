@@ -64,7 +64,10 @@ _TTS_TASK_TYPE_ALIASES = {
 MAX_SPEECH_INPUT_CHARS = 4096
 MAX_REFERENCE_AUDIO_BYTES = 10 * 1024 * 1024
 _REFERENCE_AUDIO_FIELDS = ("audio_path", "ref_audio", "audio")
-RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES = 1
+# First chunk 4 frames (0.16 s — actually audible, unlike the old 1-frame
+# TTFA blip); the vocoder then doubles chunk sizes until the steady size, so
+# playback starts early and stays gapless (growth ratio 2 <= generation RTF).
+RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES = 4
 # Steady vocoder chunk for stream requests: 12 frames = 0.48 s at 25 Hz, so
 # live playback gets a continuous feed instead of the scheduler-wide 3 s
 # throughput chunks; costs ~1.5x vocoder compute on streaming requests only.

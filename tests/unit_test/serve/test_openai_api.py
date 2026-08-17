@@ -833,7 +833,7 @@ def test_raw_pcm_speech_request_defaults_initial_codec_chunk_frames() -> None:
         default_model="higgs-audio-v2"
     ).build_generate_request(req)
 
-    assert gen_req.extra_params["initial_codec_chunk_frames"] == 1
+    assert gen_req.extra_params["initial_codec_chunk_frames"] == 4
 
 
 def test_raw_pcm_speech_request_respects_explicit_initial_zero() -> None:

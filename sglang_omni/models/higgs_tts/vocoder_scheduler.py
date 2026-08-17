@@ -28,6 +28,11 @@ class _HiggsStreamState:
     delayed_rows: list[torch.Tensor] = field(default_factory=list)
     emitted_raw_frames: int = 0
     codec_chunk_frames: int = 0
+    # ramp-in: frame target of the NEXT emission (0 = steady). Doubles after
+    # each small chunk until it reaches the steady size, so playback starts
+    # early AND stays gapless (growth ratio 2 <= generation RTF).
+    next_chunk_frames: int = 0
+    ramp_initialized: bool = False
     next_decode_rows: int = 0
     num_codebooks: int | None = None
     codebook_size: int | None = None
@@ -244,18 +249,14 @@ class HiggsStreamingVocoderScheduler(
 
         stride_rows, followup_rows = self._steady_chunk_rows(state, num_codebooks)
         steady_codec_frames = max(1, stride_rows - num_codebooks + 1)
-        use_initial_chunk = (
-            state.initial_codec_chunk_frames > 0
-            and state.initial_codec_chunk_frames < steady_codec_frames
-            and not self._stream_has_emitted(request_id)
-        )
-        first_decode_rows = max(
-            num_codebooks,
-            state.initial_codec_chunk_frames + num_codebooks - 1,
-        )
+        target_frames = state.next_chunk_frames
+        use_small_chunk = 0 < target_frames < steady_codec_frames and not is_final
         next_decode_rows = state.next_decode_rows or (
-            first_decode_rows
-            if use_initial_chunk and not is_final
+            max(
+                num_codebooks,
+                state.emitted_raw_frames + target_frames + num_codebooks - 1,
+            )
+            if use_small_chunk
             else max(num_codebooks, stride_rows)
         )
         if not is_final and delayed_count < next_decode_rows:
@@ -270,8 +271,8 @@ class HiggsStreamingVocoderScheduler(
                 )
         else:
             emit_until_raw = raw_total
-        if use_initial_chunk and not is_final:
-            emit_until_raw = min(raw_total, state.initial_codec_chunk_frames)
+        if use_small_chunk:
+            emit_until_raw = min(raw_total, state.emitted_raw_frames + target_frames)
         elif not is_final:
             emit_until_raw = max(
                 0,
@@ -312,10 +313,15 @@ class HiggsStreamingVocoderScheduler(
             return None
 
         state.emitted_raw_frames = emit_until_raw
+        if use_small_chunk:
+            doubled = target_frames * 2
+            state.next_chunk_frames = 0 if doubled >= steady_codec_frames else doubled
         state.next_decode_rows = self._next_decode_rows_after_emit(
             delayed_count,
             num_codebooks=num_codebooks,
-            emitted_initial_chunk=use_initial_chunk and not is_final,
+            emitted_small_chunk=use_small_chunk,
+            next_chunk_frames=state.next_chunk_frames,
+            emitted_raw_frames=state.emitted_raw_frames,
             stride_rows=stride_rows,
             followup_rows=followup_rows,
         )
@@ -581,6 +587,11 @@ class HiggsStreamingVocoderScheduler(
             params,
             steady_chunk_frames=steady_codec_frames,
         )
+        # metadata re-latches on every chunk; only seed the ramp once so the
+        # doubling progression is not reset mid-stream
+        if not state.ramp_initialized:
+            state.next_chunk_frames = state.initial_codec_chunk_frames
+            state.ramp_initialized = True
 
     def _steady_chunk_rows(
         self, state: _HiggsStreamState, num_codebooks: int
@@ -610,11 +621,18 @@ class HiggsStreamingVocoderScheduler(
         delayed_count: int,
         *,
         num_codebooks: int,
-        emitted_initial_chunk: bool,
+        emitted_small_chunk: bool,
+        next_chunk_frames: int,
+        emitted_raw_frames: int,
         stride_rows: int,
         followup_rows: int,
     ) -> int:
-        if emitted_initial_chunk:
+        if emitted_small_chunk:
+            if next_chunk_frames > 0:  # ramp continues: decode at the next target
+                return max(
+                    num_codebooks,
+                    emitted_raw_frames + next_chunk_frames + num_codebooks - 1,
+                )
             return max(num_codebooks, stride_rows) + followup_rows
         return delayed_count + followup_rows
 
