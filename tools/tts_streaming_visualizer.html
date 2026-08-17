@@ -182,12 +182,12 @@
     <div class="card">
       <h2>节奏控制 <span class="chip">LLM 输出 · 播放缓冲</span></h2>
       <div class="field">
-        <label>token 间隔 <b id="rateVal" class="mono">100</b> ms/token <span id="rateTps" style="color:var(--ink-3)">（≈10 tok/s）</span></label>
-        <input type="range" id="rate" min="20" max="400" step="10" value="100" />
+        <label>token 间隔 <b id="rateVal" class="mono">20</b> ms/token <span id="rateTps" style="color:var(--ink-3)">（≈50 tok/s）</span></label>
+        <input type="range" id="rate" min="20" max="400" step="10" value="20" />
       </div>
       <div class="field" style="margin-bottom:2px">
-        <label>播放预缓冲 <b id="prebufVal" class="mono">300</b> ms <span style="color:var(--ink-3)">（吸收启动段到达抖动，0=到即播）</span></label>
-        <input type="range" id="prebuf" min="0" max="600" step="20" value="300" />
+        <label>播放预缓冲 <b id="prebufVal" class="mono">400</b> ms <span style="color:var(--ink-3)">（吸收启动段到达抖动，0=到即播）</span></label>
+        <input type="range" id="prebuf" min="0" max="600" step="20" value="400" />
       </div>
     </div>
 
