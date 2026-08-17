@@ -64,7 +64,7 @@ class HiggsStreamingVocoderScheduler(
         stream_holdback_tokens: int = 4,
         max_batch_size: int = 4,
         max_batch_wait_ms: int = 2,
-        startup_low_latency: bool = True,
+        startup_masked: bool = True,
         # >= the DAC decoder's receptive field (+-10.4 frames at 25 Hz),
         # so steady-phase chunk size never affects decode quality
         context_frames: int = 11,
@@ -101,7 +101,7 @@ class HiggsStreamingVocoderScheduler(
         self._stream_overlap_tokens = int(stream_overlap_tokens)
         self._stream_holdback_tokens = int(stream_holdback_tokens)
         self._samples_per_frame = self._resolve_samples_per_frame(codec)
-        self._startup_low_latency = bool(startup_low_latency)
+        self._startup_masked = bool(startup_masked)
         self._context_frames = int(context_frames)
         self._startup_full_chunk_frames = int(startup_full_chunk_frames)
         self._startup_full_chunk_count = int(startup_full_chunk_count)
@@ -340,7 +340,7 @@ class HiggsStreamingVocoderScheduler(
         num_codebooks, codebook_size = self._require_stream_contract(state, request_id)
         next_frame = state.next_emit_frame
         cache_len = len(state.delayed_rows)
-        if self._startup_low_latency and next_frame < self._startup_masked_until_frames:
+        if self._startup_masked and next_frame < self._startup_masked_until_frames:
             emit_frames = min(
                 self._startup_masked_emit_frames,
                 self._startup_masked_until_frames - next_frame,
@@ -360,7 +360,7 @@ class HiggsStreamingVocoderScheduler(
             phase = "partial_masked_delay"
         else:
             if (
-                self._startup_low_latency
+                self._startup_masked
                 and next_frame < self._startup_reduced_context_until_frames
             ):
                 emit_frames = min(
@@ -371,7 +371,7 @@ class HiggsStreamingVocoderScheduler(
                 right_context = self._startup_reduced_context_frames
                 phase = "full_reduced_context"
             elif (
-                self._startup_low_latency
+                self._startup_masked
                 and state.startup_full_chunks_emitted < self._startup_full_chunk_count
             ):
                 emit_frames = self._startup_full_chunk_frames
