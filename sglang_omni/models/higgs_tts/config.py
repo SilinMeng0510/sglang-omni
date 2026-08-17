@@ -56,6 +56,11 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     # listening-tested K8/M3 schedule emits the first frames with reduced
     # lookahead for fast TTFA; False = uniform stride emission from frame 0.
     vocoder_low_latency_startup: bool = True
+    # steady-phase decode context per side; 11 >= the codec decoder's
+    # receptive field (+-10.4 frames), which makes steady chunk seams
+    # bit-exact vs whole-utterance decode — stride becomes pure cadence.
+    # Costs 2 extra frames (80 ms) of steady lookahead vs the old 9.
+    vocoder_context_frames: int = Field(default=11, ge=0)
     vocoder_startup_masked_delay_rows: int = Field(default=8, ge=1)
     vocoder_startup_masked_emit_frames: int = Field(default=3, ge=1)
     vocoder_startup_masked_until_frames: int = Field(default=8, ge=1)
@@ -132,6 +137,7 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                     stream_stride=self.vocoder_stream_stride,
                     stream_followup_stride=self.vocoder_stream_followup_stride,
                     low_latency_startup=self.vocoder_low_latency_startup,
+                    context_frames=self.vocoder_context_frames,
                     startup_masked_delay_rows=self.vocoder_startup_masked_delay_rows,
                     startup_masked_emit_frames=self.vocoder_startup_masked_emit_frames,
                     startup_masked_until_frames=self.vocoder_startup_masked_until_frames,

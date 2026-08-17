@@ -71,7 +71,14 @@ class HiggsStreamingVocoderScheduler(
         max_batch_size: int = 4,
         max_batch_wait_ms: int = 2,
         low_latency_startup: bool = True,
-        context_frames: int = 9,
+        # >= the DAC decoder's receptive field (+-10.4 frames at 25 Hz, from
+        # conv1 k7 + upsampling blocks [8,5,4,2,3] each with k7 residual
+        # units at dilations 1/3/9 + conv2 k7), so every steady-phase frame
+        # decodes bit-identically to the whole-utterance decode: chunk size
+        # (stream_stride) is pure emission cadence, fully decoupled from
+        # quality. The K8/M3 startup phases keep their listening-tested
+        # reduced lookahead — that is the TTFA trade, a separate decision.
+        context_frames: int = 11,
         startup_full_chunk_frames: int = 8,
         startup_full_chunk_count: int = 3,
         startup_reduced_context_frames: int = 6,

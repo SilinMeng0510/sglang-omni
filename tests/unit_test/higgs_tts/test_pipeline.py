@@ -47,6 +47,7 @@ def test_higgs_masked_startup_config_reaches_vocoder_factory() -> None:
     vocoder = next(stage for stage in config.stages if stage.name == "vocoder")
 
     assert vocoder.factory_args["low_latency_startup"] is True
+    assert vocoder.factory_args["context_frames"] == 11
     assert vocoder.factory_args["startup_masked_delay_rows"] == 8
     assert vocoder.factory_args["startup_masked_emit_frames"] == 3
     assert vocoder.factory_args["startup_masked_until_frames"] == 8
@@ -1070,6 +1071,34 @@ def _higgs_stream_item(
             "codebook_size": codebook_size,
         },
     )
+
+
+def test_higgs_steady_window_carries_receptive_field_context() -> None:
+    """Steady-phase decode windows must carry context_frames (11 >= codec
+    receptive field) each side, so chunk size never touches quality."""
+    raw_codes = torch.tensor(
+        [[i + 1, i + 8, i + 15] for i in range(40)], dtype=torch.long
+    )
+    delayed = apply_delay_pattern(raw_codes)
+    codec = _FakeHiggsStreamingCodec(samples_per_frame=4)
+    scheduler = HiggsStreamingVocoderScheduler(
+        codec,
+        stream_stride=8,  # steady emit = 6 frames
+        stream_followup_stride=8,
+        low_latency_startup=False,
+    )
+    payload = _higgs_stream_payload(
+        "req", stream=True, delayed_rows=delayed.tolist(), codebook_size=45
+    )
+    scheduler._on_streaming_new_request("req", payload)
+    for idx, row in enumerate(delayed):
+        item = _higgs_stream_item(row, codebook_size=45)
+        item.chunk_id = idx
+        scheduler._on_chunk("req", item)
+        _drain_higgs_outbox(scheduler)
+    # an interior steady chunk decodes left(11) + emit(6) + right(11) frames
+    interior = [t.shape[0] for t in codec.decode_inputs if t.shape[0] == 11 + 6 + 11]
+    assert interior, [t.shape[0] for t in codec.decode_inputs]
 
 
 def test_higgs_low_latency_startup_flag_controls_first_emissions() -> None:
