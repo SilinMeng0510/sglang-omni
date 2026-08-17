@@ -12,11 +12,7 @@ from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import build_usage
-from sglang_omni.scheduling.streaming_vocoder import (
-    INITIAL_CODEC_CHUNK_FRAMES_PARAM,
-    StreamingVocoderBase,
-    resolve_initial_codec_chunk_frames,
-)
+from sglang_omni.scheduling.streaming_vocoder import StreamingVocoderBase
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 from sglang_omni.utils.codec_delay import reverse_delay_pattern
 
@@ -28,7 +24,6 @@ class _HiggsStreamState:
     next_decode_rows: int = 0
     num_codebooks: int | None = None
     codebook_size: int | None = None
-    initial_codec_chunk_frames: int = 0
     next_emit_frame: int = 0
     startup_full_chunks_emitted: int = 0
 
@@ -171,15 +166,6 @@ class HiggsStreamingVocoderScheduler(
                 codebook_size=payload.data.get("codebook_size", state.codebook_size),
                 source=origin,
             )
-            self._latch_initial_codec_chunk_frames_from_mapping(
-                request_id,
-                state,
-                (
-                    payload.request.params
-                    if isinstance(payload.request.params, dict)
-                    else None
-                ),
-            )
             return
         metadata: Mapping[str, Any] = source
         missing = [
@@ -197,12 +183,6 @@ class HiggsStreamingVocoderScheduler(
                 num_codebooks=metadata["num_codebooks"],
                 codebook_size=metadata["codebook_size"],
                 source=origin,
-            )
-        if INITIAL_CODEC_CHUNK_FRAMES_PARAM in metadata:
-            self._latch_initial_codec_chunk_frames_from_mapping(
-                request_id,
-                state,
-                metadata,
             )
 
     def validate_chunk(
@@ -238,20 +218,8 @@ class HiggsStreamingVocoderScheduler(
             return None
         raw_total = delayed_count - num_codebooks + 1
 
-        steady_codec_frames = max(1, self._stream_stride - num_codebooks + 1)
-        use_initial_chunk = (
-            state.initial_codec_chunk_frames > 0
-            and state.initial_codec_chunk_frames < steady_codec_frames
-            and not self._stream_has_emitted(request_id)
-        )
-        first_decode_rows = max(
-            num_codebooks,
-            state.initial_codec_chunk_frames + num_codebooks - 1,
-        )
-        next_decode_rows = state.next_decode_rows or (
-            first_decode_rows
-            if use_initial_chunk and not is_final
-            else max(num_codebooks, self._stream_stride)
+        next_decode_rows = state.next_decode_rows or max(
+            num_codebooks, self._stream_stride
         )
         if not is_final and delayed_count < next_decode_rows:
             state.next_decode_rows = next_decode_rows
@@ -265,9 +233,7 @@ class HiggsStreamingVocoderScheduler(
                 )
         else:
             emit_until_raw = raw_total
-        if use_initial_chunk and not is_final:
-            emit_until_raw = min(raw_total, state.initial_codec_chunk_frames)
-        elif not is_final:
+        if not is_final:
             emit_until_raw = max(
                 0,
                 raw_total - max(1, self._stream_holdback_tokens),
@@ -307,11 +273,7 @@ class HiggsStreamingVocoderScheduler(
             return None
 
         state.emitted_raw_frames = emit_until_raw
-        state.next_decode_rows = self._next_decode_rows_after_emit(
-            delayed_count,
-            num_codebooks=num_codebooks,
-            emitted_initial_chunk=use_initial_chunk and not is_final,
-        )
+        state.next_decode_rows = delayed_count + self._stream_followup_stride
         return delta
 
     def select_step_participants(self) -> list[tuple[str, _HiggsStreamState]]:
@@ -565,19 +527,6 @@ class HiggsStreamingVocoderScheduler(
         state.num_codebooks = num_codebooks_i
         state.codebook_size = codebook_size_i
 
-    def _latch_initial_codec_chunk_frames_from_mapping(
-        self,
-        request_id: str,
-        state: _HiggsStreamState,
-        params: Mapping[str, Any] | None,
-    ) -> None:
-        num_codebooks, _ = self._require_stream_contract(state, request_id)
-        steady_codec_frames = max(1, self._stream_stride - num_codebooks + 1)
-        state.initial_codec_chunk_frames = resolve_initial_codec_chunk_frames(
-            params,
-            steady_chunk_frames=steady_codec_frames,
-        )
-
     @staticmethod
     def _require_stream_contract(
         state: _HiggsStreamState,
@@ -589,19 +538,6 @@ class HiggsStreamingVocoderScheduler(
                 "num_codebooks or codebook_size"
             )
         return state.num_codebooks, state.codebook_size
-
-    def _next_decode_rows_after_emit(
-        self,
-        delayed_count: int,
-        *,
-        num_codebooks: int,
-        emitted_initial_chunk: bool,
-    ) -> int:
-        if emitted_initial_chunk:
-            return (
-                max(num_codebooks, self._stream_stride) + self._stream_followup_stride
-            )
-        return delayed_count + self._stream_followup_stride
 
     def _vocode_payload(self, payload: StagePayload) -> StagePayload:
         return self._vocode_payloads([payload])[0]

@@ -623,28 +623,6 @@ def test_higgs_model_runner_emits_latched_stream_metadata() -> None:
     }
 
 
-def test_higgs_stream_metadata_carries_initial_codec_chunk_frames() -> None:
-    payload = StagePayload(
-        request_id="req",
-        request=OmniRequest(
-            inputs="",
-            params={"stream": True, "initial_codec_chunk_frames": 1},
-        ),
-        data={},
-    )
-    data = SimpleNamespace(num_codebooks=3, codebook_size=17)
-
-    metadata = build_higgs_stream_metadata(payload, data)
-
-    assert metadata == {
-        "modality": "audio_codes",
-        "stream": True,
-        "num_codebooks": 3,
-        "codebook_size": 17,
-        "initial_codec_chunk_frames": 1,
-    }
-
-
 def test_higgs_model_runner_marks_sampler_finish_cg() -> None:
     runner = object.__new__(HiggsTTSModelRunner)
     runner._outbox = None
@@ -1035,7 +1013,6 @@ def _higgs_stream_payload(
     delayed_rows: list[list[int]],
     num_codebooks: int = 3,
     codebook_size: int = 20,
-    initial_codec_chunk_frames: int | None = None,
 ) -> StagePayload:
     state = HiggsTtsState(
         output_codes_delayed=delayed_rows,
@@ -1045,8 +1022,6 @@ def _higgs_stream_payload(
         completion_tokens=len(delayed_rows),
     )
     params: dict[str, Any] = {"stream": stream}
-    if initial_codec_chunk_frames is not None:
-        params["initial_codec_chunk_frames"] = initial_codec_chunk_frames
     return StagePayload(
         request_id=request_id,
         request=OmniRequest(inputs="", params=params),

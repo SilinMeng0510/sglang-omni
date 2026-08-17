@@ -22,7 +22,6 @@ from sglang_omni.models.higgs_tts.streaming_protocol import (
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
-from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 
 
 @dataclass
@@ -201,10 +200,6 @@ def build_higgs_stream_metadata(
         "num_codebooks": num_codebooks,
         "codebook_size": codebook_size,
     }
-    if params.get(INITIAL_CODEC_CHUNK_FRAMES_PARAM) is not None:
-        metadata[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = params[
-            INITIAL_CODEC_CHUNK_FRAMES_PARAM
-        ]
     return metadata
 
 
@@ -295,7 +290,6 @@ def make_higgs_scheduler_adapters(
 
 __all__ = [
     "HiggsSGLangRequestData",
-    "INITIAL_CODEC_CHUNK_FRAMES_PARAM",
     "apply_higgs_result",
     "build_higgs_stream_metadata",
     "build_sglang_higgs_request",
