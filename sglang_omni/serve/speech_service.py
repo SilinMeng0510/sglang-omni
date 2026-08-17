@@ -65,13 +65,11 @@ MAX_SPEECH_INPUT_CHARS = 4096
 MAX_REFERENCE_AUDIO_BYTES = 10 * 1024 * 1024
 _REFERENCE_AUDIO_FIELDS = ("audio_path", "ref_audio", "audio")
 # First chunk 4 frames (0.16 s — actually audible, unlike the old 1-frame
-# TTFA blip); the vocoder then doubles chunk sizes until the steady size, so
-# playback starts early and stays gapless (growth ratio 2 <= generation RTF).
+# TTFA blip); the windowed vocoder path then doubles chunk sizes until the
+# steady size (growth ratio 2 <= generation RTF). The default masked
+# full-context path has its own listening-tested startup schedule and
+# ignores this parameter.
 RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES = 4
-# Steady vocoder chunk for stream requests: 12 frames = 0.48 s at 25 Hz, so
-# live playback gets a continuous feed instead of the scheduler-wide 3 s
-# throughput chunks; costs ~1.5x vocoder compute on streaming requests only.
-RAW_PCM_DEFAULT_CODEC_CHUNK_FRAMES = 12
 # Mirrors speech_voices.DEFAULT_VOICE_PRESETS[0]; kept as a literal because that
 # module is imported lazily (it pulls in numpy/safetensors).
 DEFAULT_SPEECH_VOICE = "default"
@@ -835,14 +833,10 @@ def _build_extra_params(request: CreateSpeechRequest) -> dict[str, Any]:
         initial_codec_chunk_frames = RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES
     if initial_codec_chunk_frames is not None:
         extra_params[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = initial_codec_chunk_frames
-    codec_chunk_frames = request.codec_chunk_frames
-    if codec_chunk_frames is None and request.stream:
-        # live playback needs a continuous feed: without this, the vocoder's
-        # throughput-oriented steady chunk (3 s) makes audible starts lag the
-        # first tiny TTFA chunk by seconds
-        codec_chunk_frames = RAW_PCM_DEFAULT_CODEC_CHUNK_FRAMES
-    if codec_chunk_frames is not None:
-        extra_params[CODEC_CHUNK_FRAMES_PARAM] = codec_chunk_frames
+    if request.codec_chunk_frames is not None:
+        # windowed-path steady chunk override; the default masked
+        # full-context path manages its own emission schedule
+        extra_params[CODEC_CHUNK_FRAMES_PARAM] = request.codec_chunk_frames
     if request.streaming_protocol:
         extra_params["streaming_protocol"] = True
     return extra_params

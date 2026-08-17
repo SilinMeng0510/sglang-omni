@@ -928,12 +928,9 @@ def test_speech_request_passes_streaming_control_fields() -> None:
     assert tts_params["initial_codec_chunk_frames"] == 8
     assert tts_params["x_vector_only_mode"] is True
     assert tts_params["response_format"] == "pcm"
-    # stream requests default the steady vocoder chunk to a small live-playback
-    # size; an explicit codec_chunk_frames overrides it
-    assert gen_req.extra_params == {
-        "initial_codec_chunk_frames": 8,
-        "codec_chunk_frames": 12,
-    }
+    # no steady-chunk default: the masked full-context vocoder path manages
+    # its own emission schedule; codec_chunk_frames is opt-in (windowed path)
+    assert gen_req.extra_params == {"initial_codec_chunk_frames": 8}
 
     req_explicit = req.model_copy(update={"codec_chunk_frames": 25})
     gen_req = SpeechRequestValidator(default_model="qwen3-tts").build_generate_request(
