@@ -45,12 +45,31 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 INITIAL_CODEC_CHUNK_FRAMES_PARAM = "initial_codec_chunk_frames"
+CODEC_CHUNK_FRAMES_PARAM = "codec_chunk_frames"
 
 _COMPLETED_STREAM_REQUEST_ID_LIMIT = 10000
 _COMPLETED_STREAM_REQUEST_ID_RETAINED = 5000
 
 StreamStateT = TypeVar("StreamStateT")
 StepPlanT = TypeVar("StepPlanT")
+
+
+def resolve_codec_chunk_frames(params: Mapping[str, Any] | None) -> int:
+    """Return the request-level STEADY codec chunk size in frames (0 = unset,
+    scheduler default applies). Small values trade vocoder efficiency for
+    smooth real-time playback cadence."""
+    if params is None:
+        return 0
+    value = params.get(CODEC_CHUNK_FRAMES_PARAM)
+    if value is None:
+        return 0
+    try:
+        frames = int(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{CODEC_CHUNK_FRAMES_PARAM} must be an integer") from exc
+    if frames < 1:
+        raise ValueError(f"{CODEC_CHUNK_FRAMES_PARAM} must be >= 1")
+    return frames
 
 
 def resolve_initial_codec_chunk_frames(
@@ -504,7 +523,9 @@ class StreamingVocoderBase(
 
 
 __all__ = [
+    "CODEC_CHUNK_FRAMES_PARAM",
     "INITIAL_CODEC_CHUNK_FRAMES_PARAM",
     "StreamingVocoderBase",
+    "resolve_codec_chunk_frames",
     "resolve_initial_codec_chunk_frames",
 ]

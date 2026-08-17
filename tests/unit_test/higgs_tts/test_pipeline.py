@@ -1114,6 +1114,48 @@ def test_higgs_streaming_vocoder_emits_compact_chunks_and_slim_final() -> None:
     assert "req" not in scheduler._stream_states
 
 
+def test_higgs_streaming_vocoder_honors_request_codec_chunk_frames() -> None:
+    """A request-level codec_chunk_frames overrides the scheduler-wide steady
+    stride: emissions start after ~chunk_frames rows instead of the (large)
+    server stride, giving live playback a continuous feed."""
+    raw_codes = torch.tensor(
+        [[i + 1, i + 8, i + 15] for i in range(6)],
+        dtype=torch.long,
+    )
+    delayed = apply_delay_pattern(raw_codes)
+    codec = _FakeHiggsStreamingCodec(samples_per_frame=4)
+    scheduler = HiggsStreamingVocoderScheduler(
+        codec,
+        stream_stride=8,  # server-wide steady chunk: would need all 8 rows
+        stream_followup_stride=8,
+        stream_holdback_tokens=0,
+    )
+    payload = _higgs_stream_payload(
+        "req",
+        stream=True,
+        delayed_rows=delayed.tolist(),
+        codebook_size=25,
+    )
+    payload.request.params["codec_chunk_frames"] = 2
+
+    scheduler._on_streaming_new_request("req", payload)
+    emissions_at: list[int] = []
+    for idx, row in enumerate(delayed):
+        item = _higgs_stream_item(row, codebook_size=25)
+        item.chunk_id = idx
+        scheduler._on_chunk("req", item)
+        if any(m.type == "stream" for m in _drain_higgs_outbox(scheduler)):
+            emissions_at.append(idx + 1)
+    scheduler._on_done("req")
+    final = _drain_higgs_outbox(scheduler)
+
+    # first emission after ~stride_rows(2 + 3 - 1 = 4) rows, well before the
+    # server-wide 8-row stride, and repeatedly afterwards
+    assert emissions_at and emissions_at[0] <= 4
+    assert len(emissions_at) >= 2
+    assert any(m.type == "result" for m in final)
+
+
 def test_higgs_streaming_vocoder_honors_initial_codec_chunk_frames() -> None:
     raw_codes = torch.tensor(
         [

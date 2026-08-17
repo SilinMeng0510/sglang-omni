@@ -13,8 +13,10 @@ from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import (
+    CODEC_CHUNK_FRAMES_PARAM,
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
     StreamingVocoderBase,
+    resolve_codec_chunk_frames,
     resolve_initial_codec_chunk_frames,
 )
 from sglang_omni.utils.audio_payload import audio_waveform_payload
@@ -25,6 +27,7 @@ from sglang_omni.utils.codec_delay import reverse_delay_pattern
 class _HiggsStreamState:
     delayed_rows: list[torch.Tensor] = field(default_factory=list)
     emitted_raw_frames: int = 0
+    codec_chunk_frames: int = 0
     next_decode_rows: int = 0
     num_codebooks: int | None = None
     codebook_size: int | None = None
@@ -196,7 +199,10 @@ class HiggsStreamingVocoderScheduler(
                 codebook_size=metadata["codebook_size"],
                 source=origin,
             )
-        if INITIAL_CODEC_CHUNK_FRAMES_PARAM in metadata:
+        if (
+            INITIAL_CODEC_CHUNK_FRAMES_PARAM in metadata
+            or CODEC_CHUNK_FRAMES_PARAM in metadata
+        ):
             self._latch_initial_codec_chunk_frames_from_mapping(
                 request_id,
                 state,
@@ -236,7 +242,8 @@ class HiggsStreamingVocoderScheduler(
             return None
         raw_total = delayed_count - num_codebooks + 1
 
-        steady_codec_frames = max(1, self._stream_stride - num_codebooks + 1)
+        stride_rows, followup_rows = self._steady_chunk_rows(state, num_codebooks)
+        steady_codec_frames = max(1, stride_rows - num_codebooks + 1)
         use_initial_chunk = (
             state.initial_codec_chunk_frames > 0
             and state.initial_codec_chunk_frames < steady_codec_frames
@@ -249,7 +256,7 @@ class HiggsStreamingVocoderScheduler(
         next_decode_rows = state.next_decode_rows or (
             first_decode_rows
             if use_initial_chunk and not is_final
-            else max(num_codebooks, self._stream_stride)
+            else max(num_codebooks, stride_rows)
         )
         if not is_final and delayed_count < next_decode_rows:
             state.next_decode_rows = next_decode_rows
@@ -274,7 +281,7 @@ class HiggsStreamingVocoderScheduler(
         if emit_until_raw < state.emitted_raw_frames or (
             emit_until_raw == state.emitted_raw_frames and not can_flush_codec_tail
         ):
-            state.next_decode_rows = delayed_count + self._stream_followup_stride
+            state.next_decode_rows = delayed_count + followup_rows
             return None
 
         window_start_raw = max(
@@ -301,7 +308,7 @@ class HiggsStreamingVocoderScheduler(
         else:
             delta = audio[trim_samples:].contiguous()
         if delta.numel() == 0:
-            state.next_decode_rows = delayed_count + self._stream_followup_stride
+            state.next_decode_rows = delayed_count + followup_rows
             return None
 
         state.emitted_raw_frames = emit_until_raw
@@ -309,6 +316,8 @@ class HiggsStreamingVocoderScheduler(
             delayed_count,
             num_codebooks=num_codebooks,
             emitted_initial_chunk=use_initial_chunk and not is_final,
+            stride_rows=stride_rows,
+            followup_rows=followup_rows,
         )
         return delta
 
@@ -564,11 +573,25 @@ class HiggsStreamingVocoderScheduler(
         params: Mapping[str, Any] | None,
     ) -> None:
         num_codebooks, _ = self._require_stream_contract(state, request_id)
-        steady_codec_frames = max(1, self._stream_stride - num_codebooks + 1)
+        state.codec_chunk_frames = resolve_codec_chunk_frames(params)
+        steady_codec_frames = state.codec_chunk_frames or max(
+            1, self._stream_stride - num_codebooks + 1
+        )
         state.initial_codec_chunk_frames = resolve_initial_codec_chunk_frames(
             params,
             steady_chunk_frames=steady_codec_frames,
         )
+
+    def _steady_chunk_rows(
+        self, state: _HiggsStreamState, num_codebooks: int
+    ) -> tuple[int, int]:
+        """Per-request (stride_rows, followup_rows): a request-level
+        ``codec_chunk_frames`` overrides the scheduler-wide stride so
+        interactive sessions can stream small, frequent deltas."""
+        if state.codec_chunk_frames > 0:
+            stride = state.codec_chunk_frames + num_codebooks - 1
+            return stride, state.codec_chunk_frames
+        return self._stream_stride, self._stream_followup_stride
 
     @staticmethod
     def _require_stream_contract(
@@ -588,12 +611,12 @@ class HiggsStreamingVocoderScheduler(
         *,
         num_codebooks: int,
         emitted_initial_chunk: bool,
+        stride_rows: int,
+        followup_rows: int,
     ) -> int:
         if emitted_initial_chunk:
-            return (
-                max(num_codebooks, self._stream_stride) + self._stream_followup_stride
-            )
-        return delayed_count + self._stream_followup_stride
+            return max(num_codebooks, stride_rows) + followup_rows
+        return delayed_count + followup_rows
 
     def _vocode_payload(self, payload: StagePayload) -> StagePayload:
         return self._vocode_payloads([payload])[0]
