@@ -1,11 +1,11 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Streaming TTS Lab</title>
 <style>
-  /* 调色板：validated 双模式（深色优先的开发工具） */
+  /* palette: validated dual-mode (dark-first dev tool) */
   :root {
     color-scheme: dark;
     --bg: #141413;         --surface: #1a1a19;      --raised: #222220;
@@ -106,7 +106,7 @@
   }
   button.ghost:hover { color: var(--ink); border-color: var(--ink-3); }
 
-  /* 指标块 */
+  /* stat tiles */
   .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 4px 0 10px; }
   @media (max-width: 700px) { .stats { grid-template-columns: repeat(2, 1fr); } }
   .stat { background: var(--raised); border: 1px solid var(--edge-soft); border-radius: 11px; padding: 10px 12px; }
@@ -152,98 +152,98 @@
   <h1>Streaming <span class="accent">TTS</span> Lab</h1>
   <span class="chip">PR #53 · offline / streaming / incremental</span>
   <span class="spacer"></span>
-  <label style="margin:0" for="base">服务地址</label>
+  <label style="margin:0" for="base">Server</label>
   <input type="text" id="base" style="width:230px" />
-  <span class="dot" id="connDot" title="服务状态"></span>
-  <span id="connText" style="font-size:12px;color:var(--ink-3)">未连接</span>
+  <span class="dot" id="connDot" title="server status"></span>
+  <span id="connText" style="font-size:12px;color:var(--ink-3)">disconnected</span>
 </header>
 
 <main>
 <div class="cols">
-  <!-- ====================== 左列：配置 + 发起 ====================== -->
+  <!-- ====================== left column: config + launch ====================== -->
   <div style="display:grid;gap:16px">
     <div class="card">
-      <h2>音色与采样</h2>
+      <h2>Voice &amp; Sampling</h2>
       <div class="field">
-        <label for="refFile">参考音频（可选 · 留空用服务端默认音色）</label>
+        <label for="refFile">Reference audio (optional; empty = server default voice)</label>
         <input type="file" id="refFile" accept="audio/*" />
       </div>
       <div class="field">
-        <label for="refText">参考音频文字（配合参考音频）</label>
+        <label for="refText">Reference transcript (pairs with the reference audio)</label>
         <input type="text" id="refText" placeholder="reference transcript…" />
       </div>
       <div class="inline">
         <div class="field"><label for="temp">temperature</label><input type="number" id="temp" value="0.8" step="0.05" min="0" max="2" /></div>
         <div class="field"><label for="topk">top_k</label><input type="number" id="topk" value="50" step="1" min="0" /></div>
-        <div class="field"><label for="seed">seed（空=随机）</label><input type="number" id="seed" placeholder="—" /></div>
+        <div class="field"><label for="seed">seed (empty = random)</label><input type="number" id="seed" placeholder="—" /></div>
       </div>
     </div>
 
     <div class="card">
-      <h2>节奏控制 <span class="chip">LLM 输出 · 播放缓冲</span></h2>
+      <h2>Pacing <span class="chip">LLM output · playback buffer</span></h2>
       <div class="field">
-        <label>token 间隔 <b id="rateVal" class="mono">20</b> ms/token <span id="rateTps" style="color:var(--ink-3)">（≈50 tok/s）</span></label>
+        <label>Token interval <b id="rateVal" class="mono">20</b> ms/token <span id="rateTps" style="color:var(--ink-3)">(≈50 tok/s)</span></label>
         <input type="range" id="rate" min="20" max="400" step="10" value="20" />
       </div>
       <div class="field" style="margin-bottom:2px">
-        <label>播放预缓冲 <b id="prebufVal" class="mono">400</b> ms <span style="color:var(--ink-3)">（吸收启动段到达抖动，0=到即播）</span></label>
+        <label>Playback prebuffer <b id="prebufVal" class="mono">400</b> ms <span style="color:var(--ink-3)">(absorbs startup arrival jitter; 0 = play on arrival)</span></label>
         <input type="range" id="prebuf" min="0" max="600" step="20" value="400" />
       </div>
     </div>
 
     <div class="card">
-      <h2>HTTP 单次请求 <span class="chip">/v1/audio/speech</span></h2>
+      <h2>HTTP one-shot <span class="chip">/v1/audio/speech</span></h2>
       <div class="field">
-        <label>生成协议</label>
+        <label>Generation protocol</label>
         <div class="seg" id="segProto">
           <button class="on" data-v="offline">offline</button>
-          <button data-v="streaming">streaming 协议</button>
+          <button data-v="streaming">streaming protocol</button>
         </div>
       </div>
       <div class="field check">
         <input type="checkbox" id="httpStreamOut" checked />
-        <span>流式输出（PCM 分块返回，可测 TTFA）</span>
+        <span>Stream output (chunked PCM; measures TTFA)</span>
       </div>
       <div class="field check">
         <input type="checkbox" id="httpSimLLM" />
-        <span>模拟上游 LLM：按上方节奏等 token 全部到齐后才发请求（TTFA 从首 token 起算，可与增量模式对比）</span>
+        <span>Simulate upstream LLM: wait for every token at the pace above before sending (TTFA counts from the first token; comparable with incremental mode)</span>
       </div>
       <div class="field">
-        <label for="httpText">文本</label>
+        <label for="httpText">Text</label>
         <textarea id="httpText">Streaming text to speech keeps latency low, and the speech keeps flowing smoothly while the text is still being written.</textarea>
       </div>
-      <button class="primary" id="httpRun">▶ 运行 HTTP 请求</button>
+      <button class="primary" id="httpRun">▶ Run HTTP request</button>
     </div>
 
     <div class="card">
-      <h2>WebSocket 增量输入 <span class="chip">/v1/audio/speech/stream</span></h2>
+      <h2>WebSocket incremental input <span class="chip">/v1/audio/speech/stream</span></h2>
       <div class="field">
-        <label for="wsText">文本（按上方节奏逐 token 发送，边到边合成）</label>
+        <label for="wsText">Text (sent token by token at the pace above; synthesized as it arrives)</label>
         <textarea id="wsText">Streaming text to speech keeps latency low, and the speech keeps flowing smoothly while the text is still being written.</textarea>
       </div>
       <div class="field check">
         <input type="checkbox" id="stallOn" />
-        <span>中途随机断供（模拟 LLM 卡顿 0.8–2s，触发引擎 hold/resume）</span>
+        <span>Random mid-stream stalls (0.8–2 s LLM hiccups; exercises engine hold/resume)</span>
       </div>
-      <button class="primary" id="wsRun">▶ 运行增量会话</button>
+      <button class="primary" id="wsRun">▶ Run incremental session</button>
     </div>
   </div>
 
-  <!-- ====================== 右列：可视化 ====================== -->
+  <!-- ====================== right column: visualization ====================== -->
   <div style="display:grid;gap:16px">
     <div class="card">
-      <h2>本次运行
+      <h2>Current run
         <span class="chip" id="runLabel">—</span>
         <span class="spacer" style="flex:1"></span>
-        <button class="ghost" id="btnReplay" disabled>重播</button>
-        <button class="ghost" id="btnStop" disabled>停止</button>
-        <button class="ghost" id="btnSave" disabled>下载 WAV</button>
+        <button class="ghost" id="btnReplay" disabled>Replay</button>
+        <button class="ghost" id="btnStop" disabled>Stop</button>
+        <button class="ghost" id="btnSave" disabled>Download WAV</button>
       </h2>
       <div class="stats">
-        <div class="stat"><div class="k">TTFA（首音频）</div><div class="v" id="stTtfa">–</div></div>
-        <div class="stat"><div class="k">总耗时</div><div class="v" id="stTotal">–</div></div>
-        <div class="stat"><div class="k">音频时长</div><div class="v" id="stAudio">–</div></div>
-        <div class="stat"><div class="k">生成速率</div><div class="v" id="stRtf">–</div></div>
+        <div class="stat"><div class="k">TTFA (first audio)</div><div class="v" id="stTtfa">–</div></div>
+        <div class="stat"><div class="k">Total time</div><div class="v" id="stTotal">–</div></div>
+        <div class="stat"><div class="k">Audio length</div><div class="v" id="stAudio">–</div></div>
+        <div class="stat"><div class="k">Gen speed</div><div class="v" id="stRtf">–</div></div>
       </div>
 
       <div class="canvas-wrap" style="margin-bottom:10px">
@@ -251,9 +251,9 @@
         <div class="tip" id="tlTip"></div>
       </div>
       <div class="legend">
-        <span><span class="sw" style="background:var(--token)"></span>文本 token 发送</span>
-        <span><span class="sw" style="background:var(--audio)"></span>音频块到达</span>
-        <span><span class="sw" style="background:var(--stall);opacity:.55"></span>断供区间</span>
+        <span><span class="sw" style="background:var(--token)"></span>text tokens sent</span>
+        <span><span class="sw" style="background:var(--audio)"></span>audio chunks arrived</span>
+        <span><span class="sw" style="background:var(--stall);opacity:.55"></span>stall window</span>
         <span><span class="sw" style="background:var(--violet)"></span>TTFA</span>
       </div>
 
@@ -262,17 +262,17 @@
       </div>
 
       <div style="margin-top:12px">
-        <label style="margin-bottom:6px">事件日志</label>
+        <label style="margin-bottom:6px">Event log</label>
         <div class="log mono" id="log"></div>
       </div>
     </div>
 
     <div class="card">
-      <h2>历史对比 <span class="chip">同参数下比较三种模式的延迟画像</span>
+      <h2>History <span class="chip">latency profiles across modes, same params</span>
         <span class="spacer" style="flex:1"></span>
-        <button class="ghost" id="btnClearHist">清空</button>
+        <button class="ghost" id="btnClearHist">Clear</button>
       </h2>
-      <div id="histWrap"><div class="empty">还没有运行记录 — 跑一次任意模式即可。</div></div>
+      <div id="histWrap"><div class="empty">No runs yet — run any mode to populate.</div></div>
     </div>
   </div>
 </div>
@@ -284,32 +284,32 @@ const $ = id => document.getElementById(id);
 const now = () => performance.now() / 1000;
 const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
-// 默认服务地址跟随页面来源主机：通过机器 IP 打开页面时自动指向同机的 8111，
-// 端口转发（localhost）场景同样正确。?api=… 可覆盖。
+// Default server address follows the page host: opening via the machine IP
+// points at the same host's 8111; localhost port-forwarding also works. ?api= overrides.
 {
   const q = new URLSearchParams(location.search);
   const host = location.hostname || "127.0.0.1";
   $("base").value = q.get("api") || `http://${host}:8111`;
 }
 
-// ---------------------------------------------------------------- 服务器状态
+// ---------------------------------------------------------------- server status
 async function pollHealth() {
   const dot = $("connDot"), txt = $("connText");
   try {
     const r = await fetch($("base").value.replace(/\/$/, "") + "/v1/models", { signal: AbortSignal.timeout(2500) });
-    if (r.ok) { dot.className = "dot ok"; txt.textContent = "已连接"; return; }
+    if (r.ok) { dot.className = "dot ok"; txt.textContent = "connected"; return; }
     throw 0;
-  } catch { dot.className = "dot err"; txt.textContent = "无法连接"; }
+  } catch { dot.className = "dot err"; txt.textContent = "unreachable"; }
 }
 pollHealth(); setInterval(pollHealth, 5000);
 
-// ---------------------------------------------------------------- 参考音频
+// ---------------------------------------------------------------- reference audio
 let refB64 = null;
 $("refFile").addEventListener("change", () => {
   const f = $("refFile").files[0];
   if (!f) { refB64 = null; return; }
   const rd = new FileReader();
-  rd.onload = () => { refB64 = rd.result.split(",")[1]; logLine("ok", `参考音频已加载：${f.name}（${(f.size/1024).toFixed(0)} KB）`); };
+  rd.onload = () => { refB64 = rd.result.split(",")[1]; logLine("ok", `reference audio loaded: ${f.name} (${(f.size/1024).toFixed(0)} KB)`); };
   rd.readAsDataURL(f);
 });
 function refPayload() {
@@ -324,7 +324,7 @@ function samplingPayload() {
   return p;
 }
 
-// ---------------------------------------------------------------- 音频播放（流式 PCM 调度）
+// ---------------------------------------------------------------- audio playback (streamed PCM scheduling)
 const SR = 24000;
 let actx = null, playHead = 0, playT0 = null;
 function ensureCtx() { if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)(); return actx; }
@@ -336,7 +336,7 @@ function playPcm(f32) {
   buf.copyToChannel(f32, 0);
   const src = ctx.createBufferSource();
   src.buffer = buf; src.connect(ctx.destination);
-  // 首块额外压一段预缓冲，用一点起播延迟换网络抖动下的不断流
+  // hold the first chunk for the prebuffer: a little start delay buys jitter immunity
   const prebuf = playHead === 0 ? parseInt($("prebuf").value) / 1000 : 0;
   const t = Math.max(ctx.currentTime + 0.06 + prebuf, playHead);
   src.start(t); playHead = t + buf.duration;
@@ -352,10 +352,10 @@ function i16ToF32(ab) {
   return f;
 }
 
-// ---------------------------------------------------------------- 运行状态与事件流
+// ---------------------------------------------------------------- run state & event stream
 // run = { mode, t0, events:[{t,type,info}], stalls:[[t0,t1]], samples:Float32[], ttfa, total, done }
 let run = null, history = [], runCounter = 0;
-const MODE_NAMES = { offline: "offline", offstream: "offline+流出", proto: "streaming 协议", protostream: "streaming+流出", ws: "WS 增量" };
+const MODE_NAMES = { offline: "offline", offstream: "offline+stream", proto: "streaming proto", protostream: "streaming+stream", ws: "WS incremental" };
 
 function newRun(mode, label) {
   stopPlayback();
@@ -392,12 +392,12 @@ function finishRun(errMsg) {
   const audioS = run.sampleCount / SR;
   if (audioS > 0 && run.total > run.ttfa) {
     const speed = audioS / (run.total - (run.ttfa ?? 0));
-    $("stRtf").textContent = speed.toFixed(1) + "×"; // 相对实时
+    $("stRtf").textContent = speed.toFixed(1) + "×"; // vs real time
   }
   $("btnStop").disabled = true;
   $("btnReplay").disabled = run.sampleCount === 0;
   $("btnSave").disabled = run.sampleCount === 0;
-  logLine(errMsg ? "err" : "ok", errMsg ? `失败：${errMsg}` : `完成 · 音频 ${fmtS(audioS)} · 总耗时 ${fmtS(run.total)}`);
+  logLine(errMsg ? "err" : "ok", errMsg ? `failed: ${errMsg}` : `done · audio ${fmtS(audioS)} · total ${fmtS(run.total)}`);
   history.unshift({ id: run.id, mode: run.mode, sim: run.sim, ttfa: run.ttfa, total: run.total,
                     audio: audioS, err: run.err, samples: run.samples.slice() });
   if (history.length > 12) history.pop();
@@ -406,7 +406,7 @@ function finishRun(errMsg) {
 }
 function fmtS(s) { return s == null ? "–" : (s >= 10 ? s.toFixed(1) : s.toFixed(2)) + "s"; }
 
-// ---------------------------------------------------------------- 日志
+// ---------------------------------------------------------------- log
 let logN = 0;
 function logLine(cls, text) {
   if (logN > 400) return;
@@ -417,9 +417,9 @@ function logLine(cls, text) {
   el.scrollTop = el.scrollHeight;
 }
 
-// ---------------------------------------------------------------- 上游 LLM 模拟
-// 近似 LLM token 粒度：CJK/假名/谚文一字一 token，拉丁按 ≤4 字符一段，
-// 前导空白并入后续 token（与 BPE 的 " word" 习惯一致）
+// ---------------------------------------------------------------- upstream LLM simulation
+// Approximate LLM token granularity: one CJK/kana/hangul char per token,
+// Latin in <=4-char pieces, leading whitespace attached (matching BPE's " word" habit)
 const CJK_RE = /[⺀-鿿぀-ヿ가-힯豈-﫿]/;
 function pseudoTokens(text) {
   const toks = [];
@@ -438,13 +438,13 @@ function pseudoTokens(text) {
 function msPerToken() { return parseInt($("rate").value); }
 function updateRateLabel() {
   $("rateVal").textContent = $("rate").value;
-  $("rateTps").textContent = `（≈${(1000 / msPerToken()).toFixed(0)} tok/s）`;
+  $("rateTps").textContent = `(≈${(1000 / msPerToken()).toFixed(0)} tok/s)`;
 }
 $("rate").addEventListener("input", updateRateLabel);
 updateRateLabel();
 $("prebuf").addEventListener("input", () => $("prebufVal").textContent = $("prebuf").value);
 
-// ---------------------------------------------------------------- HTTP 模式
+// ---------------------------------------------------------------- HTTP mode
 document.querySelectorAll("#segProto button").forEach(b => b.addEventListener("click", () => {
   document.querySelectorAll("#segProto button").forEach(x => x.classList.toggle("on", x === b));
 }));
@@ -454,7 +454,7 @@ $("httpRun").addEventListener("click", async () => {
   const streamOut = $("httpStreamOut").checked;
   const simLLM = $("httpSimLLM").checked;
   const mode = proto === "offline" ? (streamOut ? "offstream" : "offline") : (streamOut ? "protostream" : "proto");
-  newRun(mode, `HTTP · ${MODE_NAMES[mode]}${simLLM ? " · 候全部 token" : ""}`);
+  newRun(mode, `HTTP · ${MODE_NAMES[mode]}${simLLM ? " · wait-all-tokens" : ""}`);
   run.sim = simLLM;
   $("httpRun").disabled = true;
   logN = 0;
@@ -464,23 +464,23 @@ $("httpRun").addEventListener("click", async () => {
   if (proto === "streaming") body.streaming_protocol = true;
   if (streamOut) { body.stream = true; body.response_format = "pcm"; } else { body.response_format = "wav"; }
   if (simLLM) {
-    // 全文进的公平对比：请求要等模拟 LLM 吐完全部 token 才能发出，
-    // TTFA 与增量模式一样从第一个 token 起算
+    // fair full-text comparison: the request may only go out after the
+    // simulated LLM has emitted every token; TTFA counts from the first token
     const toks = pseudoTokens(body.input);
     const ms = msPerToken();
-    logLine("tok", `模拟 LLM：${toks.length} token @ ${ms}ms/token，到齐后发请求`);
+    logLine("tok", `simulated LLM: ${toks.length} tokens @ ${ms} ms/token, sending after the last one`);
     for (let i = 0; i < toks.length && !abort.on; i++) {
-      if (i === 0) { run.t0 = now(); run.events.length = 0; }  // TTFA 从首 token 起算
+      if (i === 0) { run.t0 = now(); run.events.length = 0; }  // TTFA counts from the first token
       ev("token", toks[i]);
       await sleep(ms);
     }
     if (abort.on) { $("httpRun").disabled = false; return; }
-    ev("done", "token 全部到齐 → 发起请求");
-    logLine("tok", `token 全部到齐（${fmtS(now() - run.t0)}），发起 HTTP 请求`);
+    ev("done", "all tokens arrived → sending request");
+    logLine("tok", `all tokens arrived (${fmtS(now() - run.t0)}), sending HTTP request`);
   } else {
-    ev("token", "全文提交");
+    ev("token", "full text submitted");
   }
-  logLine("tok", `POST /v1/audio/speech（${MODE_NAMES[mode]}，${body.input.length} 字符）`);
+  logLine("tok", `POST /v1/audio/speech (${MODE_NAMES[mode]}, ${body.input.length} chars)`);
   try {
     const r = await fetch($("base").value.replace(/\/$/, "") + "/v1/audio/speech", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -499,7 +499,7 @@ $("httpRun").addEventListener("click", async () => {
       }
     } else {
       const ab = await r.arrayBuffer();
-      ev("audio", "整段返回");
+      ev("audio", "whole clip returned");
       const ctx = ensureCtx();
       const decoded = await ctx.decodeAudioData(ab.slice(0));
       const ch = decoded.getChannelData(0);
@@ -512,10 +512,10 @@ $("httpRun").addEventListener("click", async () => {
   $("httpRun").disabled = false;
 });
 
-// ---------------------------------------------------------------- WS 增量模式
+// ---------------------------------------------------------------- WS incremental mode
 let wsAbort = null;
 $("wsRun").addEventListener("click", async () => {
-  newRun("ws", "WebSocket · 增量输入");
+  newRun("ws", "WebSocket · incremental");
   $("wsRun").disabled = true;
   logN = 0;
   const base = $("base").value.replace(/\/$/, "").replace(/^http/, "ws");
@@ -530,7 +530,7 @@ $("wsRun").addEventListener("click", async () => {
       const s = new WebSocket(base + "/v1/audio/speech/stream");
       s.binaryType = "arraybuffer";
       s.onopen = () => res(s);
-      s.onerror = () => rej(new Error("WebSocket 连接失败（服务端是否装了 websockets 包？）"));
+      s.onerror = () => rej(new Error("WebSocket connection failed (is the websockets package installed server-side?)"));
     });
   } catch (e) { finishRun(e.message); $("wsRun").disabled = false; return; }
 
@@ -544,35 +544,35 @@ $("wsRun").addEventListener("click", async () => {
       else if (evt.type === "error") resolve(evt.message || "server error");
       else logLine("warn", JSON.stringify(evt).slice(0, 120));
     };
-    ws.onclose = () => resolve(run && run.done ? null : "连接中断");
+    ws.onclose = () => resolve(run && run.done ? null : "connection lost");
   });
 
   ws.send(JSON.stringify({ type: "session.config", session: {
     streaming_protocol: true, stream_audio: true, response_format: "pcm",
     ...samplingPayload(), ...refPayload() } }));
 
-  // 模拟 LLM 逐 token 喂入；t0 重置为第一个 token 发出时刻（真实 TTFA 语义）
+  // feed tokens one by one; t0 resets to the first token send (true TTFA semantics)
   const toks = pseudoTokens(text.trim());
   const stallAt = doStall ? new Set([...Array(Math.max(1, Math.round(toks.length / 20)))].map(
       () => 3 + Math.floor(Math.random() * Math.max(1, toks.length - 6)))) : new Set();
-  logLine("tok", `模拟 LLM：${toks.length} token @ ${ms}ms/token`);
+  logLine("tok", `simulated LLM: ${toks.length} tokens @ ${ms} ms/token`);
   (async () => {
     for (let i = 0; i < toks.length && !abort.on; i++) {
       if (stallAt.has(i)) {
         const dur = 0.8 + Math.random() * 1.2;
         const s0 = now() - run.t0;
-        logLine("warn", `模拟断供 ${dur.toFixed(1)}s（token #${i}）`);
+        logLine("warn", `simulated stall ${dur.toFixed(1)}s (token #${i})`);
         await sleep(dur * 1000);
         run.stalls.push([s0, now() - run.t0]);
         scheduleDraw();
       }
-      if (i === 0) { run.t0 = now(); run.events.length = 0; }  // TTFA 从第一个 token 起算
+      if (i === 0) { run.t0 = now(); run.events.length = 0; }  // TTFA counts from the first token
       ws.send(JSON.stringify({ type: "input.text", text: toks[i] }));
       ev("token", toks[i]);
       if (i % 10 === 0) logLine("tok", `input.text: “${toks[i].trim()}”（#${i + 1}/${toks.length}）`);
       await sleep(ms);
     }
-    if (!abort.on) { ws.send(JSON.stringify({ type: "input.done" })); logLine("tok", "input.done"); ev("done", "输入结束"); }
+    if (!abort.on) { ws.send(JSON.stringify({ type: "input.done" })); logLine("tok", "input.done"); ev("done", "input done"); }
   })();
 
   const err = await doneP;
@@ -582,12 +582,12 @@ $("wsRun").addEventListener("click", async () => {
 });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ---------------------------------------------------------------- 控制按钮
+// ---------------------------------------------------------------- control buttons
 $("btnStop").addEventListener("click", () => {
   if (wsAbort) wsAbort.on = true;
   if (httpAbort) httpAbort.on = true;
   stopPlayback();
-  finishRun("手动停止");
+  finishRun("stopped manually");
 });
 $("btnReplay").addEventListener("click", () => { if (run) replaySamples(run.samples); });
 $("btnSave").addEventListener("click", () => { if (run) downloadWav(run.samples, `tts_${run.mode}_${run.id}.wav`); });
@@ -614,7 +614,7 @@ function downloadWav(chunks, name) {
   a.download = name; a.click(); URL.revokeObjectURL(a.href);
 }
 
-// ---------------------------------------------------------------- 时间轴（双泳道）
+// ---------------------------------------------------------------- timeline (two lanes)
 const tl = $("timeline"), tctx = tl.getContext("2d");
 const wv = $("wave"), wctx = wv.getContext("2d");
 let drawPending = false;
@@ -635,25 +635,25 @@ function drawTimeline() {
   const inkSoft = css("--ink-3"), edge = css("--edge-soft");
   tctx.font = "11px ui-sans-serif, system-ui";
   tctx.fillStyle = inkSoft;
-  tctx.fillText("文本输入", 8, laneTokY + 4);
-  tctx.fillText("音频到达", 8, laneAudY + 4);
+  tctx.fillText("text in", 8, laneTokY + 4);
+  tctx.fillText("audio in", 8, laneAudY + 4);
   if (!run || (!run.events.length && !run.stalls.length)) {
-    tctx.fillStyle = inkSoft; tctx.fillText("等待运行…", padL, h / 2);
+    tctx.fillStyle = inkSoft; tctx.fillText("waiting for a run…", padL, h / 2);
     return;
   }
   const tEnd = Math.max(0.8, run.done ? run.total : now() - run.t0);
   const X = t => padL + (t / tEnd) * (w - padL - padR);
-  // 网格（recessive）
+  // grid (recessive)
   tctx.strokeStyle = edge; tctx.lineWidth = 1;
   const step = tEnd > 24 ? 5 : tEnd > 8 ? 2 : 1;
   for (let s = 0; s <= tEnd; s += step) {
     tctx.beginPath(); tctx.moveTo(X(s), 14); tctx.lineTo(X(s), h - 16); tctx.stroke();
     tctx.fillStyle = inkSoft; tctx.fillText(s + "s", X(s) + 3, h - 5);
   }
-  // 断供区间
+  // stall windows
   tctx.fillStyle = css("--stall-soft");
   run.stalls.forEach(([a, b]) => tctx.fillRect(X(a), 14, Math.max(2, X(b) - X(a)), h - 30));
-  // 事件 ticks
+  // event ticks
   const tokC = css("--token"), audC = css("--audio");
   run.events.forEach(e => {
     if (e.type === "token") { tctx.fillStyle = tokC; tctx.fillRect(X(e.t) - 1, laneTokY - laneH / 2, 2, laneH); }
@@ -663,7 +663,7 @@ function drawTimeline() {
       tctx.beginPath(); tctx.moveTo(X(e.t), 14); tctx.lineTo(X(e.t), h - 16); tctx.stroke(); tctx.setLineDash([]);
     }
   });
-  // TTFA 竖线
+  // TTFA marker
   if (run.ttfa != null) {
     const vx = X(run.ttfa);
     tctx.strokeStyle = css("--violet"); tctx.lineWidth = 2;
@@ -672,7 +672,7 @@ function drawTimeline() {
     tctx.fillText("TTFA " + fmtS(run.ttfa), Math.min(vx + 5, w - 86), 20);
   }
 }
-// 悬浮提示
+// hover tooltip
 tl.addEventListener("mousemove", e => {
   const tip = $("tlTip");
   if (!run || !run.events.length) { tip.style.display = "none"; return; }
@@ -686,19 +686,19 @@ tl.addEventListener("mousemove", e => {
   tip.style.display = "block";
   tip.style.left = (e.clientX - rect.left + 12) + "px";
   tip.style.top = (e.clientY - rect.top - 10) + "px";
-  const kind = best.type === "token" ? "文本" : best.type === "audio" ? "音频块" : "事件";
+  const kind = best.type === "token" ? "text" : best.type === "audio" ? "audio chunk" : "event";
   tip.textContent = `${best.t.toFixed(2)}s · ${kind}${best.info ? " · " + best.info : ""}`;
 });
 tl.addEventListener("mouseleave", () => $("tlTip").style.display = "none");
 
-// ---------------------------------------------------------------- 波形
+// ---------------------------------------------------------------- waveform
 function drawWave() {
   const [w, h, dpr] = fitCanvas(wv, 96);
   wctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   wctx.clearRect(0, 0, w, h);
   if (!run || !run.sampleCount) {
     wctx.fillStyle = css("--ink-3"); wctx.font = "11px ui-sans-serif, system-ui";
-    wctx.fillText("波形（收到音频后显示）", 10, h / 2);
+    wctx.fillText("waveform (appears once audio arrives)", 10, h / 2);
     return;
   }
   const total = run.sampleCount, per = Math.max(1, Math.floor(total / w));
@@ -718,7 +718,7 @@ function drawWave() {
     const y0 = h / 2 - mx * (h / 2 - 5), y1 = h / 2 - mn * (h / 2 - 5);
     wctx.fillRect(x, y0, 1, Math.max(1, y1 - y0));
   }
-  // 播放头
+  // playhead
   if (actx && playT0 !== null && playHead > playT0) {
     const p = Math.min(1, (actx.currentTime - playT0) / (total / SR));
     if (p > 0 && p <= 1) {
@@ -729,24 +729,24 @@ function drawWave() {
   }
 }
 
-// ---------------------------------------------------------------- 历史对比
+// ---------------------------------------------------------------- history
 function renderHistory() {
   const wrap = $("histWrap");
-  if (!history.length) { wrap.innerHTML = '<div class="empty">还没有运行记录 — 跑一次任意模式即可。</div>'; return; }
+  if (!history.length) { wrap.innerHTML = '<div class="empty">No runs yet — run any mode to populate.</div>'; return; }
   const bestTtfa = Math.min(...history.filter(r => r.ttfa != null && !r.err).map(r => r.ttfa));
   let rows = history.map(r => `
     <tr class="${r.ttfa === bestTtfa && !r.err ? "best" : ""}">
       <td>#${r.id}</td>
-      <td><span class="mode-tag">${MODE_NAMES[r.mode] || r.mode}${r.sim ? " · 候全部 token" : ""}</span></td>
-      <td>${r.err ? `<span style="color:var(--err)">失败</span>` : fmtS(r.ttfa)}${r.ttfa === bestTtfa && !r.err ? " ★" : ""}</td>
+      <td><span class="mode-tag">${MODE_NAMES[r.mode] || r.mode}${r.sim ? " · wait-all-tokens" : ""}</span></td>
+      <td>${r.err ? `<span style="color:var(--err)">failed</span>` : fmtS(r.ttfa)}${r.ttfa === bestTtfa && !r.err ? " ★" : ""}</td>
       <td>${fmtS(r.total)}</td>
       <td>${fmtS(r.audio)}</td>
       <td>${r.audio && r.total ? (r.audio / r.total).toFixed(1) + "×" : "–"}</td>
-      <td><button class="ghost" onclick="replayHist(${r.id})">播放</button>
+      <td><button class="ghost" onclick="replayHist(${r.id})">Play</button>
           <button class="ghost" onclick="saveHist(${r.id})">WAV</button></td>
     </tr>`).join("");
   wrap.innerHTML = `<table>
-    <thead><tr><th>#</th><th>模式</th><th>TTFA</th><th>总耗时</th><th>音频时长</th><th>音频/耗时</th><th></th></tr></thead>
+    <thead><tr><th>#</th><th>Mode</th><th>TTFA</th><th>Total</th><th>Audio</th><th>Audio/Total</th><th></th></tr></thead>
     <tbody>${rows}</tbody></table>`;
 }
 window.replayHist = id => { const r = history.find(x => x.id === id); if (r) replaySamples(r.samples); };
@@ -755,7 +755,7 @@ window.saveHist = id => { const r = history.find(x => x.id === id); if (r) downl
 window.addEventListener("resize", scheduleDraw);
 drawAll();
 
-// ---------------------------------------------------------------- 自动化冒烟（?autotest=1，供无头浏览器/CI 使用）
+// ---------------------------------------------------------------- automated smoke (?autotest=1, for headless browser/CI)
 (async function autotest() {
   const q = new URLSearchParams(location.search);
   if (!q.get("autotest")) return;
@@ -769,7 +769,7 @@ drawAll();
   };
   try {
     console.log("AUTOTEST start");
-    // 1) HTTP streaming 协议 + 流式输出
+    // 1) HTTP streaming protocol + stream output
     $("httpText").value = short;
     document.querySelector('#segProto [data-v="streaming"]').click();
     $("httpStreamOut").checked = true;
@@ -778,7 +778,7 @@ drawAll();
     if (run.err) throw new Error("http run failed: " + run.err);
     if (!(run.sampleCount > SR)) throw new Error("http run produced <1s audio");
     console.log(`AUTOTEST http ok ttfa=${run.ttfa?.toFixed(2)} audio=${(run.sampleCount / SR).toFixed(1)}s`);
-    // 2) WS 增量
+    // 2) WS incremental
     $("wsText").value = "Incremental websocket smoke test with several words to inject.";
     $("stallOn").checked = true;
     $("wsRun").click();
@@ -786,7 +786,7 @@ drawAll();
     if (run.err) throw new Error("ws run failed: " + run.err);
     if (!(run.sampleCount > SR)) throw new Error("ws run produced <1s audio");
     console.log(`AUTOTEST ws ok ttfa=${run.ttfa?.toFixed(2)} audio=${(run.sampleCount / SR).toFixed(1)}s stalls=${run.stalls.length}`);
-    // 3) HTTP offline + 模拟 LLM（候全部 token 后发请求）
+    // 3) HTTP offline + simulated LLM (send after every token arrived)
     $("httpText").value = short;
     $("rate").value = 20; updateRateLabel();
     document.querySelector('#segProto [data-v="offline"]').click();
