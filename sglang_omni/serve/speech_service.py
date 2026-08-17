@@ -19,10 +19,7 @@ from sglang_omni.client import ClientError, GenerateRequest, SamplingParams
 from sglang_omni.client.audio import audio_encoding_unavailable_reason
 from sglang_omni.preprocessing.base import MediaIO
 from sglang_omni.preprocessing.resource_connector import MultiModalResourceConnector
-from sglang_omni.scheduling.streaming_vocoder import (
-    CODEC_CHUNK_FRAMES_PARAM,
-    INITIAL_CODEC_CHUNK_FRAMES_PARAM,
-)
+from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
     SUPPORTED_TTS_LANGUAGES,
@@ -64,12 +61,7 @@ _TTS_TASK_TYPE_ALIASES = {
 MAX_SPEECH_INPUT_CHARS = 4096
 MAX_REFERENCE_AUDIO_BYTES = 10 * 1024 * 1024
 _REFERENCE_AUDIO_FIELDS = ("audio_path", "ref_audio", "audio")
-# First chunk 4 frames (0.16 s — actually audible, unlike the old 1-frame
-# TTFA blip); the windowed vocoder path then doubles chunk sizes until the
-# steady size (growth ratio 2 <= generation RTF). The default masked
-# full-context path has its own listening-tested startup schedule and
-# ignores this parameter.
-RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES = 4
+RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES = 1
 # Mirrors speech_voices.DEFAULT_VOICE_PRESETS[0]; kept as a literal because that
 # module is imported lazily (it pulls in numpy/safetensors).
 DEFAULT_SPEECH_VOICE = "default"
@@ -243,9 +235,6 @@ class SpeechRequestValidator:
         _validate_non_negative_int(
             request.initial_codec_chunk_frames,
             param=INITIAL_CODEC_CHUNK_FRAMES_PARAM,
-        )
-        _validate_positive_int(
-            request.codec_chunk_frames, param=CODEC_CHUNK_FRAMES_PARAM
         )
         _validate_non_negative_int(request.seed, param="seed")
         return updates
@@ -533,7 +522,6 @@ class SpeechRequestValidator:
             batch.initial_codec_chunk_frames,
             param=INITIAL_CODEC_CHUNK_FRAMES_PARAM,
         )
-        _validate_positive_int(batch.codec_chunk_frames, param=CODEC_CHUNK_FRAMES_PARAM)
         _validate_non_negative_int(batch.seed, param="seed")
         if (
             self.voice_store is not None
@@ -627,7 +615,6 @@ class SpeechRequestValidator:
         for field_name in (
             "max_new_tokens",
             "initial_codec_chunk_frames",
-            "codec_chunk_frames",
             "token_count",
             "duration_tokens",
             "seed",
@@ -771,8 +758,6 @@ def _build_tts_params(
         tts_params[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = (
             request.initial_codec_chunk_frames
         )
-    if request.codec_chunk_frames is not None:
-        tts_params[CODEC_CHUNK_FRAMES_PARAM] = request.codec_chunk_frames
     if request.lora_adapter is not None:
         tts_params["lora_adapter"] = request.lora_adapter.model_dump()
     if request.token_count is not None:
@@ -833,10 +818,6 @@ def _build_extra_params(request: CreateSpeechRequest) -> dict[str, Any]:
         initial_codec_chunk_frames = RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES
     if initial_codec_chunk_frames is not None:
         extra_params[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = initial_codec_chunk_frames
-    if request.codec_chunk_frames is not None:
-        # windowed-path steady chunk override; the default masked
-        # full-context path manages its own emission schedule
-        extra_params[CODEC_CHUNK_FRAMES_PARAM] = request.codec_chunk_frames
     if request.streaming_protocol:
         extra_params["streaming_protocol"] = True
     return extra_params

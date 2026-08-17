@@ -13,10 +13,8 @@ from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import (
-    CODEC_CHUNK_FRAMES_PARAM,
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
     StreamingVocoderBase,
-    resolve_codec_chunk_frames,
     resolve_initial_codec_chunk_frames,
 )
 from sglang_omni.utils.audio_payload import audio_waveform_payload
@@ -27,12 +25,6 @@ from sglang_omni.utils.codec_delay import reverse_delay_pattern
 class _HiggsStreamState:
     delayed_rows: list[torch.Tensor] = field(default_factory=list)
     emitted_raw_frames: int = 0
-    codec_chunk_frames: int = 0
-    # ramp-in: frame target of the NEXT emission (0 = steady). Doubles after
-    # each small chunk until it reaches the steady size, so playback starts
-    # early AND stays gapless (growth ratio 2 <= generation RTF).
-    next_chunk_frames: int = 0
-    ramp_initialized: bool = False
     next_decode_rows: int = 0
     num_codebooks: int | None = None
     codebook_size: int | None = None
@@ -204,10 +196,7 @@ class HiggsStreamingVocoderScheduler(
                 codebook_size=metadata["codebook_size"],
                 source=origin,
             )
-        if (
-            INITIAL_CODEC_CHUNK_FRAMES_PARAM in metadata
-            or CODEC_CHUNK_FRAMES_PARAM in metadata
-        ):
+        if INITIAL_CODEC_CHUNK_FRAMES_PARAM in metadata:
             self._latch_initial_codec_chunk_frames_from_mapping(
                 request_id,
                 state,
@@ -247,17 +236,20 @@ class HiggsStreamingVocoderScheduler(
             return None
         raw_total = delayed_count - num_codebooks + 1
 
-        stride_rows, followup_rows = self._steady_chunk_rows(state, num_codebooks)
-        steady_codec_frames = max(1, stride_rows - num_codebooks + 1)
-        target_frames = state.next_chunk_frames
-        use_small_chunk = 0 < target_frames < steady_codec_frames and not is_final
+        steady_codec_frames = max(1, self._stream_stride - num_codebooks + 1)
+        use_initial_chunk = (
+            state.initial_codec_chunk_frames > 0
+            and state.initial_codec_chunk_frames < steady_codec_frames
+            and not self._stream_has_emitted(request_id)
+        )
+        first_decode_rows = max(
+            num_codebooks,
+            state.initial_codec_chunk_frames + num_codebooks - 1,
+        )
         next_decode_rows = state.next_decode_rows or (
-            max(
-                num_codebooks,
-                state.emitted_raw_frames + target_frames + num_codebooks - 1,
-            )
-            if use_small_chunk
-            else max(num_codebooks, stride_rows)
+            first_decode_rows
+            if use_initial_chunk and not is_final
+            else max(num_codebooks, self._stream_stride)
         )
         if not is_final and delayed_count < next_decode_rows:
             state.next_decode_rows = next_decode_rows
@@ -271,8 +263,8 @@ class HiggsStreamingVocoderScheduler(
                 )
         else:
             emit_until_raw = raw_total
-        if use_small_chunk:
-            emit_until_raw = min(raw_total, state.emitted_raw_frames + target_frames)
+        if use_initial_chunk and not is_final:
+            emit_until_raw = min(raw_total, state.initial_codec_chunk_frames)
         elif not is_final:
             emit_until_raw = max(
                 0,
@@ -282,7 +274,7 @@ class HiggsStreamingVocoderScheduler(
         if emit_until_raw < state.emitted_raw_frames or (
             emit_until_raw == state.emitted_raw_frames and not can_flush_codec_tail
         ):
-            state.next_decode_rows = delayed_count + followup_rows
+            state.next_decode_rows = delayed_count + self._stream_followup_stride
             return None
 
         window_start_raw = max(
@@ -309,21 +301,14 @@ class HiggsStreamingVocoderScheduler(
         else:
             delta = audio[trim_samples:].contiguous()
         if delta.numel() == 0:
-            state.next_decode_rows = delayed_count + followup_rows
+            state.next_decode_rows = delayed_count + self._stream_followup_stride
             return None
 
         state.emitted_raw_frames = emit_until_raw
-        if use_small_chunk:
-            doubled = target_frames * 2
-            state.next_chunk_frames = 0 if doubled >= steady_codec_frames else doubled
         state.next_decode_rows = self._next_decode_rows_after_emit(
             delayed_count,
             num_codebooks=num_codebooks,
-            emitted_small_chunk=use_small_chunk,
-            next_chunk_frames=state.next_chunk_frames,
-            emitted_raw_frames=state.emitted_raw_frames,
-            stride_rows=stride_rows,
-            followup_rows=followup_rows,
+            emitted_initial_chunk=use_initial_chunk and not is_final,
         )
         return delta
 
@@ -579,30 +564,11 @@ class HiggsStreamingVocoderScheduler(
         params: Mapping[str, Any] | None,
     ) -> None:
         num_codebooks, _ = self._require_stream_contract(state, request_id)
-        state.codec_chunk_frames = resolve_codec_chunk_frames(params)
-        steady_codec_frames = state.codec_chunk_frames or max(
-            1, self._stream_stride - num_codebooks + 1
-        )
+        steady_codec_frames = max(1, self._stream_stride - num_codebooks + 1)
         state.initial_codec_chunk_frames = resolve_initial_codec_chunk_frames(
             params,
             steady_chunk_frames=steady_codec_frames,
         )
-        # metadata re-latches on every chunk; only seed the ramp once so the
-        # doubling progression is not reset mid-stream
-        if not state.ramp_initialized:
-            state.next_chunk_frames = state.initial_codec_chunk_frames
-            state.ramp_initialized = True
-
-    def _steady_chunk_rows(
-        self, state: _HiggsStreamState, num_codebooks: int
-    ) -> tuple[int, int]:
-        """Per-request (stride_rows, followup_rows): a request-level
-        ``codec_chunk_frames`` overrides the scheduler-wide stride so
-        interactive sessions can stream small, frequent deltas."""
-        if state.codec_chunk_frames > 0:
-            stride = state.codec_chunk_frames + num_codebooks - 1
-            return stride, state.codec_chunk_frames
-        return self._stream_stride, self._stream_followup_stride
 
     @staticmethod
     def _require_stream_contract(
@@ -621,20 +587,13 @@ class HiggsStreamingVocoderScheduler(
         delayed_count: int,
         *,
         num_codebooks: int,
-        emitted_small_chunk: bool,
-        next_chunk_frames: int,
-        emitted_raw_frames: int,
-        stride_rows: int,
-        followup_rows: int,
+        emitted_initial_chunk: bool,
     ) -> int:
-        if emitted_small_chunk:
-            if next_chunk_frames > 0:  # ramp continues: decode at the next target
-                return max(
-                    num_codebooks,
-                    emitted_raw_frames + next_chunk_frames + num_codebooks - 1,
-                )
-            return max(num_codebooks, stride_rows) + followup_rows
-        return delayed_count + followup_rows
+        if emitted_initial_chunk:
+            return (
+                max(num_codebooks, self._stream_stride) + self._stream_followup_stride
+            )
+        return delayed_count + self._stream_followup_stride
 
     def _vocode_payload(self, payload: StagePayload) -> StagePayload:
         return self._vocode_payloads([payload])[0]

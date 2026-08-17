@@ -833,7 +833,7 @@ def test_raw_pcm_speech_request_defaults_initial_codec_chunk_frames() -> None:
         default_model="higgs-audio-v2"
     ).build_generate_request(req)
 
-    assert gen_req.extra_params["initial_codec_chunk_frames"] == 4
+    assert gen_req.extra_params["initial_codec_chunk_frames"] == 1
 
 
 def test_raw_pcm_speech_request_respects_explicit_initial_zero() -> None:
@@ -928,16 +928,7 @@ def test_speech_request_passes_streaming_control_fields() -> None:
     assert tts_params["initial_codec_chunk_frames"] == 8
     assert tts_params["x_vector_only_mode"] is True
     assert tts_params["response_format"] == "pcm"
-    # no steady-chunk default: the masked full-context vocoder path manages
-    # its own emission schedule; codec_chunk_frames is opt-in (windowed path)
     assert gen_req.extra_params == {"initial_codec_chunk_frames": 8}
-
-    req_explicit = req.model_copy(update={"codec_chunk_frames": 25})
-    gen_req = SpeechRequestValidator(default_model="qwen3-tts").build_generate_request(
-        req_explicit
-    )
-    assert gen_req.extra_params["codec_chunk_frames"] == 25
-    assert gen_req.metadata["tts_params"]["codec_chunk_frames"] == 25
 
 
 def test_transcription_request_builds_asr_generate_request() -> None:

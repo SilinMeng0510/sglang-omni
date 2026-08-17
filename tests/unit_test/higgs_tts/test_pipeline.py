@@ -1114,48 +1114,6 @@ def test_higgs_streaming_vocoder_emits_compact_chunks_and_slim_final() -> None:
     assert "req" not in scheduler._stream_states
 
 
-def test_higgs_streaming_vocoder_honors_request_codec_chunk_frames() -> None:
-    """A request-level codec_chunk_frames overrides the scheduler-wide steady
-    stride: emissions start after ~chunk_frames rows instead of the (large)
-    server stride, giving live playback a continuous feed."""
-    raw_codes = torch.tensor(
-        [[i + 1, i + 8, i + 15] for i in range(6)],
-        dtype=torch.long,
-    )
-    delayed = apply_delay_pattern(raw_codes)
-    codec = _FakeHiggsStreamingCodec(samples_per_frame=4)
-    scheduler = HiggsStreamingVocoderScheduler(
-        codec,
-        stream_stride=8,  # server-wide steady chunk: would need all 8 rows
-        stream_followup_stride=8,
-        stream_holdback_tokens=0,
-    )
-    payload = _higgs_stream_payload(
-        "req",
-        stream=True,
-        delayed_rows=delayed.tolist(),
-        codebook_size=25,
-    )
-    payload.request.params["codec_chunk_frames"] = 2
-
-    scheduler._on_streaming_new_request("req", payload)
-    emissions_at: list[int] = []
-    for idx, row in enumerate(delayed):
-        item = _higgs_stream_item(row, codebook_size=25)
-        item.chunk_id = idx
-        scheduler._on_chunk("req", item)
-        if any(m.type == "stream" for m in _drain_higgs_outbox(scheduler)):
-            emissions_at.append(idx + 1)
-    scheduler._on_done("req")
-    final = _drain_higgs_outbox(scheduler)
-
-    # first emission after ~stride_rows(2 + 3 - 1 = 4) rows, well before the
-    # server-wide 8-row stride, and repeatedly afterwards
-    assert emissions_at and emissions_at[0] <= 4
-    assert len(emissions_at) >= 2
-    assert any(m.type == "result" for m in final)
-
-
 def test_higgs_streaming_vocoder_honors_initial_codec_chunk_frames() -> None:
     raw_codes = torch.tensor(
         [
@@ -1198,44 +1156,6 @@ def test_higgs_streaming_vocoder_honors_initial_codec_chunk_frames() -> None:
     audio = np.frombuffer(messages[0].data["audio_waveform"], dtype=np.float32)
     assert audio.size == 4
     assert codec.decode_inputs[0].shape[0] == 1
-
-
-def test_higgs_streaming_vocoder_ramps_chunks_to_steady() -> None:
-    """After the initial chunk, emissions double (1 -> 2 -> 4) until they
-    reach the steady chunk size: early audio with no mid-ramp gaps."""
-    raw_codes = torch.tensor(
-        [[i + 1, i + 6, i + 11] for i in range(12)],
-        dtype=torch.long,
-    )
-    delayed = apply_delay_pattern(raw_codes)
-    codec = _FakeHiggsStreamingCodec(samples_per_frame=4)
-    scheduler = HiggsStreamingVocoderScheduler(
-        codec,
-        stream_stride=8,  # steady = 8 - 3 + 1 = 6 frames
-        stream_followup_stride=8,
-        stream_holdback_tokens=0,
-    )
-    payload = _higgs_stream_payload(
-        "req",
-        stream=True,
-        delayed_rows=delayed.tolist(),
-        codebook_size=25,
-        initial_codec_chunk_frames=1,
-    )
-
-    scheduler._on_streaming_new_request("req", payload)
-    emitted_frames: list[int] = []
-    for idx, row in enumerate(delayed):
-        item = _higgs_stream_item(row, codebook_size=25)
-        item.chunk_id = idx
-        scheduler._on_chunk("req", item)
-        for msg in _drain_higgs_outbox(scheduler):
-            if msg.type == "stream":
-                audio = np.frombuffer(msg.data["audio_waveform"], dtype=np.float32)
-                emitted_frames.append(audio.size // 4)
-    scheduler._on_done("req")
-
-    assert emitted_frames[:3] == [1, 2, 4]
 
 
 def test_higgs_masked_startup_coalesces_ready_requests() -> None:
@@ -1431,15 +1351,10 @@ def test_higgs_initial_codec_chunk_frames_controls_first_chunk_only() -> None:
     ]
     assert len(first_streams) == 1
 
-    # the initial chunk seeds a doubling ramp: the next (2-frame) chunk
-    # emits as soon as its rows are available, not at the steady stride
     for row in delayed[3:5]:
         scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=64))
 
-    ramp_streams = [
-        msg for msg in _drain_higgs_outbox(scheduler) if msg.type == "stream"
-    ]
-    assert len(ramp_streams) == 1
+    assert _drain_higgs_outbox(scheduler) == []
 
 
 def test_higgs_initial_chunk_resumes_after_followup_boundary() -> None:
@@ -1469,18 +1384,14 @@ def test_higgs_initial_chunk_resumes_after_followup_boundary() -> None:
     ]
     assert len(first_streams) == 1
 
-    # ramp: 2-frame chunk at 5 rows, 4-frame chunk at 9 rows, then steady
     for row in delayed[3:7]:
         scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=64))
-    ramp2 = [m for m in _drain_higgs_outbox(scheduler) if m.type == "stream"]
-    assert len(ramp2) == 1
+    assert _drain_higgs_outbox(scheduler) == []
 
     for row in delayed[7:11]:
         scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=64))
-    ramp4 = [m for m in _drain_higgs_outbox(scheduler) if m.type == "stream"]
-    assert len(ramp4) == 1
+    assert _drain_higgs_outbox(scheduler) == []
 
-    # steady schedule resumes at the followup boundary (12 rows)
     scheduler._on_chunk("req", _higgs_stream_item(delayed[11], codebook_size=64))
     second_streams = [
         msg for msg in _drain_higgs_outbox(scheduler) if msg.type == "stream"

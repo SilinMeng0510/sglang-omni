@@ -47,7 +47,7 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     # a fixed 9 frames either side, so small chunks cost bounded extra
     # vocoder compute (~3x per frame) and zero quality — measured same-seed
     # spectral distance 0.032 vs whole-utterance decode, identical to
-    # stride 75. Throughput deployments may still raise this per config.
+    # stride 75. Throughput deployments may raise this via a config file.
     vocoder_stream_stride: int = Field(default=15, ge=1)
     vocoder_stream_followup_stride: int = Field(default=15, ge=1)
     # masked full-context decoding: every streamed chunk is decoded with the
