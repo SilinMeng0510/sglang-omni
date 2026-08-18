@@ -69,7 +69,7 @@ class HiggsStreamingVocoderScheduler(
         # so steady-phase chunk size never affects decode quality
         context_frames: int = 11,
         startup_full_chunk_frames: int = 8,
-        startup_full_chunk_count: int = 3,
+        startup_full_chunk_count: int = 10,
         startup_reduced_context_frames: int = 6,
         startup_reduced_left_context_frames: int = 9,
         startup_reduced_context_until_frames: int = 11,

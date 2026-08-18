@@ -48,7 +48,7 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     vocoder_startup_masked_emit_frames: int = Field(default=3, ge=1)
     vocoder_startup_masked_until_frames: int = Field(default=8, ge=1)
     vocoder_startup_full_chunk_frames: int = Field(default=8, ge=1)
-    vocoder_startup_full_chunk_count: int = Field(default=3, ge=0)
+    vocoder_startup_full_chunk_count: int = Field(default=10, ge=0)
     stages: list[StageConfig] = Field(
         default_factory=lambda: [
             StageConfig(
