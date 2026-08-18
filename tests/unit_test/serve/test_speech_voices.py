@@ -12,12 +12,10 @@ from fastapi.testclient import TestClient
 
 from sglang_omni.client.audio import DEFAULT_SAMPLE_RATE, encode_wav
 from sglang_omni.scheduling.speaker_cache import SpeakerArtifactCache, SpeakerCacheKey
-from sglang_omni.serve import create_app
+from sglang_omni.serve import create_app, speech_voices
 from sglang_omni.serve.openai_api import VoiceUploadBodyLimitMiddleware
 from sglang_omni.serve.speech_errors import SpeechAPIError
-from sglang_omni.serve import speech_service
 from sglang_omni.serve.speech_service import SpeechRequestValidator
-from sglang_omni.serve import speech_voices
 from sglang_omni.serve.speech_voices import SpeakerSampleStore
 
 
@@ -696,7 +694,12 @@ def test_caller_reference_wins_over_the_packaged_default(
     own_clip = "data:audio/wav;base64," + base64.b64encode(_reference_wav()).decode()
     response = client.post(
         "/v1/audio/speech",
-        json={"model": "tts", "input": "hello", "ref_audio": own_clip, "ref_text": "mine"},
+        json={
+            "model": "tts",
+            "input": "hello",
+            "ref_audio": own_clip,
+            "ref_text": "mine",
+        },
     )
 
     assert response.status_code == 200
@@ -763,9 +766,7 @@ def test_default_voice_language_selects_packaged_variant(
 
     assert response.status_code == 200
     reference = client_impl.requests[-1].prompt["references"][0]
-    expected = (
-        speech_voices.PACKAGED_VOICE_DIR / f"{expected_stem}.wav"
-    ).read_bytes()
+    expected = (speech_voices.PACKAGED_VOICE_DIR / f"{expected_stem}.wav").read_bytes()
     assert base64.b64decode(reference["data"]) == expected
     assert reference["uploaded_voice_name"] == f"default/{expected_stem}"
 
@@ -777,7 +778,12 @@ def test_language_is_a_lenient_free_form_hint(tmp_path: Path, monkeypatch) -> No
 
     response = client.post(
         "/v1/audio/speech",
-        json={"model": "tts", "input": "你好", "language": "zh", "response_format": "wav"},
+        json={
+            "model": "tts",
+            "input": "你好",
+            "language": "zh",
+            "response_format": "wav",
+        },
     )
 
     assert response.status_code == 200
