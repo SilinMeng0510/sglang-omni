@@ -16,7 +16,10 @@ Roles (what THIS step's model output means):
 - ``DECISION``: the input was an injected text token (or the opening ``T0``
   from prefill, or ``<|text_end|>``); sample the text head constrained to
   ``{<|text|>, <|audio|>}``. ``<|text|>`` = wait, ``<|audio|>`` = open an
-  audio block. After ``<|text_end|>`` the decision is forced to audio.
+  audio block. The text head is only consulted BEFORE the first audio block:
+  training lays out every later block boundary as a forced ``<|audio|>``
+  (mid-stream waits are off-distribution), so once the first block opened,
+  boundaries and everything after ``<|text_end|>`` force audio.
 - ``WAIT_FEED``: the input was the ``<|text|>`` wait token; output discarded.
   Publishes the next queued text token (or ``<|text_end|>``).
 - ``AUDIO``: the input was ``<|audio|>`` or a previous audio row; the audio
@@ -88,7 +91,6 @@ class StreamingProtocolConfig:
     num_extra_tokens: int  # delay-pattern ramp rows = num_codebooks - 1
     frames_per_block: int = 4
     max_opening_waits: int = 64
-    max_mid_waits: int = 64
     max_frames: int = 25 * 120  # content frames cap (excl. ramp rows)
 
 
@@ -108,7 +110,6 @@ class StreamingProtocolState:
 
     text_pos: int = 0
     role: StepRole = StepRole.DECISION  # prefill's last position outputs a decision
-    opening: bool = True
     text_end_sent: bool = False
     first_block_emitted: bool = False
     block_rows_remaining: int = 0
@@ -120,7 +121,6 @@ class StreamingProtocolState:
     in_tail_flush: bool = False
 
     opening_waits: int = 0
-    mid_waits: int = 0
     blocks: int = 0
     fuse_tripped: bool = False
 
@@ -198,7 +198,6 @@ class StreamingProtocolState:
         else:
             self.block_rows_remaining = cfg.frames_per_block
         self.first_block_emitted = True
-        self.opening = False
         self.blocks += 1
         return StepPlan(
             input_token_id=cfg.audio_token_id,
@@ -217,17 +216,12 @@ class StreamingProtocolState:
         cfg = self.cfg
         role = self.role
         if role is StepRole.DECISION:
-            if self.text_end_sent or decision_is_audio:
+            if self.text_end_sent or self.first_block_emitted or decision_is_audio:
                 plan = self._open_audio_block()
             else:
-                # wait: over-budget waits trip the fuse and force audio open
-                if self.opening:
-                    self.opening_waits += 1
-                    tripped = self.opening_waits > cfg.max_opening_waits
-                else:
-                    self.mid_waits += 1
-                    tripped = self.mid_waits > cfg.max_mid_waits
-                if tripped:
+                # opening wait; over-budget waits trip the fuse and force audio
+                self.opening_waits += 1
+                if self.opening_waits > cfg.max_opening_waits:
                     self.fuse_tripped = True
                     plan = self._open_audio_block()
                 else:
