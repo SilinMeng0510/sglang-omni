@@ -41,9 +41,9 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     lora_max_rank: int = Field(default=32, ge=1)
     lora_max_cached_adapters: int = Field(default=8, ge=1)
     separate_vocoder_process: bool = False
-    vocoder_stream_stride: int = Field(default=75, ge=1)
-    vocoder_stream_followup_stride: int = Field(default=75, ge=1)
-    vocoder_full_context_streaming: bool = False
+    vocoder_stream_stride: int = Field(default=32, ge=1)
+    vocoder_startup_masked: bool = True
+    vocoder_context_frames: int = Field(default=11, ge=0)
     vocoder_startup_masked_delay_rows: int = Field(default=8, ge=1)
     vocoder_startup_masked_emit_frames: int = Field(default=3, ge=1)
     vocoder_startup_masked_until_frames: int = Field(default=8, ge=1)
@@ -118,8 +118,8 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             if stage.name == "vocoder":
                 stage.factory_args.update(
                     stream_stride=self.vocoder_stream_stride,
-                    stream_followup_stride=self.vocoder_stream_followup_stride,
-                    full_context_streaming=self.vocoder_full_context_streaming,
+                    startup_masked=self.vocoder_startup_masked,
+                    context_frames=self.vocoder_context_frames,
                     startup_masked_delay_rows=self.vocoder_startup_masked_delay_rows,
                     startup_masked_emit_frames=self.vocoder_startup_masked_emit_frames,
                     startup_masked_until_frames=self.vocoder_startup_masked_until_frames,

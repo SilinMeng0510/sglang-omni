@@ -207,6 +207,12 @@ def create_preprocessing_executor(
 
         text = inputs.get("input") or inputs.get("text") or ""
         reference_text = inputs.get("reference_text") or None
+        streaming_protocol = bool(params.get("streaming_protocol", False))
+        if streaming_protocol and adapter.streaming_tts_id is None:
+            raise ValueError(
+                "streaming_protocol requested but this checkpoint's tokenizer "
+                "has no <|streaming_tts|> token (not a streaming-trained model)"
+            )
         ref_codes_TN = to_codes_TN(inputs.get("reference_codes"), num_codebooks)
         if ref_codes_TN is not None and ref_codes_TN.shape[0] > _MAX_REF_AUDIO_SEC * 75:
             raise ValueError(
@@ -267,20 +273,31 @@ def create_preprocessing_executor(
                             (waveform_tensor.clone(), reference_code_cache_key),
                         )
 
+        def _build_prompt(num_ref_tokens: int) -> tuple[list[int], list[int] | None]:
+            if streaming_protocol:
+                return adapter.build_streaming_prompt(
+                    text,
+                    num_ref_tokens=num_ref_tokens,
+                    reference_text=reference_text,
+                )
+            return (
+                adapter.build_prompt(
+                    text,
+                    num_ref_tokens=num_ref_tokens,
+                    reference_text=reference_text,
+                ),
+                None,
+            )
+
+        inject_text_ids: list[int] | None = None
         if ref_codes_TN is not None:
             delayed = apply_delay_pattern(ref_codes_TN)
-            prompt_ids = adapter.build_prompt(
-                text,
-                num_ref_tokens=delayed.shape[0],
-                reference_text=reference_text,
-            )
+            prompt_ids, inject_text_ids = _build_prompt(delayed.shape[0])
             ref_codes_delayed: list[list[int]] | None = delayed.tolist()
             target_text_for_encoder = None
             reference_text_for_encoder = None
         elif waveform_tensor is None:
-            prompt_ids = adapter.build_prompt(
-                text, num_ref_tokens=0, reference_text=reference_text
-            )
+            prompt_ids, inject_text_ids = _build_prompt(0)
             ref_codes_delayed = None
             target_text_for_encoder = None
             reference_text_for_encoder = None
@@ -297,6 +314,16 @@ def create_preprocessing_executor(
             reference_code_cache_key=reference_code_cache_key,
             target_text=target_text_for_encoder,
             reference_text=reference_text_for_encoder,
+            streaming_protocol=streaming_protocol,
+            inject_text_ids=inject_text_ids,
+            streaming_incremental=(
+                streaming_protocol and bool(params.get("streaming_incremental", False))
+            ),
+            streaming_text_token_id=adapter.text_id if streaming_protocol else None,
+            streaming_audio_token_id=adapter.audio_id if streaming_protocol else None,
+            streaming_text_end_token_id=(
+                adapter.text_end_id if streaming_protocol else None
+            ),
             uploaded_voice_name=uploaded_voice_name,
             uploaded_voice_created_at=uploaded_voice_created_at,
             lora_adapter_path=lora_adapter_path,
@@ -383,11 +410,20 @@ def create_audio_encoder_executor(
             else:
                 reference_code_cache.put(state.reference_code_cache_key, cached_codes)
         state.reference_codes_delayed = delayed_rows
-        state.prompt_token_ids = adapter.build_prompt(
-            state.target_text or "",
-            num_ref_tokens=len(delayed_rows),
-            reference_text=state.reference_text,
-        )
+        if state.streaming_protocol:
+            state.prompt_token_ids, state.inject_text_ids = (
+                adapter.build_streaming_prompt(
+                    state.target_text or "",
+                    num_ref_tokens=len(delayed_rows),
+                    reference_text=state.reference_text,
+                )
+            )
+        else:
+            state.prompt_token_ids = adapter.build_prompt(
+                state.target_text or "",
+                num_ref_tokens=len(delayed_rows),
+                reference_text=state.reference_text,
+            )
         state.reference_waveform = None
         state.reference_code_cache_key = None
         state.target_text = None
@@ -445,10 +481,10 @@ def create_vocoder_executor(
     vocoder_decode_batch_size: int = 16,
     max_batch_wait_ms: int = 2,
     stream_stride: int = 75,
-    stream_followup_stride: int = 75,
     stream_overlap_tokens: int = 8,
     stream_holdback_tokens: int = 4,
-    full_context_streaming: bool = False,
+    startup_masked: bool = True,
+    context_frames: int = 11,
     startup_masked_delay_rows: int = 8,
     startup_masked_emit_frames: int = 3,
     startup_masked_until_frames: int = 8,
@@ -465,10 +501,10 @@ def create_vocoder_executor(
         max_batch_size=vocoder_decode_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
         stream_stride=stream_stride,
-        stream_followup_stride=stream_followup_stride,
         stream_overlap_tokens=stream_overlap_tokens,
         stream_holdback_tokens=stream_holdback_tokens,
-        full_context_streaming=full_context_streaming,
+        startup_masked=startup_masked,
+        context_frames=context_frames,
         startup_masked_delay_rows=startup_masked_delay_rows,
         startup_masked_emit_frames=startup_masked_emit_frames,
         startup_masked_until_frames=startup_masked_until_frames,

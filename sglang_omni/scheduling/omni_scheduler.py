@@ -381,6 +381,11 @@ class OmniScheduler:
         self._aborted_request_id_order: deque[str] = deque()
         self._pending_stream_chunks: dict[str, list[Any]] = {}
         self._pending_stream_done: set[str] = set()
+        # Requests parked out of scheduling because their incremental input
+        # queue ran dry (streaming-TTS): rid -> sglang Req. KV lives in the
+        # radix tree (lock-ref'd) while parked; resume re-admits via the
+        # standard waiting-queue radix-hit extend path.
+        self._held_input_requests: dict[str, Any] = {}
         self._deferred_request_payloads: dict[str, Any] = {}
         self._dirty_deferred_request_ids: set[str] = set()
         self._first_emit_done: set[str] = set()
@@ -819,6 +824,86 @@ class OmniScheduler:
             )
         )
 
+    def get_next_batch_to_run(self):
+        """Sweep input-starved requests out of the running batch, then defer
+        to the upstream batch selection."""
+        self._sweep_input_starved_requests()
+        return _Upstream.get_next_batch_to_run(self)
+
+    def _sweep_input_starved_requests(self) -> None:
+        """Park running requests whose incremental input queue ran dry.
+
+        The starved request's computed KV (origin + output[:-1]; the last
+        published token is a placeholder that was never forwarded) is cached
+        into the radix tree with a lock ref, its req-pool row is released,
+        and the request waits in ``_held_input_requests`` until
+        ``resume_held_request`` re-admits it as a standard radix-hit extend.
+
+        A starved request whose queue was refilled BEFORE this sweep ran
+        (the input chunk landed in the same loop iteration) is repaired in
+        place instead: the real injected token replaces the placeholder in
+        BOTH ``req.output_ids`` and the batch's ``output_ids`` tensor — the
+        tensor feeds ``prepare_for_decode``'s input_ids, so fixing only the
+        Python list would silently inject the placeholder embed.
+        """
+        batch = self.running_batch
+        reqs = getattr(batch, "reqs", None) if batch is not None else None
+        if not reqs:
+            return
+        starved: list[int] = []
+        for i, req in enumerate(reqs):
+            data = getattr(req, "_omni_data", None)
+            if (
+                data is None
+                or not getattr(data, "input_starved", False)
+                or req.finished()
+            ):
+                continue
+            resume_plan = getattr(data, "protocol_state").resume_plan()
+            if not resume_plan.starved:
+                token = int(resume_plan.input_token_id)
+                req.output_ids[-1] = token
+                if batch.output_ids is not None and i < len(batch.output_ids):
+                    batch.output_ids[i] = token
+                data.streaming_plan = resume_plan
+                data.input_starved = False
+                continue
+            starved.append(i)
+        if not starved:
+            return
+        starved_set = set(starved)
+        for i in starved:
+            req = reqs[i]
+            req.fill_ids = list(req.origin_input_ids) + list(req.output_ids[:-1])
+            self.tree_cache.cache_unfinished_req(req)
+            # free() takes the Req and nulls req_pool_idx itself; the KV slots
+            # are tree-owned now, only the row mapping is returned
+            self.req_to_token_pool.free(req)
+            self._held_input_requests[req.rid] = req
+            logger.info(
+                "OmniScheduler: holding input-starved request %s (%d computed "
+                "positions cached)",
+                req.rid,
+                len(req.fill_ids),
+            )
+        keep = [i for i in range(len(reqs)) if i not in starved_set]
+        batch.filter_batch(keep_indices=keep)
+
+    def resume_held_request(self, request_id: str) -> bool:
+        """Re-admit a parked input-starved request (its handler must have
+        refreshed ``req.output_ids[-1]`` with the real next input token and
+        cleared ``data.input_starved``). Returns False if not held."""
+        if request_id in self._aborted_request_ids:
+            # abort cleanup owns held-request teardown (tree unlock)
+            return False
+        req = self._held_input_requests.pop(request_id, None)
+        if req is None:
+            return False
+        logger.info("OmniScheduler: resuming input-starved request %s", request_id)
+        with self._request_admission_lock:
+            self.waiting_queue.append(req)
+        return True
+
     def run_batch(self, batch, pp_proxy_tensors=None):
         try:
             return self._run_batch(batch, pp_proxy_tensors)
@@ -1117,6 +1202,16 @@ class OmniScheduler:
             except Exception:
                 logger.exception(
                     "OmniScheduler: abort cleanup failed for %s", request_id
+                )
+        held = self._held_input_requests.pop(request_id, None)
+        if held is not None and getattr(held, "last_node", None) is not None:
+            # a held request's KV is tree-owned with our lock ref; drop it so
+            # the path becomes evictable (req pool row was already released)
+            try:
+                self.tree_cache.dec_lock_ref(held.last_node)
+            except Exception:
+                logger.exception(
+                    "OmniScheduler: failed to unlock held request %s", request_id
                 )
         self._pending_stream_chunks.pop(request_id, None)
         self._pending_stream_done.discard(request_id)
@@ -1904,6 +1999,9 @@ class OmniScheduler:
             self.inbox.put(msg)
 
     def _find_request_data(self, request_id: str) -> Any | None:
+        held = self._held_input_requests.get(request_id)
+        if held is not None:
+            return held._omni_data
         # Scan all batches a live req can sit in during prefill→decode handoff.
         for batch in (self.running_batch, self.cur_batch, self.last_batch):
             if batch is None:

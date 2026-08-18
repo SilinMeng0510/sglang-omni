@@ -818,6 +818,8 @@ def _build_extra_params(request: CreateSpeechRequest) -> dict[str, Any]:
         initial_codec_chunk_frames = RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES
     if initial_codec_chunk_frames is not None:
         extra_params[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = initial_codec_chunk_frames
+    if request.streaming_protocol:
+        extra_params["streaming_protocol"] = True
     return extra_params
 
 

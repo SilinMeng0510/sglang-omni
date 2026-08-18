@@ -14,6 +14,7 @@ from sglang_omni.proto import (
     AdminResultMessage,
     CompleteMessage,
     DataReadyMessage,
+    InputChunkMessage,
     ProfilerStartMessage,
     ProfilerStopMessage,
     ShutdownMessage,
@@ -262,6 +263,7 @@ class StageControlPlane:
     ) -> (
         AdminMessage
         | DataReadyMessage
+        | InputChunkMessage
         | SubmitMessage
         | ShutdownMessage
         | ProfilerStartMessage
@@ -275,6 +277,7 @@ class StageControlPlane:
             msg,
             (
                 DataReadyMessage,
+                InputChunkMessage,
                 SubmitMessage,
                 ShutdownMessage,
                 ProfilerStartMessage,

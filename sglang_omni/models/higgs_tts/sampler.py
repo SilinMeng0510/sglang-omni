@@ -318,6 +318,7 @@ def batched_step(
     temperature: torch.Tensor,
     top_p: torch.Tensor | None = None,
     top_k_buf: torch.Tensor | None = None,
+    advance_mask: torch.Tensor | None = None,
     boc_id: int = BOC_ID,
     eoc_id: int = EOC_ID,
 ) -> torch.Tensor:
@@ -352,6 +353,7 @@ def batched_step(
         top_k_buf=top_k_buf,
         seeds=seeds,
         step_count=step_count,
+        advance_mask=advance_mask,
         boc_id=boc_id,
         eoc_id=eoc_id,
     )
@@ -377,6 +379,7 @@ def batched_step_direct(
     step_count: torch.Tensor,
     top_p: torch.Tensor | None = None,
     top_k_buf: torch.Tensor | None = None,
+    advance_mask: torch.Tensor | None = None,
     boc_id: int = BOC_ID,
     eoc_id: int = EOC_ID,
 ) -> tuple[
@@ -393,6 +396,11 @@ def batched_step_direct(
 
     ``seeds``/``step_count`` (both ``[B]``) make seeded rows reproducible; the
     returned ``new_step_count`` advances active rows for the next step.
+
+    ``advance_mask`` (``[B]`` bool, optional): rows with ``False`` sample (the
+    output is discarded by the caller) but do NOT advance any state — used by
+    the streaming-TTS protocol for text-injection / decision / block-boundary
+    steps where the position holds a text token, not an audio row.
     """
     B, N, _ = logits_BNV.shape
     device = logits_BNV.device
@@ -414,6 +422,8 @@ def batched_step_direct(
     codes_BN = torch.where(delay_mask, torch.full_like(codes_BN, boc_id), codes_BN)
 
     active = ~generation_done
+    if advance_mask is not None:
+        active = active & advance_mask
     in_delay_active = active & (delay_count < N)
     in_winddown_active = active & (eoc_countdown >= 0) & (~in_delay_active)
     cb0_eoc_now_active = (

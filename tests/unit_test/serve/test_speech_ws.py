@@ -35,6 +35,7 @@ def _prompt_text(prompt: Any) -> Any:
     """
     return prompt["text"] if isinstance(prompt, dict) else prompt
 
+
 class StreamingSpeechClient:
     def __init__(self, *, sample_rate: int = 24000) -> None:
         self.sample_rate = sample_rate

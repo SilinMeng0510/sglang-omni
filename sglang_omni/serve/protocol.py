@@ -299,6 +299,10 @@ class CreateSpeechRequest(BaseModel):
     task_type: str | None = None  # e.g. "Base", "CustomVoice", "VoiceDesign"
     language: str | None = None
     instructions: str | None = None  # style/emotion instructions
+    # Streaming-TTS model protocol (<|streaming_tts|> paced text injection;
+    # Higgs streaming-trained checkpoints only). Independent from ``stream``,
+    # which controls chunked audio in the HTTP response.
+    streaming_protocol: bool = False
 
     # Voice cloning parameters
     ref_audio: str | None = None  # path or URL to reference audio
@@ -339,6 +343,7 @@ class SpeechBatchItem(BaseModel):
     task_type: Any = None
     language: Any = None
     instructions: Any = None
+    streaming_protocol: Any = None
     ref_audio: Any = None
     ref_text: Any = None
     references: Any = None
@@ -423,6 +428,10 @@ class SpeechStreamSessionConfig(BaseModel):
     speed: float = 1.0
     stream_audio: bool = False
     split_granularity: str = "sentence"
+    # Streaming-TTS model protocol: ONE engine request for the whole session,
+    # incremental text injected token-by-token as input.text arrives (no
+    # sentence batching). Requires a streaming-trained checkpoint.
+    streaming_protocol: bool = False
     task_type: str | None = None
     language: str | None = None
     instructions: str | None = None

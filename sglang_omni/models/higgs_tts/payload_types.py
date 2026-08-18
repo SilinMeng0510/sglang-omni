@@ -37,6 +37,14 @@ class HiggsTtsState(PipelineStateBase):
     num_codebooks: int = 8
     codebook_size: int = 1026  # 1024 data + <|boc|> + <|eoc|>
 
+    # streaming-TTS protocol
+    streaming_protocol: bool = False
+    inject_text_ids: list[int] | None = None
+    streaming_incremental: bool = False
+    streaming_text_token_id: int | None = None
+    streaming_audio_token_id: int | None = None
+    streaming_text_end_token_id: int | None = None
+
     # generation params
     max_new_tokens: int = 2048
     temperature: float = 1.0
@@ -81,6 +89,14 @@ class HiggsTtsState(PipelineStateBase):
             data["lora_id"] = self.lora_id
         if self.lora_adapter_path is not None:
             data["lora_adapter_path"] = self.lora_adapter_path
+        if self.streaming_protocol:
+            data["streaming_protocol"] = True
+            data["inject_text_ids"] = list(self.inject_text_ids or [])
+            data["streaming_text_token_id"] = self.streaming_text_token_id
+            data["streaming_audio_token_id"] = self.streaming_audio_token_id
+            data["streaming_text_end_token_id"] = self.streaming_text_end_token_id
+            if self.streaming_incremental:
+                data["streaming_incremental"] = True
         for key in ("top_p", "top_k", "seed"):
             value = getattr(self, key)
             if value is not None:
@@ -111,6 +127,12 @@ class HiggsTtsState(PipelineStateBase):
             uploaded_voice_created_at=data.get("uploaded_voice_created_at"),
             lora_id=data.get("lora_id"),
             lora_adapter_path=data.get("lora_adapter_path"),
+            streaming_protocol=data.get("streaming_protocol", False),
+            inject_text_ids=data.get("inject_text_ids"),
+            streaming_incremental=data.get("streaming_incremental", False),
+            streaming_text_token_id=data.get("streaming_text_token_id"),
+            streaming_audio_token_id=data.get("streaming_audio_token_id"),
+            streaming_text_end_token_id=data.get("streaming_text_end_token_id"),
             num_codebooks=data.get("num_codebooks", 8),
             codebook_size=data.get("codebook_size", 1026),
             max_new_tokens=data.get("max_new_tokens", 2048),

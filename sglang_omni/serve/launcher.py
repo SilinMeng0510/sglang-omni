@@ -383,6 +383,12 @@ async def _run_server(
             allowed_media_domains=allowed_media_domains,
             tts_batch_max_items=tts_batch_max_items,
             architectures=[pipeline_config.architecture],
+            model_path=getattr(pipeline_config, "model_path", None),
+            generation_stage=(
+                type(pipeline_config)
+                .generation_sglang_role_to_stage()
+                .get("generation")
+            ),
         )
         profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
         profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)

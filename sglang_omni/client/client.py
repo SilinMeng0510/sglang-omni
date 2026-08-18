@@ -261,6 +261,21 @@ class Client:
     # Other operations
     # ------------------------------------------------------------------
 
+    async def append_input(
+        self,
+        request_id: str,
+        data: Any = None,
+        *,
+        stage: str,
+        done: bool = False,
+    ) -> bool:
+        """Push incremental input (e.g. streaming-TTS text tokens) to a
+        running request on ``stage``. Returns False if the request already
+        finished or the stage is unknown."""
+        return await self._coordinator.submit_input_chunk(
+            request_id, stage, data, done=done
+        )
+
     async def abort(
         self,
         request_id: str,

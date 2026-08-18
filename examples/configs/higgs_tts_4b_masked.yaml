@@ -18,8 +18,7 @@ separate_vocoder_process: true
 # to chase startup latency; more aggressive masking audibly degrades quality.
 # K8/M4 was also tested, but its latency gain was too small to pursue.
 vocoder_stream_stride: 32
-vocoder_stream_followup_stride: 32
-vocoder_full_context_streaming: true
+vocoder_startup_masked: true
 vocoder_startup_masked_delay_rows: 8
 vocoder_startup_masked_emit_frames: 3
 vocoder_startup_masked_until_frames: 8

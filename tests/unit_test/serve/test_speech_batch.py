@@ -165,7 +165,10 @@ def test_batch_speech_preserves_order_and_item_errors() -> None:
     assert body["results"][2]["media_type"] == "audio/pcm"
     assert body["results"][3]["error"]["param"] == "items.3.input"
     assert body["results"][4]["error"]["param"] == "items.4.input"
-    assert [_prompt_text(request.prompt) for request in client_impl.requests] == ["first", "third"]
+    assert [_prompt_text(request.prompt) for request in client_impl.requests] == [
+        "first",
+        "third",
+    ]
 
 
 def test_batch_speech_rejects_invalid_envelope_before_item_work() -> None:

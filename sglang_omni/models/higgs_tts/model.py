@@ -210,6 +210,19 @@ class HiggsTTSModel(nn.Module):
         self._cg_active_step_count = torch.zeros(
             pool_size, dtype=torch.long, device=cg_device
         )
+        # Streaming-TTS protocol shadow buffers (defaults keep the offline
+        # path byte-identical): force_text picks the text embedding of the
+        # published input token over the fused audio embedding; audio_advance
+        # False freezes the delay/EOC sampler state for the step.
+        self._cg_active_force_text = torch.zeros(
+            pool_size, dtype=torch.bool, device=cg_device
+        )
+        self._cg_active_audio_advance = torch.ones(
+            pool_size, dtype=torch.bool, device=cg_device
+        )
+        # rids whose PREFILL must not run the audio sampler (streaming
+        # protocol: the prompt's last position outputs a text-head decision).
+        self._streaming_rids: set[str] = set()
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.backbone.get_input_embeddings()
@@ -257,12 +270,21 @@ class HiggsTTSModel(nn.Module):
             NO_SEED if seed is None else resolve_row_seed(seed)
         )
 
+    def set_request_streaming(self, req_id: str, streaming: bool) -> None:
+        """Mark ``req_id`` as a streaming-protocol request (prefill emits a
+        text-head decision instead of an audio row)."""
+        if streaming:
+            self._streaming_rids.add(req_id)
+        else:
+            self._streaming_rids.discard(req_id)
+
     def release_row(self, req_id: str) -> None:
         """Return ``req_id``'s row to the free pool and drop its output codes."""
         row = self._rid_to_row.pop(req_id, None)
         if row is not None:
             self._free_rows.append(row)
         self._output_codes.pop(req_id, None)
+        self._streaming_rids.discard(req_id)
 
     def reset_request(self, req_id: str) -> None:
         self.release_row(req_id)
@@ -328,6 +350,18 @@ class HiggsTTSModel(nn.Module):
 
         was_done = self._sampler_pool.generation_done[row_indices].clone()
 
+        # Streaming-protocol rows: the prompt's last position outputs a
+        # text-head decision, so their audio sampler state must not advance
+        # at prefill and no code row is recorded.
+        streaming_row = [rid in self._streaming_rids for rid in req_ids]
+        advance_mask = (
+            torch.tensor(
+                [not s for s in streaming_row], dtype=torch.bool, device=device
+            )
+            if any(streaming_row)
+            else None
+        )
+
         codes_BN = batched_step(
             logits_BNV,
             self._sampler_pool,
@@ -335,13 +369,14 @@ class HiggsTTSModel(nn.Module):
             temperature=temperature,
             top_p=top_p,
             top_k_buf=top_k_buf,
+            advance_mask=advance_mask,
         )
 
         # Note(yichi): One D2H per step to skip STOP-sentinel rows in the Python append loop.
         was_done_cpu = was_done.cpu().tolist()
         codes_BN = codes_BN.detach().to(torch.long)
         for b in range(batch_size):
-            if was_done_cpu[b]:
+            if was_done_cpu[b] or streaming_row[b]:
                 continue
             self._output_codes.setdefault(req_ids[b], []).append(codes_BN[b])
 
@@ -373,6 +408,7 @@ class HiggsTTSModel(nn.Module):
         last_codes_BN_in = self._cg_active_last_codes[:batch_size]
         seeds_B = self._cg_active_seeds[:batch_size]
         step_count_B = self._cg_active_step_count[:batch_size]
+        audio_advance_B = self._cg_active_audio_advance[:batch_size]
 
         self._cg_was_done[:batch_size] = generation_done_B
 
@@ -394,6 +430,7 @@ class HiggsTTSModel(nn.Module):
             top_k_buf=top_k_buf,
             seeds=seeds_B,
             step_count=step_count_B,
+            advance_mask=audio_advance_B,
         )
         self._cg_active_step_count[:batch_size] = new_step_count_B
         self._cg_active_delay_count[:batch_size] = new_delay_count_B.to(
@@ -473,9 +510,15 @@ class HiggsTTSModel(nn.Module):
     ) -> torch.Tensor:
         """Graph-capture-friendly decode-step embedding lookup; reads from
         shadow `_cg_active_*[:bs]` populated by ``before_decode``.
+
+        ``_cg_active_force_text`` overrides the fused-audio lookup for
+        streaming-protocol steps whose input is a text-space token (injected
+        text, wait/audio markers, ``<|text_end|>``) even after audio rows
+        have started (``delay_count > 0``).
         """
         delay_counts = self._cg_active_delay_count[:batch_size].to(torch.long)
-        has_codes = (delay_counts > 0).unsqueeze(-1)
+        force_text = self._cg_active_force_text[:batch_size].unsqueeze(-1)
+        has_codes = (delay_counts > 0).unsqueeze(-1) & ~force_text
 
         last_codes_BN = self._cg_active_last_codes[:batch_size].to(torch.long)
         fused_embeds = self.multimodal_embedding.modality_embedding_0(last_codes_BN)
@@ -485,6 +528,25 @@ class HiggsTTSModel(nn.Module):
             text_embeds = text_embeds[:, -1, :]
 
         return torch.where(has_codes, fused_embeds.to(text_embeds.dtype), text_embeds)
+
+    @torch.no_grad()
+    def decision_token_is_audio(
+        self,
+        hidden_BD: torch.Tensor,
+        *,
+        text_token_id: int,
+        audio_token_id: int,
+    ) -> torch.Tensor:
+        """Greedy text-head decision constrained to ``{<|text|>, <|audio|>}``.
+
+        Returns a bool ``[B]`` tensor, True where ``<|audio|>`` wins. Only the
+        two relevant lm_head rows are used, so this is two dot products per
+        row rather than a full-vocab projection.
+        """
+        head_weight = self.backbone.lm_head.weight
+        pair = head_weight[[text_token_id, audio_token_id]].to(hidden_BD.dtype)
+        logits_B2 = hidden_BD @ pair.t()
+        return logits_B2[:, 1] > logits_B2[:, 0]
 
     @staticmethod
     def _is_decode_step(forward_batch) -> bool:

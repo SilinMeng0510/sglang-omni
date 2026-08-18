@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import uuid
 from collections import deque
 from collections.abc import Awaitable
@@ -22,6 +24,7 @@ from sglang_omni.client.audio import (
     encode_pcm,
     select_audio_delta,
 )
+from sglang_omni.serve.incremental_text import StablePrefixTokenizer
 from sglang_omni.serve.protocol import CreateSpeechRequest, SpeechStreamSessionConfig
 from sglang_omni.serve.speech_errors import SpeechAPIError, bad_request, internal_error
 from sglang_omni.serve.speech_service import (
@@ -47,6 +50,21 @@ CLAUSE_BOUNDARIES = frozenset(".!?。！？,，;；")
 SUPPORTED_SPLIT_GRANULARITIES = frozenset({"sentence", "clause"})
 
 
+_TOKENIZER_CACHE: dict[str, Any] = {}
+
+
+def _load_cached_tokenizer(path: str) -> Any:
+    """Process-wide tokenizer cache: the tokenizer load should run once,
+    not per WebSocket session."""
+    cached = _TOKENIZER_CACHE.get(path)
+    if cached is None:
+        from tokenizers import Tokenizer
+
+        cached = Tokenizer.from_file(path)
+        _TOKENIZER_CACHE[path] = cached
+    return cached
+
+
 def new_speech_ws_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
@@ -67,10 +85,18 @@ class SpeechWebSocketSession:
         *,
         client: Client,
         speech_service: SpeechRequestValidator,
+        model_path: str | None = None,
+        generation_stage: str | None = None,
     ) -> None:
         self.websocket = websocket
         self.client = client
         self.speech_service = speech_service
+        self.model_path = model_path
+        self.generation_stage = generation_stage or "tts_engine"
+        self.stream_tokenizer: StablePrefixTokenizer | None = None
+        self.streaming_generation_task: asyncio.Task[int] | None = None
+        self.streaming_request_id: str | None = None
+        self.streaming_input_done = False
         self.session_id = new_speech_ws_id("speech_ws")
         self.closed = False
         self.config: SpeechStreamSessionConfig | None = None
@@ -151,10 +177,17 @@ class SpeechWebSocketSession:
                 return
 
             message_type = payload.get("type")
+            streaming_mode = self.config is not None and self.config.streaming_protocol
             if message_type == "input.text":
-                await self._handle_input_text(payload)
+                if streaming_mode:
+                    await self._handle_streaming_input_text(payload)
+                else:
+                    await self._handle_input_text(payload)
             elif message_type == "input.done":
-                await self._handle_input_done()
+                if streaming_mode:
+                    await self._handle_streaming_input_done()
+                else:
+                    await self._handle_input_done()
                 return
             else:
                 await self._send_error(
@@ -198,6 +231,217 @@ class SpeechWebSocketSession:
             }
         )
 
+    # ------------------------------------------------------------------
+    # Streaming-protocol session (one engine request, incremental text)
+    # ------------------------------------------------------------------
+
+    def _load_stream_tokenizer(self) -> StablePrefixTokenizer:
+        if self.stream_tokenizer is not None:
+            return self.stream_tokenizer
+        if not self.model_path:
+            raise bad_request(
+                "streaming_protocol sessions are unavailable: server has no "
+                "model path configured for incremental tokenization"
+            )
+        from sglang_omni.utils.checkpoint import resolve_checkpoint
+
+        checkpoint_dir = resolve_checkpoint(self.model_path)
+        raw = _load_cached_tokenizer(os.path.join(checkpoint_dir, "tokenizer.json"))
+
+        def _encode_full(text: str):
+            enc = raw.encode(text, add_special_tokens=False)
+            return enc.ids, enc.offsets
+
+        def _pre_tokenize(text: str):
+            return [span for _, span in raw.pre_tokenizer.pre_tokenize_str(text)]
+
+        # canonical safe-prefix release: complete pre-tokens are exact, the
+        # trailing pre-token commits behind a small token guard, so the
+        # injected stream matches the offline full-text tokenization
+        self.stream_tokenizer = StablePrefixTokenizer(_encode_full, _pre_tokenize)
+        return self.stream_tokenizer
+
+    async def _handle_streaming_input_text(self, payload: dict[str, Any]) -> None:
+        text = payload.get("text")
+        if not isinstance(text, str):
+            await self._send_error(bad_request("input.text text must be a string"))
+            return
+        if not text:
+            return
+        tokenizer = self._load_stream_tokenizer()
+        if len(tokenizer.pending_text) + len(text) > MAX_BUFFERED_TEXT_CHARS:
+            await self._send_error(
+                bad_request(
+                    f"buffered speech text exceeds {MAX_BUFFERED_TEXT_CHARS} characters",
+                    param="text",
+                )
+            )
+            self.closed = True
+            return
+        released = tokenizer.push(text)
+        await self._dispatch_released_tokens(released)
+
+    async def _handle_streaming_input_done(self) -> None:
+        self.streaming_input_done = True
+        tokenizer = self._load_stream_tokenizer()
+        released = tokenizer.flush()
+        if tokenizer.guard_breaches or tokenizer.forced_reseals:
+            logger.warning(
+                "streaming session %s released non-canonical seams: "
+                "guard_breaches=%d forced_reseals=%d",
+                self.session_id,
+                tokenizer.guard_breaches,
+                tokenizer.forced_reseals,
+            )
+        await self._dispatch_released_tokens(released, done=True)
+        total_bytes = 0
+        failed = False
+        if self.streaming_generation_task is not None:
+            try:
+                total_bytes = await self._run_generation_until_disconnect(
+                    self._await_streaming_generation()
+                )
+            except (asyncio.CancelledError, WebSocketDisconnect):
+                await self._abort_active_request()
+                raise
+            except Exception as exc:
+                failed = True
+                await self._abort_active_request()
+                error = (
+                    exc if isinstance(exc, SpeechAPIError) else internal_error(str(exc))
+                )
+                if not isinstance(exc, SpeechAPIError):
+                    logger.exception(
+                        "streaming TTS WebSocket session failed: %s",
+                        self.streaming_request_id,
+                    )
+                await self._send_error(error)
+        await self._send_json(
+            {
+                "type": "session.done",
+                "session_id": self.session_id,
+                "total_bytes": total_bytes,
+                "error": failed,
+            }
+        )
+
+    async def _await_streaming_generation(self) -> int:
+        assert self.streaming_generation_task is not None
+        return await self.streaming_generation_task
+
+    async def _dispatch_released_tokens(
+        self, token_ids: list[int], *, done: bool = False
+    ) -> None:
+        """Start the engine request on the first stable release, then push
+        later releases (and the final done marker) into its inject queue."""
+        if self.streaming_generation_task is None:
+            tokenizer = self._load_stream_tokenizer()
+            if not tokenizer.released_text:
+                if done:
+                    await self._send_error(
+                        bad_request("input.done received before any speech text")
+                    )
+                    self.closed = True
+                return
+            await self._start_streaming_generation(
+                tokenizer.released_text, input_done=done
+            )
+            return
+        if token_ids or done:
+            delivered = False
+            for attempt in range(3):
+                delivered = await self.client.append_input(
+                    self.streaming_request_id,
+                    {"token_ids": token_ids, "done": done},
+                    stage=self.generation_stage,
+                )
+                if delivered:
+                    break
+                await asyncio.sleep(0.05)
+            if not delivered and not done:
+                logger.warning(
+                    "streaming TTS session %s: engine request %s no longer "
+                    "accepts input (finished early?); %d token(s) dropped",
+                    self.session_id,
+                    self.streaming_request_id,
+                    len(token_ids),
+                )
+
+    async def _start_streaming_generation(
+        self, initial_text: str, *, input_done: bool
+    ) -> None:
+        assert self.config is not None
+        request = self._speech_request_from_config(
+            sentence=initial_text, stream=self.config.stream_audio
+        )
+        gen_req = self.speech_service.build_generate_request(
+            request,
+            validate=False,
+            reference_descriptors=self._config_reference_descriptors(),
+            uploaded_voice=self._config_uploaded_voice(),
+        )
+        gen_req.extra_params["streaming_protocol"] = True
+        if not input_done:
+            gen_req.extra_params["streaming_incremental"] = True
+        request_id = f"{self.session_id}-stream"
+        self.streaming_request_id = request_id
+        self.active_request_id = request_id
+        self.streaming_generation_task = asyncio.create_task(
+            self._pump_streaming_audio(gen_req, request_id)
+        )
+        # Block until the coordinator has registered the request: appends
+        # sent before registration are dropped (append_input -> False),
+        # which silently loses words from the middle of the utterance.
+        for _ in range(500):
+            if self.streaming_generation_task.done():
+                break  # submission failed; input.done surfaces the error
+            if await self.client.get_status(request_id) is not None:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise internal_error("streaming TTS request was not registered in time")
+
+    async def _pump_streaming_audio(self, gen_req: Any, request_id: str) -> int:
+        assert self.config is not None
+        emitted_samples = 0
+        total_bytes = 0
+        started = False
+        async for chunk in self.client.generate(gen_req, request_id=request_id):
+            if chunk.audio_data is None:
+                continue
+            sample_rate = chunk.sample_rate or DEFAULT_SAMPLE_RATE
+            audio_data, emitted_samples = select_audio_delta(
+                chunk.audio_data,
+                emitted_samples=emitted_samples,
+                is_terminal=chunk.finish_reason is not None,
+            )
+            if audio_data is None:
+                continue
+            if self.config.speed != 1.0:
+                audio_data, sample_rate = apply_speed(
+                    audio_data, self.config.speed, sample_rate
+                )
+            audio_bytes = encode_pcm(audio_data, sample_rate)
+            if not audio_bytes:
+                continue
+            if not started:
+                await self._send_json(
+                    {
+                        "type": "audio.start",
+                        "id": request_id,
+                        "format": self.config.response_format,
+                        "sample_rate": sample_rate,
+                    }
+                )
+                started = True
+            await self._send_audio_frame(audio_bytes, active_request_id=request_id)
+            total_bytes += len(audio_bytes)
+        if total_bytes == 0:
+            raise ClientError("No audio output generated from the pipeline.")
+        if self.active_request_id == request_id:
+            self.active_request_id = None
+        return total_bytes
+
     async def _parse_config(
         self,
         payload: dict[str, Any],
@@ -224,11 +468,18 @@ class SpeechWebSocketSession:
                 "stream_audio=true requires response_format='pcm'",
                 param="response_format",
             )
+        if config.streaming_protocol and not config.stream_audio:
+            raise bad_request(
+                "streaming_protocol sessions require stream_audio=true",
+                param="streaming_protocol",
+            )
         prepared = await asyncio.to_thread(
             self.speech_service.parse_generation_request,
             self._speech_payload_from_config(config, "probe"),
         )
         config_fields = set(SpeechStreamSessionConfig.model_fields)
+        # session-only switches must survive the probe-request round trip
+        config_fields.discard("streaming_protocol")
         prepared_updates = {
             key: value
             for key, value in prepared.request.model_dump().items()
@@ -608,6 +859,13 @@ class SpeechWebSocketSession:
 
     async def teardown(self) -> None:
         self.closed = True
+        if (
+            self.streaming_generation_task is not None
+            and not self.streaming_generation_task.done()
+        ):
+            self.streaming_generation_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self.streaming_generation_task
         await self._abort_active_request()
         if (
             self.websocket.application_state == WebSocketState.CONNECTED

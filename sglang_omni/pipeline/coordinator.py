@@ -17,6 +17,7 @@ from sglang_omni.proto import (
     AdminResult,
     AdminResultMessage,
     CompleteMessage,
+    InputChunkMessage,
     OmniRequest,
     RequestInfo,
     RequestState,
@@ -417,6 +418,48 @@ class Coordinator:
             self.entry_stage,
             entry_info.control_endpoint,
         )
+
+    async def submit_input_chunk(
+        self,
+        request_id: str,
+        stage_name: str,
+        data: Any = None,
+        *,
+        done: bool = False,
+    ) -> bool:
+        """Push incremental input to a running request on ``stage_name``.
+
+        Small JSON-serializable ``data`` rides the control plane straight to
+        the stage's scheduler inbox (no relay). Returns False when the
+        request is no longer tracked (finished/aborted) or the stage is
+        unknown.
+        """
+        info = self._requests.get(request_id)
+        if info is None or info.state in (
+            RequestState.COMPLETED,
+            RequestState.FAILED,
+            RequestState.ABORTED,
+        ):
+            return False
+        stage_info = self._stages.get(stage_name)
+        if stage_info is None:
+            logger.warning(
+                "submit_input_chunk: unknown stage %s for req=%s",
+                stage_name,
+                request_id,
+            )
+            return False
+        await self.control_plane.submit_to_stage(
+            stage_name,
+            stage_info.control_endpoint,
+            InputChunkMessage(
+                request_id=request_id,
+                to_stage=stage_name,
+                data=data,
+                is_done=done,
+            ),
+        )
+        return True
 
     async def abort(self, request_id: str) -> bool:
         """Abort a request.
