@@ -131,9 +131,7 @@ class HiggsTTSModelRunner(ModelRunner):
         result.next_token_ids = (
             self.model._cg_codes_BN[:n_real, 0].clamp_min(0).to(torch.long).clone()
         )
-        # Streaming-protocol rows whose NEXT input is a text-space token (the
-        # launch-time advance recorded it) override GPU codebook-0: the AR
-        # input chain must carry the injected token, not the sampled code.
+        # streaming rows with a text-space next input override GPU codebook-0
         overrides = [
             (b, token)
             for b, sched_req in enumerate(requests)
@@ -263,17 +261,11 @@ class HiggsTTSModelRunner(ModelRunner):
         )
 
     def lookahead_eligible(self, batch: Any) -> bool:
-        """Streaming-protocol requests may lookahead once past the opening:
-        every later boundary forces ``<|audio|>``, so the launch-time advance
-        (``_advance_streaming_plans_at_launch``) knows the next input without
-        this step's output. Gate to sync while any streaming request
-
-        - is still in the opening phase (the text-head decision needs this
-          step's hidden states at collect),
-        - is starved / parked-adjacent (the park sweep must not race an
-          in-flight step's GPU scatter), or
-        - would need a text token this launch that an open incremental queue
-          cannot yet supply (the advance would starve mid-launch).
+        """Streaming requests may lookahead once past the opening (the plan
+        sequence is output-independent from there). Sync while any streaming
+        request is still opening, starved, plan-carrying hard_stop, or one
+        advance from starving on an open incremental queue — starvation must
+        never be discovered with a step in flight (park frees the pool row).
         """
         for req in batch.reqs:
             data = getattr(req, "_omni_data", None)
@@ -320,16 +312,11 @@ class HiggsTTSModelRunner(ModelRunner):
         return dict(zip(rows, (bool(v) for v in is_audio.cpu().tolist())))
 
     def _advance_streaming_plans_at_launch(self, requests: list) -> None:
-        """Advance post-opening streaming protocol machines at LAUNCH time.
-
-        After the first audio block every boundary forces ``<|audio|>``, so the
-        plan sequence is fully deterministic — the next step's input is known
-        before this step's output is collected. Each launch pushes one
-        ``(plan_for_this_step, plan_after)`` record that the collect side
-        consumes instead of advancing. Opening steps (the text-head decision
-        needs this step's hidden states) push no record and keep the
-        collect-time advance, as do starve-resume extends (their collect runs
-        through the prefill path, which never launches through here).
+        """Advance post-opening protocol machines at launch: the plan sequence
+        no longer depends on the step's output, so each launch pushes one
+        ``(plan_for_this_step, plan_after)`` record for the collect side to
+        consume. Opening steps advance at collect instead (the decision needs
+        this step's hidden states) and push no record.
         """
         for sched_req in requests:
             data = sched_req.data
@@ -341,9 +328,7 @@ class HiggsTTSModelRunner(ModelRunner):
                 continue
             plan_now = data.streaming_plan
             if plan_now is not None and plan_now.hard_stop:
-                # this step's plan already carries the deterministic finish; a
-                # lookahead overrun launch must not advance past it (the
-                # collect side is about to mark the request done)
+                # a lookahead overrun launch must not advance past the finish
                 data.streaming_launch_token = None
                 continue
             next_plan = proto.on_step_output(None)
@@ -357,10 +342,10 @@ class HiggsTTSModelRunner(ModelRunner):
             else:
                 data.streaming_launch_token = None
 
-    def _consume_audio_row(self, sched_req: Any, codes_N: torch.Tensor) -> tuple[int, bool]:
-        """Shared AUDIO-step output consumption: append + emit the row, detect
-        the off-distribution EOC abort and the frozen-row watchdog. Returns
-        ``(cb0, eoc_abort)``."""
+    def _consume_audio_row(
+        self, sched_req: Any, codes_N: torch.Tensor
+    ) -> tuple[int, bool]:
+        """Append + emit one audio row; returns ``(cb0, eoc_abort)``."""
         data = sched_req.data
         proto = data.protocol_state
         data.output_codes.append(codes_N)
@@ -443,8 +428,7 @@ class HiggsTTSModelRunner(ModelRunner):
         gen_done_after: bool,
     ) -> int:
         """Collect side of a launch-advanced step: consume this step's output
-        against the recorded plan pair (the machine already advanced at
-        launch)."""
+        against the recorded plan pair."""
         data = sched_req.data
         plan_now, next_plan = data.streaming_inflight.pop(0)
         cb0 = 0
@@ -453,9 +437,7 @@ class HiggsTTSModelRunner(ModelRunner):
             assert codes_N is not None
             cb0, eoc_abort = self._consume_audio_row(sched_req, codes_N)
         if next_plan.starved:
-            # input_starved was already flagged at launch; publish a
-            # placeholder (overwritten at resume).
-            return cb0
+            return cb0  # placeholder; input_starved was flagged at launch
         return self._finish_or_publish(
             sched_req, next_plan, cb0, gen_done_after, eoc_abort
         )
@@ -468,10 +450,8 @@ class HiggsTTSModelRunner(ModelRunner):
         codes_N: torch.Tensor | None,
         gen_done_after: bool,
     ) -> int:
-        """Opening-phase collect: consume THIS step's output, advance the
-        protocol machine (the text-head decision is only available now), and
-        return the token id to publish as the next step's input.
-        """
+        """Opening-phase collect: consume this step's output, advance the
+        machine, return the token id to publish as the next step's input."""
         data = sched_req.data
         proto = data.protocol_state
         role = proto.role

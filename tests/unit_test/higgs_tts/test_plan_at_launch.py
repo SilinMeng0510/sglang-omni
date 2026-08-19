@@ -125,9 +125,7 @@ def _drive(text_ids, decisions, mode, max_frames=60, max_steps=500):
             )
             continue
         role = (
-            data.streaming_plan.role
-            if data.streaming_plan is not None
-            else proto.role
+            data.streaming_plan.role if data.streaming_plan is not None else proto.role
         )
         opening = not proto.first_block_emitted
         runner._advance_streaming_plans_at_launch([sched])
@@ -245,9 +243,7 @@ def test_lookahead_eligible_open_queue_starve_risk():
     proto = data.protocol_state
     # walk to the injection point (BLOCK_END plan) with an empty open queue
     step = 0
-    while not (
-        data.streaming_plan.role is StepRole.BLOCK_END and proto.queue_empty
-    ):
+    while not (data.streaming_plan.role is StepRole.BLOCK_END and proto.queue_empty):
         runner._advance_streaming_plans_at_launch([sched])
         codes = (
             audio_row(step)
@@ -278,9 +274,7 @@ def test_starve_flagged_at_launch():
     d = sched.data
     step = 0
     while not d.input_starved and step < 100:
-        role = (
-            d.streaming_plan.role if d.streaming_plan is not None else proto2.role
-        )
+        role = d.streaming_plan.role if d.streaming_plan is not None else proto2.role
         opening = not proto2.first_block_emitted
         runner._advance_streaming_plans_at_launch([sched])
         codes = audio_row(step) if role is StepRole.AUDIO else None
