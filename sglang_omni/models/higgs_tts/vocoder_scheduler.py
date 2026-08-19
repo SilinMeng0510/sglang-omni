@@ -567,6 +567,8 @@ class HiggsStreamingVocoderScheduler(
         payload: StagePayload,
     ) -> tuple[HiggsTtsState, torch.Tensor | None]:
         state = HiggsTtsState.from_dict(payload.data)
+        if not state.output_audio:
+            return state, None
         delayed_rows = state.output_codes_delayed
         if not delayed_rows:
             return state, None

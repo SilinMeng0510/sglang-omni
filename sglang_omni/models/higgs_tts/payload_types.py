@@ -55,6 +55,7 @@ class HiggsTtsState(PipelineStateBase):
     # RL rollout controls
     return_logprob: bool = False
     return_omni_rollout: bool = False
+    output_audio: bool = True
 
     # tts_engine
     output_codes_delayed: list[list[int]] | None = None
@@ -104,6 +105,8 @@ class HiggsTtsState(PipelineStateBase):
         for key in ("return_logprob", "return_omni_rollout"):
             if getattr(self, key):
                 data[key] = True
+        if not self.output_audio:
+            data["output_audio"] = False
         if self.output_codes_delayed is not None:
             data["output_codes_delayed"] = self.output_codes_delayed
         if self.omni_rollout is not None:
@@ -142,6 +145,7 @@ class HiggsTtsState(PipelineStateBase):
             seed=data.get("seed"),
             return_logprob=data.get("return_logprob", False),
             return_omni_rollout=data.get("return_omni_rollout", False),
+            output_audio=data.get("output_audio", True),
             output_codes_delayed=data.get("output_codes_delayed"),
             omni_rollout=data.get("omni_rollout"),
             prompt_tokens=data.get("prompt_tokens", 0),

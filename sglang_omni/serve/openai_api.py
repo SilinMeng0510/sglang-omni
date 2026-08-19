@@ -1178,7 +1178,8 @@ def _build_generate_response(
             ),
         )
     audio: GenerateAudio | None = None
-    if result.audio is not None:
+    requested_modalities = req.output_modalities or ["text"]
+    if result.audio is not None and "audio" in requested_modalities:
         audio = GenerateAudio(data=result.audio.data, format=audio_format)
 
     meta_info = GenerateMetaInfo(
