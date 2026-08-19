@@ -91,6 +91,7 @@ class HiggsTTSModelRunner(ModelRunner):
         del schedule_batch
         forward_batch.req_ids = [req.request_id for req in requests]
         self._populate_cg_buffers(forward_batch, requests, is_lookahead=is_lookahead)
+        self._advance_streaming_plans_at_launch(requests)
 
     def post_decode(self, result, forward_batch, schedule_batch, requests):
         del schedule_batch
@@ -285,72 +286,93 @@ class HiggsTTSModelRunner(ModelRunner):
         )
         return dict(zip(rows, (bool(v) for v in is_audio.cpu().tolist())))
 
-    def _advance_streaming_request(
-        self,
-        sched_req: Any,
-        decisions: dict[int, bool],
-        row_idx: int,
-        codes_N: torch.Tensor | None,
-        gen_done_after: bool,
-    ) -> int:
-        """Consume THIS step's output for one streaming request, advance the
-        protocol machine, and return the token id to publish as the next
-        step's input (text-space token or codebook-0 of the last audio row).
+    def _advance_streaming_plans_at_launch(self, requests: list) -> None:
+        """Advance post-opening streaming protocol machines at LAUNCH time.
+
+        After the first audio block every boundary forces ``<|audio|>``, so the
+        plan sequence is fully deterministic — the next step's input is known
+        before this step's output is collected. Each launch pushes one
+        ``(plan_for_this_step, plan_after)`` record that the collect side
+        consumes instead of advancing. Opening steps (the text-head decision
+        needs this step's hidden states) push no record and keep the
+        collect-time advance, as do starve-resume extends (their collect runs
+        through the prefill path, which never launches through here).
         """
+        for sched_req in requests:
+            data = sched_req.data
+            proto = getattr(data, "protocol_state", None)
+            if proto is None or not proto.first_block_emitted:
+                continue
+            if data.req.finished() or data.input_starved:
+                continue
+            plan_now = data.streaming_plan
+            if plan_now is not None and plan_now.hard_stop:
+                # this step's plan already carries the deterministic finish; a
+                # lookahead overrun launch must not advance past it (the
+                # collect side is about to mark the request done)
+                continue
+            next_plan = proto.on_step_output(None)
+            data.streaming_plan = next_plan
+            data.streaming_inflight.append((plan_now, next_plan))
+            if next_plan.starved:
+                data.input_starved = True
+
+    def _consume_audio_row(self, sched_req: Any, codes_N: torch.Tensor) -> tuple[int, bool]:
+        """Shared AUDIO-step output consumption: append + emit the row, detect
+        the off-distribution EOC abort and the frozen-row watchdog. Returns
+        ``(cb0, eoc_abort)``."""
         data = sched_req.data
         proto = data.protocol_state
-        req = data.req
-        role = proto.role
-        cb0 = 0
-        decision: bool | None = None
-        eoc_abort = False
-        if role is StepRole.AUDIO:
-            assert codes_N is not None
-            data.output_codes.append(codes_N)
-            self._emit_code_chunk(sched_req, codes_N)
-            cb0 = int(codes_N[0].item())
-            # Reference behavior: a cb0 EOC inside a NON-tail block is
-            # off-distribution and stops the stream immediately (no
-            # delay-pattern winddown; the EOC row itself is kept). Tail
-            # blocks finish via the sampler's EOC winddown (gen_done_after).
-            eoc_abort = cb0 == EOC_ID and not proto.in_tail_flush
-            # Frozen-row watchdog: the model's known runaway mode cycles
-            # through a handful of near-silence rows forever instead of
-            # reaching EOC. Trip when every row of a 2.5 s stretch repeats
-            # one of the few recently seen rows — real speech constantly
-            # produces novel rows (trained pauses cap at ~1.5 s).
-            row = tuple(codes_N.tolist())
-            recent = data.watchdog_recent_rows
-            if row in recent:
-                data.watchdog_repeat_rows += 1
-            else:
-                data.watchdog_repeat_rows = 0
-                recent.append(row)
-                if len(recent) > _WATCHDOG_RECENT_ROWS:
-                    del recent[0]
-            if data.watchdog_repeat_rows >= _WATCHDOG_FROZEN_ROWS:
-                logger.warning(
-                    "streaming-tts %s: frozen-row watchdog tripped after %d "
-                    "identical rows; force-finishing",
-                    sched_req.request_id,
-                    data.watchdog_repeat_rows,
-                )
-                proto.fuse_tripped = True
-                eoc_abort = True
-        elif role is StepRole.DECISION:
-            decision = decisions.get(row_idx, False)
-        plan = proto.on_step_output(decision)
-        data.streaming_plan = plan
-        if plan.starved:
-            # incremental input ran dry at an injection point: publish a
-            # placeholder (overwritten at resume) and ask the scheduler to
-            # park the request until more text arrives.
-            data.input_starved = True
-            return cb0
+        data.output_codes.append(codes_N)
+        self._emit_code_chunk(sched_req, codes_N)
+        cb0 = int(codes_N[0].item())
+        # Reference behavior: a cb0 EOC inside a NON-tail block is
+        # off-distribution and stops the stream immediately (no
+        # delay-pattern winddown; the EOC row itself is kept). Tail
+        # blocks finish via the sampler's EOC winddown (gen_done_after).
+        eoc_abort = cb0 == EOC_ID and not proto.in_tail_flush
+        # Frozen-row watchdog: the model's known runaway mode cycles
+        # through a handful of near-silence rows forever instead of
+        # reaching EOC. Trip when every row of a 2.5 s stretch repeats
+        # one of the few recently seen rows — real speech constantly
+        # produces novel rows (trained pauses cap at ~1.5 s).
+        row = tuple(codes_N.tolist())
+        recent = data.watchdog_recent_rows
+        if row in recent:
+            data.watchdog_repeat_rows += 1
+        else:
+            data.watchdog_repeat_rows = 0
+            recent.append(row)
+            if len(recent) > _WATCHDOG_RECENT_ROWS:
+                del recent[0]
+        if data.watchdog_repeat_rows >= _WATCHDOG_FROZEN_ROWS:
+            logger.warning(
+                "streaming-tts %s: frozen-row watchdog tripped after %d "
+                "identical rows; force-finishing",
+                sched_req.request_id,
+                data.watchdog_repeat_rows,
+            )
+            proto.fuse_tripped = True
+            eoc_abort = True
+        return cb0, eoc_abort
+
+    def _finish_or_publish(
+        self,
+        sched_req: Any,
+        plan: Any,
+        cb0: int,
+        gen_done_after: bool,
+        eoc_abort: bool,
+    ) -> int:
+        """Shared tail of streaming-step collect: apply the finish decision and
+        return the token id to publish as the next step's input."""
+        data = sched_req.data
+        proto = data.protocol_state
         done = bool(gen_done_after) or eoc_abort or plan.hard_stop
         data.generation_done = done
-        self._mark_sampler_finished(req, done)
+        self._mark_sampler_finished(data.req, done)
         if done:
+            data.streaming_inflight.clear()
             trace = proto.finalize_trace()
             logger.info(
                 "streaming-tts %s finished: rows=%d blocks=%d opening_waits=%d "
@@ -373,6 +395,63 @@ class HiggsTTSModelRunner(ModelRunner):
         if plan.input_is_text and plan.input_token_id is not None:
             return int(plan.input_token_id)
         return cb0
+
+    def _consume_streaming_step(
+        self,
+        sched_req: Any,
+        codes_N: torch.Tensor | None,
+        gen_done_after: bool,
+    ) -> int:
+        """Collect side of a launch-advanced step: consume this step's output
+        against the recorded plan pair (the machine already advanced at
+        launch)."""
+        data = sched_req.data
+        plan_now, next_plan = data.streaming_inflight.pop(0)
+        cb0 = 0
+        eoc_abort = False
+        if plan_now is not None and plan_now.role is StepRole.AUDIO:
+            assert codes_N is not None
+            cb0, eoc_abort = self._consume_audio_row(sched_req, codes_N)
+        if next_plan.starved:
+            # input_starved was already flagged at launch; publish a
+            # placeholder (overwritten at resume).
+            return cb0
+        return self._finish_or_publish(
+            sched_req, next_plan, cb0, gen_done_after, eoc_abort
+        )
+
+    def _advance_streaming_request(
+        self,
+        sched_req: Any,
+        decisions: dict[int, bool],
+        row_idx: int,
+        codes_N: torch.Tensor | None,
+        gen_done_after: bool,
+    ) -> int:
+        """Opening-phase collect: consume THIS step's output, advance the
+        protocol machine (the text-head decision is only available now), and
+        return the token id to publish as the next step's input.
+        """
+        data = sched_req.data
+        proto = data.protocol_state
+        role = proto.role
+        cb0 = 0
+        decision: bool | None = None
+        eoc_abort = False
+        if role is StepRole.AUDIO:
+            assert codes_N is not None
+            cb0, eoc_abort = self._consume_audio_row(sched_req, codes_N)
+        elif role is StepRole.DECISION:
+            decision = decisions.get(row_idx, False)
+        plan = proto.on_step_output(decision)
+        data.streaming_plan = plan
+        if plan.starved:
+            # incremental input ran dry at an injection point: publish a
+            # placeholder (overwritten at resume) and ask the scheduler to
+            # park the request until more text arrives.
+            data.input_starved = True
+            return cb0
+        return self._finish_or_publish(sched_req, plan, cb0, gen_done_after, eoc_abort)
 
     @staticmethod
     def _extract_decode_sampling_params(forward_batch, n_real: int):
@@ -506,15 +585,22 @@ class HiggsTTSModelRunner(ModelRunner):
                 continue
             if getattr(data, "protocol_state", None) is not None:
                 codes_N = codes_BN_cpu[b].to(torch.long).clone()
-                cb0_per_row.append(
-                    self._advance_streaming_request(
-                        sched_req,
-                        streaming_decisions,
-                        b,
-                        codes_N,
-                        bool(gen_done_after_cpu[b]),
+                if data.streaming_inflight:
+                    cb0_per_row.append(
+                        self._consume_streaming_step(
+                            sched_req, codes_N, bool(gen_done_after_cpu[b])
+                        )
                     )
-                )
+                else:
+                    cb0_per_row.append(
+                        self._advance_streaming_request(
+                            sched_req,
+                            streaming_decisions,
+                            b,
+                            codes_N,
+                            bool(gen_done_after_cpu[b]),
+                        )
+                    )
                 continue
             codes_N = codes_BN_cpu[b].to(torch.long).clone()
             data.output_codes.append(codes_N)
