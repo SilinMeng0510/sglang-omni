@@ -178,6 +178,8 @@ def create_preprocessing_executor(
 
         metadata = payload.request.metadata
         metadata = metadata if isinstance(metadata, dict) else {}
+        modalities = metadata.get("output_modalities")
+        output_audio = not isinstance(modalities, list) or "audio" in modalities
         tts_params = metadata.get("tts_params")
         tts_params = tts_params if isinstance(tts_params, dict) else {}
         lora_adapter = tts_params.get("lora_adapter")
@@ -336,6 +338,7 @@ def create_preprocessing_executor(
             seed=params.get("seed"),
             return_logprob=bool(params.get("return_logprob", False)),
             return_omni_rollout=bool(params.get("return_omni_rollout", False)),
+            output_audio=output_audio,
         )
         payload.data = state.to_dict()
         return payload
