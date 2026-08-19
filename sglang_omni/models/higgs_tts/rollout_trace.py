@@ -93,4 +93,71 @@ def build_omni_rollout_trace(
     }
 
 
-__all__ = ["OMNI_ROLLOUT_VERSION", "build_omni_rollout_trace"]
+def append_streaming_rollout(
+    trace: dict[str, Any],
+    *,
+    decision_actions: list[int],
+    decision_logprobs: list[float] | None,
+    protocol_trace: list,
+    text_token_id: int,
+    audio_token_id: int,
+    frames_per_block: int,
+    stage: str = "tts_engine",
+) -> dict[str, Any]:
+    """Extend an offline trace with streaming-protocol data: the trainable
+    opening decisions (waits after the force-inserted first ``<|text|>``,
+    then the block-opening ``<|audio|>``; 0=wait, 1=audio; greedy under the
+    constrained two-way softmax) and the full step layout needed to replay
+    the interleaved trajectory. Everything else (forced boundary ``<|audio|>``
+    markers, injected text, discarded feed outputs) stays masked by omission.
+    """
+    k = len(decision_actions)
+    if decision_logprobs is not None and len(decision_logprobs) != k:
+        raise ValueError(
+            f"decision logprobs length {len(decision_logprobs)} != actions {k}"
+        )
+    if k:
+        trace["action_streams"].append(
+            {
+                "name": "opening_decisions",
+                "stage": stage,
+                "modality": "text",
+                "action_type": "discrete",
+                "layout": "sequence",
+                "flatten_order": "time_major",
+                "shape": [k],
+                "vocab_size": 2,
+                "actions": [int(a) for a in decision_actions],
+                "logprobs": (
+                    [float(v) for v in decision_logprobs]
+                    if decision_logprobs is not None
+                    else None
+                ),
+                "action_mask": [1] * k,
+                "deterministic_mask": [1] * k,
+                "channel_ids": [0],
+                "channel_roles": ["opening_decision"],
+                "action_token_ids": {
+                    "0": int(text_token_id),
+                    "1": int(audio_token_id),
+                },
+            }
+        )
+        trace["total_action_count"] = int(trace["total_action_count"]) + k
+    trace["non_action_outputs"].append(
+        {
+            "name": "streaming_protocol_layout",
+            "trace": [list(event) for event in protocol_trace],
+            "text_token_id": int(text_token_id),
+            "audio_token_id": int(audio_token_id),
+            "frames_per_block": int(frames_per_block),
+        }
+    )
+    return trace
+
+
+__all__ = [
+    "OMNI_ROLLOUT_VERSION",
+    "append_streaming_rollout",
+    "build_omni_rollout_trace",
+]

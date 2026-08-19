@@ -196,6 +196,7 @@ class RolloutGenerateRequest(BaseModel):
     return_omni_rollout: bool = False
     return_routed_experts: bool = False
     return_indexer_topk: bool = False
+    streaming_protocol: bool = False
 
 
 class GenerateFinishReason(BaseModel):

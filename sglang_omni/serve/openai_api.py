@@ -1104,6 +1104,8 @@ def _build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateRequ
         "return_routed_experts": req.return_routed_experts,
         "return_indexer_topk": req.return_indexer_topk,
     }
+    if req.streaming_protocol:
+        extra_params["streaming_protocol"] = True
     metadata = dict(req.metadata) if req.metadata else {}
     _record_explicit_generation_params(
         metadata,
