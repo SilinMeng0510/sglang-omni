@@ -342,7 +342,9 @@ class HiggsTTSModelRunner(ModelRunner):
             else:
                 data.streaming_launch_token = None
 
-    def _consume_audio_row(self, sched_req: Any, codes_N: torch.Tensor) -> tuple[int, bool]:
+    def _consume_audio_row(
+        self, sched_req: Any, codes_N: torch.Tensor
+    ) -> tuple[int, bool]:
         """Append + emit one audio row; returns ``(cb0, eoc_abort)``."""
         data = sched_req.data
         proto = data.protocol_state
