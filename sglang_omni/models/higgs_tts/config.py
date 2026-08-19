@@ -49,6 +49,9 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     vocoder_startup_masked_until_frames: int = Field(default=8, ge=1)
     vocoder_startup_full_chunk_frames: int = Field(default=8, ge=1)
     vocoder_startup_full_chunk_count: int = Field(default=3, ge=0)
+    vocoder_startup_reduced_context_frames: int = Field(default=6, ge=0)
+    vocoder_startup_reduced_left_context_frames: int = Field(default=9, ge=0)
+    vocoder_startup_reduced_context_until_frames: int = Field(default=11, ge=0)
     stages: list[StageConfig] = Field(
         default_factory=lambda: [
             StageConfig(
@@ -127,6 +130,9 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                     startup_masked_until_frames=self.vocoder_startup_masked_until_frames,
                     startup_full_chunk_frames=self.vocoder_startup_full_chunk_frames,
                     startup_full_chunk_count=self.vocoder_startup_full_chunk_count,
+                    startup_reduced_context_frames=self.vocoder_startup_reduced_context_frames,
+                    startup_reduced_left_context_frames=self.vocoder_startup_reduced_left_context_frames,
+                    startup_reduced_context_until_frames=self.vocoder_startup_reduced_context_until_frames,
                 )
 
     def requires_uploaded_voice_for_named_voice(self) -> bool:
