@@ -56,6 +56,11 @@ class _FakeData:
     streaming_plan: Any = None
     streaming_inflight: list = field(default_factory=list)
     input_starved: bool = False
+    return_omni_rollout: bool = False
+    return_logprob: bool = False
+    output_logprobs: list = field(default_factory=list)
+    opening_decision_actions: list = field(default_factory=list)
+    opening_decision_logprobs: list = field(default_factory=list)
     output_codes: list = field(default_factory=list)
     watchdog_recent_rows: list = field(default_factory=list)
     watchdog_repeat_rows: int = 0
@@ -106,7 +111,11 @@ def _drive(text_ids, decisions, mode, max_frames=60, max_steps=500):
         if data.streaming_inflight:
             published.append(runner._consume_streaming_step(sched, codes, False))
         else:
-            dec = {0: opening_decision} if opening_decision is not None else {}
+            dec = (
+                {0: (opening_decision, -0.5, -1.5)}
+                if opening_decision is not None
+                else {}
+            )
             published.append(
                 runner._advance_streaming_request(sched, dec, 0, codes, False)
             )
@@ -119,7 +128,7 @@ def _drive(text_ids, decisions, mode, max_frames=60, max_steps=500):
             codes = audio_row(step) if role is StepRole.AUDIO else None
             dec = {}
             if role is StepRole.DECISION and not proto.first_block_emitted:
-                dec = {0: next(decision_iter)}
+                dec = {0: (next(decision_iter), -0.5, -1.5)}
             published.append(
                 runner._advance_streaming_request(sched, dec, 0, codes, False)
             )
@@ -199,7 +208,7 @@ def _post_opening_data(text_done=True, queue_left=5):
     runner = make_runner()
     sched = _FakeSchedReq(data)
     # drive through the opening (immediate audio decision) into the first block
-    runner._advance_streaming_request(sched, {0: True}, 0, None, False)
+    runner._advance_streaming_request(sched, {0: (True, -0.5, -1.5)}, 0, None, False)
     return data, runner, sched
 
 
@@ -281,7 +290,11 @@ def test_starve_flagged_at_launch():
         if d.streaming_inflight:
             runner._consume_streaming_step(sched, codes, False)
         else:
-            dec = {0: True} if (opening and role is StepRole.DECISION) else {}
+            dec = (
+                {0: (True, -0.5, -1.5)}
+                if (opening and role is StepRole.DECISION)
+                else {}
+            )
             runner._advance_streaming_request(sched, dec, 0, codes, False)
         step += 1
     assert d.input_starved

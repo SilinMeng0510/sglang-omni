@@ -536,17 +536,19 @@ class HiggsTTSModel(nn.Module):
         *,
         text_token_id: int,
         audio_token_id: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Greedy text-head decision constrained to ``{<|text|>, <|audio|>}``.
 
-        Returns a bool ``[B]`` tensor, True where ``<|audio|>`` wins. Only the
-        two relevant lm_head rows are used, so this is two dot products per
-        row rather than a full-vocab projection.
+        Returns ``(is_audio [B] bool, logprobs [B, 2] fp32)`` where logprobs is
+        the log-softmax over the constrained (wait, audio) pair. Only the two
+        relevant lm_head rows are used, so this is two dot products per row
+        rather than a full-vocab projection.
         """
         head_weight = self.backbone.lm_head.weight
         pair = head_weight[[text_token_id, audio_token_id]].to(hidden_BD.dtype)
-        logits_B2 = hidden_BD @ pair.t()
-        return logits_B2[:, 1] > logits_B2[:, 0]
+        logits_B2 = (hidden_BD @ pair.t()).to(torch.float32)
+        logprobs_B2 = torch.log_softmax(logits_B2, dim=-1)
+        return logits_B2[:, 1] > logits_B2[:, 0], logprobs_B2
 
     @staticmethod
     def _is_decode_step(forward_batch) -> bool:

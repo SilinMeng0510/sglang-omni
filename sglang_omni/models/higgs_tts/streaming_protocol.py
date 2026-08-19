@@ -274,6 +274,34 @@ class StreamingProtocolState:
         self.role = plan.role
         return plan
 
+    def rollback_launch_advance(self, plan_before: StepPlan, plan_after: StepPlan) -> None:
+        """Invert ONE launch-time advance that never executed (the lookahead
+        overrun step after a finish), restoring counters, text queue position,
+        and trace so the recorded trajectory matches what actually ran."""
+        role = plan_before.role
+        if role is StepRole.AUDIO:
+            self.rows_emitted -= 1
+            self._trace_audio_run -= 1
+            self.block_rows_remaining += 1
+        elif role in (StepRole.BLOCK_END, StepRole.WAIT_FEED):
+            if plan_after.starved:
+                pass  # starved feed consumed nothing
+            elif self.trace and self.trace[-1] == ("text_end",):
+                self.trace.pop()
+                self.text_end_sent = False
+            elif self.trace and self.trace[-1][0] == "inject":
+                self.trace.pop()
+                self.text_pos -= 1
+            # the feed flushed the pending audio run into the trace; restore it
+            if self.trace and self.trace[-1][0] == "audio" and self._trace_audio_run == 0:
+                self._trace_audio_run = self.trace.pop()[1]
+        elif role is StepRole.DECISION:
+            # forced post-opening block open
+            self.blocks -= 1
+            self.block_rows_remaining = 0
+            self.in_tail_flush = False
+        self.role = plan_before.role
+
     def finalize_trace(self) -> list:
         self._flush_audio_trace()
         return self.trace

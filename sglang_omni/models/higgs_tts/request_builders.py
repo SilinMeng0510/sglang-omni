@@ -14,7 +14,10 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
-from sglang_omni.models.higgs_tts.rollout_trace import build_omni_rollout_trace
+from sglang_omni.models.higgs_tts.rollout_trace import (
+    append_streaming_rollout,
+    build_omni_rollout_trace,
+)
 from sglang_omni.models.higgs_tts.streaming_protocol import (
     StepPlan,
     StreamingProtocolConfig,
@@ -42,6 +45,8 @@ class HiggsSGLangRequestData(SGLangARRequestData):
     streaming_plan: StepPlan | None = None
     streaming_inflight: list[tuple[StepPlan, StepPlan]] = field(default_factory=list)
     streaming_launch_token: int | None = None
+    opening_decision_actions: list[int] = field(default_factory=list)
+    opening_decision_logprobs: list[float] = field(default_factory=list)
     input_starved: bool = False
     watchdog_recent_rows: list[tuple[int, ...]] = field(default_factory=list)
     watchdog_repeat_rows: int = 0
@@ -105,10 +110,14 @@ def _build_protocol_state(state: HiggsTtsState) -> StreamingProtocolState:
 def build_sglang_higgs_request(
     state: HiggsTtsState, *, request_id: str = ""
 ) -> HiggsSGLangRequestData:
-    if state.streaming_protocol and state.return_omni_rollout:
+    if (
+        state.streaming_protocol
+        and state.streaming_incremental
+        and state.return_omni_rollout
+    ):
         raise ValueError(
-            "streaming_protocol does not support return_omni_rollout/logprob "
-            "capture yet"
+            "incremental (WebSocket) streaming input does not support "
+            "return_omni_rollout/logprob capture"
         )
     input_ids_list = list(state.prompt_token_ids)
     input_ids = torch.tensor(input_ids_list, dtype=torch.long)
@@ -215,6 +224,19 @@ def apply_higgs_result(state: HiggsTtsState, data: HiggsSGLangRequestData) -> No
             codebook_vocab_size=int(data.codebook_size),
             delayed_logprobs=logprobs,
         )
+        proto = getattr(data, "protocol_state", None)
+        if proto is not None:
+            append_streaming_rollout(
+                state.omni_rollout,
+                decision_actions=data.opening_decision_actions,
+                decision_logprobs=(
+                    data.opening_decision_logprobs if data.return_logprob else None
+                ),
+                protocol_trace=proto.finalize_trace(),
+                text_token_id=proto.cfg.text_token_id,
+                audio_token_id=proto.cfg.audio_token_id,
+                frames_per_block=proto.cfg.frames_per_block,
+            )
     state.prompt_tokens = len(data.input_ids)
 
 
@@ -247,7 +269,7 @@ def make_higgs_scheduler_adapters(
     def result_adapter(data: HiggsSGLangRequestData) -> StagePayload:
         payload = data.stage_payload
         state = HiggsTtsState.from_dict(payload.data)
-        proto = data.protocol_state
+        proto = getattr(data, "protocol_state", None)
         if proto is not None:
             logging.getLogger(__name__).info(
                 "streaming-tts %s result: rows=%d blocks=%d opening_waits=%d "

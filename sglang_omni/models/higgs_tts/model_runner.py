@@ -282,9 +282,13 @@ class HiggsTTSModelRunner(ModelRunner):
                     return False
         return super().lookahead_eligible(batch)
 
-    def _streaming_decisions_cpu(self, result: Any, requests: list) -> dict[int, bool]:
+    def _streaming_decisions_cpu(
+        self, result: Any, requests: list
+    ) -> dict[int, tuple[bool, float, float]]:
         """Constrained text-head decisions ({<|text|>, <|audio|>} greedy) for
-        rows whose CURRENT step role is DECISION. Returns {row_idx: is_audio}.
+        rows whose CURRENT step role is DECISION. Returns
+        {row_idx: (is_audio, logprob_wait, logprob_audio)} under the
+        constrained two-way softmax.
 
         Only opening decisions are computed: after the first audio block the
         state machine forces ``<|audio|>`` at every boundary, so the text head
@@ -306,10 +310,14 @@ class HiggsTTSModelRunner(ModelRunner):
         if hidden.ndim == 3:
             hidden = hidden[:, -1, :]
         sel = hidden[torch.tensor(rows, dtype=torch.long, device=hidden.device)]
-        is_audio = self.model.decision_token_is_audio(
+        is_audio, logprobs_B2 = self.model.decision_token_is_audio(
             sel, text_token_id=token_ids[0], audio_token_id=token_ids[1]
         )
-        return dict(zip(rows, (bool(v) for v in is_audio.cpu().tolist())))
+        lp = logprobs_B2.cpu().tolist()
+        return {
+            b: (bool(a), lp[i][0], lp[i][1])
+            for i, (b, a) in enumerate(zip(rows, is_audio.cpu().tolist()))
+        }
 
     def _advance_streaming_plans_at_launch(self, requests: list) -> None:
         """Advance post-opening protocol machines at launch: the plan sequence
@@ -343,12 +351,17 @@ class HiggsTTSModelRunner(ModelRunner):
                 data.streaming_launch_token = None
 
     def _consume_audio_row(
-        self, sched_req: Any, codes_N: torch.Tensor
+        self,
+        sched_req: Any,
+        codes_N: torch.Tensor,
+        logprobs_N: torch.Tensor | None = None,
     ) -> tuple[int, bool]:
         """Append + emit one audio row; returns ``(cb0, eoc_abort)``."""
         data = sched_req.data
         proto = data.protocol_state
         data.output_codes.append(codes_N)
+        if logprobs_N is not None:
+            data.output_logprobs.append(logprobs_N.to(torch.float32).clone())
         self._emit_code_chunk(sched_req, codes_N)
         cb0 = int(codes_N[0].item())
         # Reference behavior: a cb0 EOC inside a NON-tail block is
@@ -397,6 +410,13 @@ class HiggsTTSModelRunner(ModelRunner):
         data.generation_done = done
         self._mark_sampler_finished(data.req, done)
         if done:
+            # a lookahead overrun launch may have advanced the machine one
+            # step past the finish; roll it back so trace/counters match the
+            # rows that actually ran
+            for plan_before, plan_after in reversed(data.streaming_inflight):
+                proto.rollback_launch_advance(plan_before, plan_after)
+                if plan_after.starved:
+                    data.input_starved = False
             data.streaming_inflight.clear()
             trace = proto.finalize_trace()
             logger.info(
@@ -426,6 +446,7 @@ class HiggsTTSModelRunner(ModelRunner):
         sched_req: Any,
         codes_N: torch.Tensor | None,
         gen_done_after: bool,
+        logprobs_N: torch.Tensor | None = None,
     ) -> int:
         """Collect side of a launch-advanced step: consume this step's output
         against the recorded plan pair."""
@@ -435,7 +456,7 @@ class HiggsTTSModelRunner(ModelRunner):
         eoc_abort = False
         if plan_now is not None and plan_now.role is StepRole.AUDIO:
             assert codes_N is not None
-            cb0, eoc_abort = self._consume_audio_row(sched_req, codes_N)
+            cb0, eoc_abort = self._consume_audio_row(sched_req, codes_N, logprobs_N)
         if next_plan.starved:
             return cb0  # placeholder; input_starved was flagged at launch
         return self._finish_or_publish(
@@ -445,10 +466,11 @@ class HiggsTTSModelRunner(ModelRunner):
     def _advance_streaming_request(
         self,
         sched_req: Any,
-        decisions: dict[int, bool],
+        decisions: dict[int, tuple[bool, float, float]],
         row_idx: int,
         codes_N: torch.Tensor | None,
         gen_done_after: bool,
+        logprobs_N: torch.Tensor | None = None,
     ) -> int:
         """Opening-phase collect: consume this step's output, advance the
         machine, return the token id to publish as the next step's input."""
@@ -458,12 +480,33 @@ class HiggsTTSModelRunner(ModelRunner):
         cb0 = 0
         decision: bool | None = None
         eoc_abort = False
+        decision_lp: tuple[float, float] | None = None
+        # the FIRST opening decision mirrors a force-inserted <|text|> in the
+        # training layout — not a trainable action, so never recorded
+        consulted = (
+            role is StepRole.DECISION
+            and not proto.text_end_sent
+            and not proto.first_block_emitted
+            and proto.opening_waits > 0
+        )
         if role is StepRole.AUDIO:
             assert codes_N is not None
-            cb0, eoc_abort = self._consume_audio_row(sched_req, codes_N)
+            cb0, eoc_abort = self._consume_audio_row(sched_req, codes_N, logprobs_N)
         elif role is StepRole.DECISION:
-            decision = decisions.get(row_idx, False)
+            decision, lp_wait, lp_audio = decisions.get(row_idx, (False, 0.0, 0.0))
+            decision_lp = (lp_wait, lp_audio)
         plan = proto.on_step_output(decision)
+        if (
+            consulted
+            and decision_lp is not None
+            and self._request_captures_rollout_logprobs(sched_req)
+        ):
+            # record the EXECUTED opening action (fuse can override a wait)
+            executed_is_audio = plan.role is StepRole.AUDIO
+            data.opening_decision_actions.append(int(executed_is_audio))
+            data.opening_decision_logprobs.append(
+                decision_lp[1] if executed_is_audio else decision_lp[0]
+            )
         data.streaming_plan = plan
         if plan.starved:
             # incremental input ran dry at an injection point: publish a
@@ -605,10 +648,18 @@ class HiggsTTSModelRunner(ModelRunner):
                 continue
             if getattr(data, "protocol_state", None) is not None:
                 codes_N = codes_BN_cpu[b].to(torch.long).clone()
+                lp_N = (
+                    logprobs_cpu[b]
+                    if (
+                        logprobs_cpu is not None
+                        and self._request_captures_rollout_logprobs(sched_req)
+                    )
+                    else None
+                )
                 if data.streaming_inflight:
                     cb0_per_row.append(
                         self._consume_streaming_step(
-                            sched_req, codes_N, bool(gen_done_after_cpu[b])
+                            sched_req, codes_N, bool(gen_done_after_cpu[b]), lp_N
                         )
                     )
                 else:
@@ -619,6 +670,7 @@ class HiggsTTSModelRunner(ModelRunner):
                             b,
                             codes_N,
                             bool(gen_done_after_cpu[b]),
+                            lp_N,
                         )
                     )
                 continue
