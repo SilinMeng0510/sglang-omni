@@ -2,10 +2,12 @@
 """Parity tests for the streaming-TTS protocol state machine.
 
 Drives :class:`StreamingProtocolState` and a mini-simulator transcribed
-directly from the reference loop structure in higgs-mm
-``higgs_mm/eval/tts/streaming.py`` (``generate_streaming_tts``) with the same
-scripted model behavior (decision outcomes + EOC position), and asserts both
-produce the same protocol event sequence and row counts.
+from the reference loop structure in higgs-mm ``higgs_mm/eval/tts/streaming.py``
+(``generate_streaming_tts``) with the same scripted model behavior (decision
+outcomes + EOC position), and asserts both produce the same protocol event
+sequence and row counts. One deliberate deviation from the reference: the text
+head is only consulted before the first audio block; every later block
+boundary force-inserts ``<|audio|>``, matching the training-time layout.
 """
 
 from __future__ import annotations
@@ -34,7 +36,6 @@ def _cfg(**kw) -> StreamingProtocolConfig:
         num_extra_tokens=EXTRAS,
         frames_per_block=K,
         max_opening_waits=16,
-        max_mid_waits=16,
         max_frames=200,
     )
     defaults.update(kw)
@@ -62,7 +63,7 @@ def _reference_trace(
     injected = 1
     n = len(text_ids)
     rows = 0
-    opening_waits = mid_waits = 0
+    opening_waits = 0
     text_end_sent = False
     done = False
 
@@ -119,21 +120,7 @@ def _reference_trace(
         else:
             trace.append(("text_end",))
             text_end_sent = True
-        while True:
-            choice_audio = next(decisions)
-            if choice_audio or text_end_sent:
-                break
-            mid_waits += 1
-            if mid_waits > cfg.max_mid_waits:
-                break
-            trace.append(("wait",))
-            if injected < n:
-                trace.append(("inject", text_ids[injected]))
-                injected += 1
-            else:
-                trace.append(("text_end",))
-                text_end_sent = True
-                break
+        # post-first-block boundaries force <|audio|>: no decision consumed
         if text_end_sent:
             done = emit_rows(
                 cfg.max_frames + cfg.num_extra_tokens - rows, stop_at_eoc=True
@@ -164,7 +151,7 @@ def _machine_trace(
     for _ in range(100_000):
         role = state.role
         decision = None
-        if role is StepRole.DECISION:
+        if role is StepRole.DECISION and not state.first_block_emitted:
             decision = next(decisions)
         elif role is StepRole.AUDIO:
             # emulate the delay/EOC sampler for this sampled row, mirroring
@@ -223,10 +210,16 @@ def test_opening_waits_then_audio():
     _assert_parity(TEXT, decisions, eoc_row=45)
 
 
-def test_mid_stream_wait_honored():
-    # audio open, then one mid-stream wait at the second boundary
-    decisions = [True, False, True] + [True] * 50
-    _assert_parity(TEXT, decisions, eoc_row=45)
+def test_mid_stream_boundaries_force_audio():
+    # after the first block a would-be wait decision is never consulted:
+    # the trace is identical to the all-audio run
+    forced_trace, forced_rows, _ = _machine_trace(
+        TEXT, [True, False] + [True] * 50, eoc_row=45, cfg=_cfg()
+    )
+    base_trace, base_rows, _ = _machine_trace(TEXT, [True] * 52, eoc_row=45, cfg=_cfg())
+    assert forced_trace == base_trace
+    assert forced_rows == base_rows
+    assert ("wait",) not in forced_trace[1:]
 
 
 def test_text_exhausted_tail_flush():
@@ -267,10 +260,9 @@ def test_eoc_immediately_in_first_block():
 
 def test_stats_counters():
     cfg = _cfg()
-    decisions = [False, False, True] + [True, False, True] + [True] * 50
+    decisions = [False, False, True] + [True] * 50
     _, _, state = _machine_trace(TEXT, list(decisions), eoc_row=60, cfg=cfg)
     assert state.opening_waits == 2
-    assert state.mid_waits == 1
     assert state.blocks >= 2
 
 
@@ -299,7 +291,7 @@ def _machine_trace_incremental(
     for _ in range(100_000):
         role = state.role
         decision = None
-        if role is StepRole.DECISION:
+        if role is StepRole.DECISION and not state.first_block_emitted:
             decision = next(decisions)
         elif role is StepRole.AUDIO:
             row_idx = rows

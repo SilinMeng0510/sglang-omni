@@ -249,13 +249,12 @@ def make_higgs_scheduler_adapters(
         if proto is not None:
             logging.getLogger(__name__).info(
                 "streaming-tts %s result: rows=%d blocks=%d opening_waits=%d "
-                "mid_waits=%d text_pos=%d/%d text_end_sent=%s fuse=%s "
+                "text_pos=%d/%d text_end_sent=%s fuse=%s "
                 "generation_done=%s output_rows=%d",
                 payload.request_id,
                 proto.rows_emitted,
                 proto.blocks,
                 proto.opening_waits,
-                proto.mid_waits,
                 proto.text_pos,
                 len(proto.inject_text_ids),
                 proto.text_end_sent,

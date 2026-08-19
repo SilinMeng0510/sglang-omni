@@ -259,6 +259,10 @@ class HiggsTTSModelRunner(ModelRunner):
     def _streaming_decisions_cpu(self, result: Any, requests: list) -> dict[int, bool]:
         """Constrained text-head decisions ({<|text|>, <|audio|>} greedy) for
         rows whose CURRENT step role is DECISION. Returns {row_idx: is_audio}.
+
+        Only opening decisions are computed: after the first audio block the
+        state machine forces ``<|audio|>`` at every boundary, so the text head
+        is never consulted again.
         """
         rows: list[int] = []
         token_ids: tuple[int, int] | None = None
@@ -267,7 +271,7 @@ class HiggsTTSModelRunner(ModelRunner):
             proto = getattr(data, "protocol_state", None)
             if proto is None or data.req.finished():
                 continue
-            if proto.role is StepRole.DECISION:
+            if proto.role is StepRole.DECISION and not proto.first_block_emitted:
                 rows.append(b)
                 token_ids = (proto.cfg.text_token_id, proto.cfg.audio_token_id)
         if not rows or token_ids is None:
@@ -350,13 +354,12 @@ class HiggsTTSModelRunner(ModelRunner):
             trace = proto.finalize_trace()
             logger.info(
                 "streaming-tts %s finished: rows=%d blocks=%d opening_waits=%d "
-                "mid_waits=%d text_pos=%d/%d text_end_sent=%s fuse=%s "
+                "text_pos=%d/%d text_end_sent=%s fuse=%s "
                 "eoc_abort=%s hard_stop=%s trace_head=%s trace_tail=%s",
                 sched_req.request_id,
                 proto.rows_emitted,
                 proto.blocks,
                 proto.opening_waits,
-                proto.mid_waits,
                 proto.text_pos,
                 len(proto.inject_text_ids),
                 proto.text_end_sent,

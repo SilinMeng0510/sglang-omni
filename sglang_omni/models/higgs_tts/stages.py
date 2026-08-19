@@ -488,6 +488,8 @@ def create_vocoder_executor(
     startup_masked_delay_rows: int = 8,
     startup_masked_emit_frames: int = 3,
     startup_masked_until_frames: int = 8,
+    startup_full_chunk_frames: int = 8,
+    startup_full_chunk_count: int = 3,
 ):
     """Decode Higgs delayed codes to a mono 24 kHz waveform.
 
@@ -508,6 +510,8 @@ def create_vocoder_executor(
         startup_masked_delay_rows=startup_masked_delay_rows,
         startup_masked_emit_frames=startup_masked_emit_frames,
         startup_masked_until_frames=startup_masked_until_frames,
+        startup_full_chunk_frames=startup_full_chunk_frames,
+        startup_full_chunk_count=startup_full_chunk_count,
     )
 
 
