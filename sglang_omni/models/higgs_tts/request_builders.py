@@ -41,6 +41,7 @@ class HiggsSGLangRequestData(SGLangARRequestData):
     protocol_state: StreamingProtocolState | None = None
     streaming_plan: StepPlan | None = None
     streaming_inflight: list[tuple[StepPlan, StepPlan]] = field(default_factory=list)
+    streaming_launch_token: int | None = None
     input_starved: bool = False
     watchdog_recent_rows: list[tuple[int, ...]] = field(default_factory=list)
     watchdog_repeat_rows: int = 0

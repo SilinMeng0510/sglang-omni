@@ -131,6 +131,24 @@ class HiggsTTSModelRunner(ModelRunner):
         result.next_token_ids = (
             self.model._cg_codes_BN[:n_real, 0].clamp_min(0).to(torch.long).clone()
         )
+        # Streaming-protocol rows whose NEXT input is a text-space token (the
+        # launch-time advance recorded it) override GPU codebook-0: the AR
+        # input chain must carry the injected token, not the sampled code.
+        overrides = [
+            (b, token)
+            for b, sched_req in enumerate(requests)
+            if (token := getattr(sched_req.data, "streaming_launch_token", None))
+            is not None
+        ]
+        if overrides:
+            device = result.next_token_ids.device
+            idx = torch.tensor([b for b, _ in overrides], dtype=torch.long).to(
+                device, non_blocking=True
+            )
+            vals = torch.tensor([t for _, t in overrides], dtype=torch.long).to(
+                device, non_blocking=True
+            )
+            result.next_token_ids[idx] = vals
         return host_buf, logprob_host
 
     def post_decode_resolve(
@@ -245,16 +263,31 @@ class HiggsTTSModelRunner(ModelRunner):
         )
 
     def lookahead_eligible(self, batch: Any) -> bool:
-        """Streaming-protocol requests must decode synchronously: the next
-        step's input token is decided by the host-side state machine during
-        collect, but the async launch publishes next_token_ids from GPU codes
-        before resolve runs — a one-step-stale text injection.
+        """Streaming-protocol requests may lookahead once past the opening:
+        every later boundary forces ``<|audio|>``, so the launch-time advance
+        (``_advance_streaming_plans_at_launch``) knows the next input without
+        this step's output. Gate to sync while any streaming request
+
+        - is still in the opening phase (the text-head decision needs this
+          step's hidden states at collect),
+        - is starved / parked-adjacent (the park sweep must not race an
+          in-flight step's GPU scatter), or
+        - would need a text token this launch that an open incremental queue
+          cannot yet supply (the advance would starve mid-launch).
         """
-        streaming_rids = self.model._streaming_rids
-        if streaming_rids and any(
-            getattr(req, "rid", None) in streaming_rids for req in batch.reqs
-        ):
-            return False
+        for req in batch.reqs:
+            data = getattr(req, "_omni_data", None)
+            proto = getattr(data, "protocol_state", None) if data is not None else None
+            if proto is None:
+                continue
+            if not proto.first_block_emitted or data.input_starved:
+                return False
+            plan = data.streaming_plan
+            if plan is None or plan.starved or plan.hard_stop:
+                return False
+            if plan.role in (StepRole.BLOCK_END, StepRole.WAIT_FEED):
+                if proto.queue_empty and not proto.text_done:
+                    return False
         return super().lookahead_eligible(batch)
 
     def _streaming_decisions_cpu(self, result: Any, requests: list) -> dict[int, bool]:
@@ -304,18 +337,25 @@ class HiggsTTSModelRunner(ModelRunner):
             if proto is None or not proto.first_block_emitted:
                 continue
             if data.req.finished() or data.input_starved:
+                data.streaming_launch_token = None
                 continue
             plan_now = data.streaming_plan
             if plan_now is not None and plan_now.hard_stop:
                 # this step's plan already carries the deterministic finish; a
                 # lookahead overrun launch must not advance past it (the
                 # collect side is about to mark the request done)
+                data.streaming_launch_token = None
                 continue
             next_plan = proto.on_step_output(None)
             data.streaming_plan = next_plan
             data.streaming_inflight.append((plan_now, next_plan))
             if next_plan.starved:
                 data.input_starved = True
+                data.streaming_launch_token = 0
+            elif next_plan.input_is_text and next_plan.input_token_id is not None:
+                data.streaming_launch_token = int(next_plan.input_token_id)
+            else:
+                data.streaming_launch_token = None
 
     def _consume_audio_row(self, sched_req: Any, codes_N: torch.Tensor) -> tuple[int, bool]:
         """Shared AUDIO-step output consumption: append + emit the row, detect

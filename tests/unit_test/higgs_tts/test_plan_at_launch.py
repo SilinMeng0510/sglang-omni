@@ -173,6 +173,96 @@ def test_parity_tiny_max_frames_hard_stop():
     assert data.protocol_state.fuse_tripped
 
 
+class _FakeSamplingParams:
+    repetition_penalty = 1.0
+    frequency_penalty = 0.0
+    presence_penalty = 0.0
+    min_new_tokens = 0
+
+
+class _FakeBatchReq:
+    def __init__(self, data=None):
+        self._omni_data = data
+        self.sampling_params = _FakeSamplingParams()
+
+
+class _FakeBatch:
+    def __init__(self, reqs):
+        self.reqs = reqs
+
+
+def _post_opening_data(text_done=True, queue_left=5):
+    proto = StreamingProtocolState(
+        cfg=make_cfg(),
+        inject_text_ids=list(range(100, 100 + queue_left)),
+        text_done=text_done,
+    )
+    data = _FakeData(protocol_state=proto)
+    runner = make_runner()
+    sched = _FakeSchedReq(data)
+    # drive through the opening (immediate audio decision) into the first block
+    runner._advance_streaming_request(sched, {0: True}, 0, None, False)
+    return data, runner, sched
+
+
+def test_lookahead_eligible_gates():
+    runner = make_runner()
+
+    # offline-only batch: eligible
+    assert runner.lookahead_eligible(_FakeBatch([_FakeBatchReq()]))
+
+    # opening-phase streaming request: sync
+    proto = StreamingProtocolState(cfg=make_cfg(), inject_text_ids=[100, 101])
+    opening = _FakeData(protocol_state=proto)
+    assert not runner.lookahead_eligible(_FakeBatch([_FakeBatchReq(opening)]))
+
+    # post-opening with closed queue: eligible (mixed with offline)
+    data, _, _ = _post_opening_data()
+    batch = _FakeBatch([_FakeBatchReq(data), _FakeBatchReq()])
+    assert runner.lookahead_eligible(batch)
+
+    # starved: sync
+    data.input_starved = True
+    assert not runner.lookahead_eligible(batch)
+    data.input_starved = False
+
+    # hard-stop plan: sync
+    saved = data.streaming_plan
+    data.streaming_plan = type(saved)(
+        input_token_id=None,
+        input_is_text=False,
+        audio_advance=False,
+        role=StepRole.BLOCK_END,
+        hard_stop=True,
+    )
+    assert not runner.lookahead_eligible(batch)
+    data.streaming_plan = saved
+
+
+def test_lookahead_eligible_open_queue_starve_risk():
+    data, runner, sched = _post_opening_data(text_done=False, queue_left=1)
+    batch = _FakeBatch([_FakeBatchReq(data)])
+    proto = data.protocol_state
+    # walk to the injection point (BLOCK_END plan) with an empty open queue
+    step = 0
+    while not (
+        data.streaming_plan.role is StepRole.BLOCK_END and proto.queue_empty
+    ):
+        runner._advance_streaming_plans_at_launch([sched])
+        codes = (
+            audio_row(step)
+            if data.streaming_inflight
+            and data.streaming_inflight[0][0].role is StepRole.AUDIO
+            else None
+        )
+        runner._consume_streaming_step(sched, codes, False)
+        step += 1
+        assert step < 100
+    assert not runner.lookahead_eligible(batch)
+    proto.append_text([200], done=False)
+    assert runner.lookahead_eligible(batch)
+
+
 def test_starve_flagged_at_launch():
     """Open queue runs dry post-opening: the launch advance flags
     input_starved and the collect publishes a placeholder."""
