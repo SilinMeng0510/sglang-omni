@@ -387,6 +387,75 @@ def test_mp_runner_preserves_tp_rank_and_visible_device_contracts(tmp_path) -> N
     assert env["CUDA_VISIBLE_DEVICES"] == "7"
 
 
+def test_mp_runner_applies_process_specific_env_defaults(tmp_path) -> None:
+    config = PipelineConfig(
+        model_path="model",
+        name="mp",
+        endpoints=EndpointsConfig(base_path=str(tmp_path)),
+        env_defaults={"SHARED_ENV": "shared", "PRIORITY": "global"},
+        process_env_defaults={
+            "pipeline": {"PRIORITY": "below-normal"},
+            "vocoder": {"PRIORITY": "normal"},
+        },
+        stages=[
+            stage("generate", next="decode", process="pipeline"),
+            stage("decode", terminal=True, process="vocoder"),
+        ],
+    )
+    prep = prepare_pipeline_runtime(config)
+    try:
+        groups = _build_stage_groups(
+            config,
+            ctx=FakeMpContext(),
+            stages_cfg=prep.stages_cfg,
+            name_map=prep.name_map,
+            endpoints=prep.endpoints,
+            placement_plan=prep.placement_plan,
+            process_plan=prep.process_plan,
+        )
+    finally:
+        assert prep.runtime_dir is not None
+        prep.runtime_dir.close()
+
+    env_by_process = {
+        process_spec.process_name: process_spec.stage_specs[0].env_defaults
+        for group in groups
+        for process_spec in group.process_specs
+    }
+    assert env_by_process == {
+        "pipeline": {"SHARED_ENV": "shared", "PRIORITY": "below-normal"},
+        "vocoder": {"SHARED_ENV": "shared", "PRIORITY": "normal"},
+    }
+
+
+def test_mp_runner_rejects_unknown_process_env_defaults(tmp_path) -> None:
+    config = PipelineConfig(
+        model_path="model",
+        name="mp",
+        endpoints=EndpointsConfig(base_path=str(tmp_path)),
+        process_env_defaults={"typo": {"PRIORITY": "normal"}},
+        stages=[stage("generate", terminal=True, process="pipeline")],
+    )
+    prep = prepare_pipeline_runtime(config)
+    try:
+        with pytest.raises(
+            ValueError,
+            match="process_env_defaults contains unknown process.*typo",
+        ):
+            _build_stage_groups(
+                config,
+                ctx=FakeMpContext(),
+                stages_cfg=prep.stages_cfg,
+                name_map=prep.name_map,
+                endpoints=prep.endpoints,
+                placement_plan=prep.placement_plan,
+                process_plan=prep.process_plan,
+            )
+    finally:
+        assert prep.runtime_dir is not None
+        prep.runtime_dir.close()
+
+
 def test_mp_runner_keeps_cpu_stage_without_gpu_identity(tmp_path) -> None:
     config = PipelineConfig(
         model_path="model",

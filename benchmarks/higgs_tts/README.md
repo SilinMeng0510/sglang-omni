@@ -54,6 +54,132 @@ docker run --rm --name higgs-tts-sglang-omni \
   --port 18043
 ```
 
+## Single-GPU dual-instance serving
+
+At higher concurrency, one Higgs TTS process leaves scheduling gaps between
+autoregressive generation, relay work, and vocoder execution. CUDA MPS can
+place two complete replicas on **one physical GPU** so an external serving
+layer can route requests across two independent endpoints. This is
+data-parallel request serving: neither replica uses tensor parallelism or spans
+multiple GPUs.
+
+The measured H100 setup uses a total concurrency of ten, split dynamically by
+the external router across two endpoints. Each endpoint captures CUDA Graphs
+for batch sizes 1–5 and accepts at most five running requests. The generation
+processes each receive a 50% MPS active-thread limit, while the higher-priority
+vocoders receive 35%.
+
+Start one MPS control daemon for the selected GPU. The daemon and both endpoint
+processes must use the same pipe and log directories:
+
+```bash
+export CUDA_VISIBLE_DEVICES=7
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps-higgs-gpu7
+export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-log-higgs-gpu7
+mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+nvidia-cuda-mps-control -d
+```
+
+When endpoints run in containers, bind both containers to the same physical
+GPU and share the MPS pipe directory with the MPS control daemon. Do not assign
+multiple physical GPUs to either endpoint.
+
+Add the following serving-only overrides to a copy of
+`examples/configs/higgs_tts_4b_masked.yaml`:
+
+```yaml
+process_env_defaults:
+  pipeline:
+    CUDA_MPS_CLIENT_PRIORITY: "1"
+    CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: "50"
+  vocoder:
+    CUDA_MPS_CLIENT_PRIORITY: "0"
+    CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: "35"
+
+runtime_overrides:
+  tts_engine:
+    server_args_overrides:
+      cuda_graph_bs: [1, 2, 3, 4, 5]
+      max_running_requests: 5
+```
+
+`process_env_defaults` applies these values when each stage subprocess starts.
+Priority `0` gives the vocoder preference over the generation pipeline during
+token bursts. For a no-LoRA deployment, also set
+`enable_dynamic_lora: false`; merely omitting `lora_adapter` from requests does
+not remove the dynamic LoRA manager overhead. For request-scoped dynamic LoRA,
+keep the existing `enable_dynamic_lora`, `lora_base_dir`, cache, and rank
+settings.
+
+Launch two endpoints with the same GPU and config but different ports:
+
+```bash
+python -m sglang_omni.cli serve \
+  --config /path/to/higgs_tts_4b_masked_mps.yaml \
+  --model-path /path/to/higgs-tts-3-4b \
+  --host 0.0.0.0 \
+  --port 18053 \
+  --mem-fraction-static 0.32 >endpoint-0.log 2>&1 &
+endpoint_0=$!
+
+python -m sglang_omni.cli serve \
+  --config /path/to/higgs_tts_4b_masked_mps.yaml \
+  --model-path /path/to/higgs-tts-3-4b \
+  --host 0.0.0.0 \
+  --port 18063 \
+  --mem-fraction-static 0.32 >endpoint-1.log 2>&1 &
+endpoint_1=$!
+
+wait "$endpoint_0" "$endpoint_1"
+```
+
+Register both endpoint URLs with the deployment's existing routing layer.
+NUMA-local CPU pinning for each endpoint is optional but recommended.
+
+No-LoRA requests need no special payload. Dynamic LoRA requests use the same
+request-scoped `lora_adapter.path` described below. This setup does not merge
+or quantize adapters.
+
+### Observed H100 performance
+
+The following results use one H100 80 GB, BF16, the 4B K8/M3 config, default
+voice, the checked-in ShareGPT workload, and 120 seconds per concurrency level.
+Concurrency is the total client concurrency across both replicas, not a
+per-replica value. Continuous P85 is continuous-playback start latency.
+
+No LoRA:
+
+| Concurrency | Single audio-s/s | Dual audio-s/s | Single P85 | Dual P85 |
+| ---: | ---: | ---: | ---: | ---: |
+| 5 | 28.07 | 25.76 | 101.2 ms | 92.7 ms |
+| 6 | 32.35 | 30.23 | 109.6 ms | 94.2 ms |
+| 7 | 36.48 | 35.15 | 119.0 ms | 97.9 ms |
+| 8 | 39.46 | 40.08 | 180.7 ms | 100.2 ms |
+| 9 | 40.16 | 44.44 | 326.3 ms | 100.0 ms |
+| 10 | 40.24 | 48.98 | 543.8 ms | 108.0 ms |
+
+The dual-instance topology trades some low-concurrency batching efficiency for
+tail stability. It crosses the single-instance throughput curve at concurrency
+eight. At concurrency ten it improves generated-audio throughput by 21.7% and
+reduces Continuous P85 by 80.1%.
+
+Request-scoped dynamic LoRA (`ap2`):
+
+| Concurrency | Single audio-s/s | Dual audio-s/s | Single P85 | Dual P85 |
+| ---: | ---: | ---: | ---: | ---: |
+| 5 | 20.09 | 17.97 | 152.9 ms | 134.6 ms |
+| 6 | 23.09 | 21.35 | 154.5 ms | 135.5 ms |
+| 7 | 26.42 | 24.62 | 162.2 ms | 137.4 ms |
+| 8 | 29.42 | 27.79 | 162.6 ms | 147.1 ms |
+| 9 | 31.91 | 30.92 | 173.5 ms | 141.9 ms |
+| 10 | 34.27 | 33.90 | 184.5 ms | 157.2 ms |
+
+Dynamic LoRA retains a small throughput advantage for one larger batch over
+two smaller batches in this range. At concurrency ten the dual topology is
+within 1.1% of single-instance throughput and reduces Continuous P85 by 14.8%.
+Offline adapter merging is a different serving protocol and is not included in
+this comparison.
+
 The following LoRA checkpoints are available for testing. Their request paths
 are shown relative to the `/adapters` mount used above:
 

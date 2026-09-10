@@ -164,8 +164,40 @@ def _build_stage_groups(
             )
         )
     groups.extend(tp_groups)
+    _apply_process_env_defaults(groups, config)
 
     return groups
+
+
+def _apply_process_env_defaults(
+    groups: list[StageGroup],
+    config: PipelineConfig,
+) -> None:
+    if not config.process_env_defaults:
+        return
+
+    process_specs = [
+        process_spec for group in groups for process_spec in group.process_specs
+    ]
+    known_processes = {spec.process_name for spec in process_specs}
+    unknown_processes = set(config.process_env_defaults) - known_processes
+    if unknown_processes:
+        unknown = ", ".join(sorted(unknown_processes))
+        known = ", ".join(sorted(known_processes))
+        raise ValueError(
+            f"process_env_defaults contains unknown process(es): {unknown}; "
+            f"known processes: {known}"
+        )
+
+    for process_spec in process_specs:
+        overrides = config.process_env_defaults.get(process_spec.process_name)
+        if not overrides:
+            continue
+        for stage_spec in process_spec.stage_specs:
+            stage_spec.env_defaults = {
+                **stage_spec.env_defaults,
+                **overrides,
+            }
 
 
 def _resolve_same_process_targets(
