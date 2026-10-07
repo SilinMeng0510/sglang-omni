@@ -18,12 +18,17 @@ reference returns onsets only -- its end at the first frame where
 ``P(state >= G_{j+1}) > 0.5`` (the mass has left the word's dwell states, into
 the gap or straight into word ``j + 1``; no gap means ``end == next onset``).
 
+Units are the text tokens themselves (one entry per token outside ``<|...|>``
+tags, with its char span; tokens without a content char -- whitespace,
+punctuation -- are folded into the preceding entry): regrouping into words is
+the client's job from ``start_char`` / ``end_char``.
+
 Conventions (export ``config.json``): the hidden that PREDICTS frame ``t`` --
 the decode position fed frame ``t-1``'s codebook row; frame 0 <- the
 ``<|audio|>`` prompt token -- scores frame ``t``; the softmax runs over the
-text tokens from the first word's first token up to ``<|audio|>`` (head
-control tags excluded, inline tags / punctuation left in as distractors);
-onset frame ``t`` -> ``t * 40 ms`` from the start of the generated audio.
+text tokens from the first unit's token up to ``<|audio|>`` (head control
+tags excluded, inline tags / punctuation left in as distractors); onset
+frame ``t`` -> ``t * 40 ms`` from the start of the generated audio.
 """
 
 from __future__ import annotations
@@ -40,119 +45,45 @@ import torch
 
 FRAME_MS = 40
 _TAG = re.compile(r"<\|[^|<>]*\|>")
-_CJK_RANGES = (
-    (0x3040, 0x30FF),  # hiragana, katakana
-    (0x3400, 0x4DBF),
-    (0x4E00, 0x9FFF),
-    (0xF900, 0xFAFF),
-    (0xAC00, 0xD7AF),  # hangul
-    (0x20000, 0x2FA1F),
-)
-
-
-def _is_cjk(ch: str) -> bool:
-    o = ord(ch)
-    return any(lo <= o <= hi for lo, hi in _CJK_RANGES)
 
 
 def _content(ch: str) -> bool:
     return not ch.isspace() and unicodedata.category(ch)[0] not in "PSZ"
 
 
-def text_words(text: str) -> list[tuple[int, int]]:
-    """Char spans of the words of a prompt text: whitespace-delimited pieces
-    outside ``<|...|>`` tags, every CJK character its own word (the server has
-    no segmenter); punctuation-only pieces join the previous word."""
-    plain = _TAG.sub(lambda m: " " * len(m.group()), text)
-    pieces: list[tuple[int, int]] = []
-    for m in re.finditer(r"\S+", plain):
-        start = None
-        for i in range(m.start(), m.end()):
-            if _is_cjk(plain[i]):
-                if start is not None:
-                    pieces.append((start, i))
-                    start = None
-                pieces.append((i, i + 1))
-            elif start is None:
-                start = i
-        if start is not None:
-            pieces.append((start, m.end()))
-    out: list[list[int]] = []
-    for s, e in pieces:
-        if out and not any(_content(c) for c in text[s:e]):
-            out[-1][1] = e
-        else:
-            out.append([s, e])
-    return [(s, e) for s, e in out if any(_content(c) for c in text[s:e])]
-
-
-def word_token_ranges(
-    offsets: list[tuple[int, int]], words: list[tuple[int, int]]
-) -> list[tuple[int, int]] | None:
-    """[lo, hi) token range of every word: the tokens overlapping its chars;
-    None if one has none."""
-    s = np.array([o[0] for o in offsets])
-    e = np.array([o[1] for o in offsets])
-    out = []
-    for c0, c1 in words:
-        hit = np.flatnonzero((s < c1) & (e > c0) & (e > s))
-        if hit.size == 0:
-            return None
-        out.append((int(hit[0]), int(hit[-1]) + 1))
-    return out
-
-
 def plan_word_align(
-    tokenizer: Any, text: str, text_cap: int, unit: str = "word", dwell: int | None = None
+    tokenizer: Any, text: str, text_cap: int, dwell: int | None = None
 ) -> dict[str, Any]:
-    """Preprocessing-stage plan: the units of ``text`` with their token ranges
-    in ``tokenizer.encode(text, add_special_tokens=False)`` and char spans.
-    ``unit="word"``: words per ``text_words``, consecutive words that add no
-    token of their own (CJK characters sharing one token) merged, since the
-    probe cannot tell them apart. ``unit="token"``: every text token outside
-    ``<|...|>`` tags is a unit (scripts without word boundaries, th/km/lo/my;
-    clients regroup by the char spans); tokens with no content char
-    (whitespace, punctuation) join the previous unit."""
+    """Preprocessing-stage plan: one unit per token of
+    ``tokenizer.encode(text, add_special_tokens=False)`` outside ``<|...|>``
+    tags, as token ranges ``[lo, hi)`` and char spans ``[s, e)``; tokens with
+    no content char join the preceding unit (their chars extend its span)."""
     enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
     n_text = len(enc["input_ids"])
     if n_text > text_cap:
         raise ValueError(
             f"word_timestamps supports at most {text_cap} text tokens, got {n_text}"
         )
-    if unit == "token":
-        tagged = [False] * len(text)
-        for m in _TAG.finditer(text):
-            tagged[m.start() : m.end()] = [True] * (m.end() - m.start())
-        spans = [
-            (s, e) for s, e in enc["offset_mapping"]
-            if e > s and not any(tagged[s:e])
-        ]
-        ranges = word_token_ranges(enc["offset_mapping"], spans) if spans else None
-    elif unit == "word":
-        spans = text_words(text)
-        ranges = word_token_ranges(enc["offset_mapping"], spans) if spans else None
-    else:
-        raise ValueError(f"word_timestamps_unit must be 'word' or 'token', got {unit!r}")
-    if not ranges:
-        raise ValueError("word_timestamps: no alignable word in the input text")
+    tagged = [False] * len(text)
+    for m in _TAG.finditer(text):
+        tagged[m.start() : m.end()] = [True] * (m.end() - m.start())
     words: list[str] = []
-    merged: list[list[int]] = []
+    ranges: list[list[int]] = []
     chars: list[list[int]] = []
-    for (s, e), (lo, hi) in zip(spans, ranges):
-        content = any(_content(c) for c in text[s:e])
-        if merged and (hi <= merged[-1][1] or not content):
+    for j, (s, e) in enumerate(enc["offset_mapping"]):
+        if e <= s or any(tagged[s:e]):
+            continue
+        if any(_content(c) for c in text[s:e]):
+            words.append(text[s:e])
+            ranges.append([j, j + 1])
+            chars.append([s, e])
+        elif words:
             words[-1] += text[s:e]
-            merged[-1][1] = max(merged[-1][1], hi)
+            ranges[-1][1] = j + 1
             chars[-1][1] = e
-            continue
-        if not content:
-            continue
-        words.append(text[s:e])
-        merged.append([lo, hi])
-        chars.append([s, e])
     if not words:
-        raise ValueError("word_timestamps: no alignable word in the input text")
-    plan = {"words": words, "ranges": merged, "chars": chars, "n_text": n_text, "unit": unit}
+        raise ValueError("word_timestamps: no alignable token in the input text")
+    plan = {"words": words, "ranges": ranges, "chars": chars, "n_text": n_text}
     if dwell is not None:
         plan["dwell"] = int(dwell)
     return plan
@@ -297,11 +228,4 @@ class WordAlignRequest:
         return w
 
 
-__all__ = [
-    "FRAME_MS",
-    "WordAlignHead",
-    "WordAlignRequest",
-    "plan_word_align",
-    "text_words",
-    "word_token_ranges",
-]
+__all__ = ["FRAME_MS", "WordAlignHead", "WordAlignRequest", "plan_word_align"]

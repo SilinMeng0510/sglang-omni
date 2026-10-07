@@ -308,10 +308,7 @@ class CreateSpeechRequest(BaseModel):
     # --word-align-head). Non-stream: ``X-Word-Timestamps`` header; stream:
     # the response becomes NDJSON audio.delta / audio.done events.
     word_timestamps: bool = False
-    # "word" (whitespace words, CJK per character) or "token" (every text
-    # token, for scripts without word boundaries; regroup by start/end_char)
-    word_timestamps_unit: str = "word"
-    # minimum frames per unit in the online decoder (default: the probe export's)
+    # minimum frames per token unit in the online decoder (default: the export's)
     word_timestamps_dwell: int | None = Field(default=None, ge=1)
 
     # Voice cloning parameters
@@ -444,7 +441,6 @@ class SpeechStreamSessionConfig(BaseModel):
     streaming_protocol: bool = False
     # Higgs word-align probe: ``words`` JSON events before the audio frames
     word_timestamps: bool = False
-    word_timestamps_unit: str = "word"
     word_timestamps_dwell: int | None = None
     task_type: str | None = None
     language: str | None = None

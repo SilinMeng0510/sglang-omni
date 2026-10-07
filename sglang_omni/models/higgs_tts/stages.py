@@ -159,7 +159,7 @@ def create_preprocessing_executor(
     codec encoding (and prompt assembly) to the audio_encoder stage —
     only the loaded waveform is shipped forward. With ``word_align_head``
     set (the engine serves the probe), ``params["word_timestamps"]`` adds
-    the word -> text-token plan the engine aligns against.
+    the text-token unit plan the engine aligns against.
     """
     checkpoint_dir = resolve_checkpoint(model_path)
 
@@ -233,10 +233,7 @@ def create_preprocessing_executor(
                 )
             dwell = params.get("word_timestamps_dwell")
             word_align = plan_word_align(
-                tokenizer,
-                text,
-                word_align_text_cap,
-                unit=str(params.get("word_timestamps_unit", "word")),
+                tokenizer, text, word_align_text_cap,
                 dwell=int(dwell) if dwell is not None else None,
             )
         ref_codes_TN = to_codes_TN(inputs.get("reference_codes"), num_codebooks)

@@ -268,19 +268,23 @@ sgl-omni serve \
 ```
 
 Opt in per request with `"word_timestamps": true` (off = byte-identical to a
-server without the probe). Words are `{"index", "text", "start_ms", "end_ms"}`
-measured from the start of the generated audio, plus the unit's
-`start_char` / `end_char` in the input text. Units follow
-`word_timestamps_unit`: `"word"` (default; whitespace-delimited words, CJK text
-per character, characters sharing one token merged) or `"token"` (every text
-token outside control tags is a unit, for scripts without word boundaries such
-as Thai; regroup by the char spans — Qwen's Thai tokens are sub-syllable pieces
-and combining marks come out as zero-length units). With `"stream": true` the
+server without the probe). The server emits one entry per **text token**
+outside control tags, `{"index", "text", "start_char", "end_char", "start_ms",
+"end_ms"}`: times from the start of the generated audio, char offsets into the
+`input` string (tokens with no content char — whitespace, punctuation — are
+folded into the preceding entry, whose `end_char` then covers them).
+Regrouping tokens into words is the client's or gateway's job using the char
+offsets: whitespace scripts split at spaces, CJK per character or with a
+segmenter, th/km/lo/my with an ICU word iterator; a token straddling a word
+boundary goes to the word holding most of its chars; a word's onset is its
+first token's `start_ms`, its end the last token's `end_ms`. (Qwen's Thai
+tokens are sub-syllable pieces; combining-mark tokens come out as zero-length
+units at the frame the mass passes through.) With `"stream": true` the
 response is NDJSON instead of raw
 PCM: one `audio.delta` event per chunk (`audio` = base64 PCM16, `words` = the
-entries that chunk's audio reaches: a word first appears with its `start_ms`,
+entries that chunk's audio reaches: a unit first appears with its `start_ms`,
 and again with `end_ms` once its end is known) and a final `audio.done` with
-every word complete:
+every entry complete:
 
 ```bash
 curl -N -X POST http://localhost:8000/v1/audio/speech \
@@ -292,17 +296,18 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
     "stream": true, "response_format": "pcm", "word_timestamps": true
   }'
 # {"type": "audio.delta", "audio": "...", "sample_rate": 24000, "words": []}
-# {"type": "audio.delta", "audio": "...", "sample_rate": 24000, "words": [{"index": 0, "text": "Get", "start_ms": 120}]}
-# {"type": "audio.delta", "audio": "...", "sample_rate": 24000, "words": [{"index": 0, "text": "Get", "start_ms": 120, "end_ms": 320}, {"index": 1, "text": "the", "start_ms": 320}]}
+# {"type": "audio.delta", "audio": "...", "sample_rate": 24000, "words": [{"index": 0, "text": "Get", "start_char": 0, "end_char": 3, "start_ms": 120}]}
+# {"type": "audio.delta", "audio": "...", "sample_rate": 24000, "words": [{"index": 0, "text": "Get", "start_char": 0, "end_char": 3, "start_ms": 120, "end_ms": 320}, {"index": 1, "text": " the", "start_char": 3, "end_char": 7, "start_ms": 320}]}
 # ...
-# {"type": "audio.done", "words": [{"index": 0, "text": "Get", "start_ms": 120, "end_ms": 320}, ..., {"index": 7, "text": "early.", "start_ms": 1600, "end_ms": 2080}]}
+# {"type": "audio.done", "words": [{"index": 0, "text": "Get", ..., "start_ms": 120, "end_ms": 320}, ..., {"index": 7, "text": " early.", "start_char": 29, "end_char": 36, "start_ms": 1600, "end_ms": 2080}]}
 ```
 
 Non-stream requests return the list in the `X-Word-Timestamps` header; the
 WebSocket endpoint sends a `{"type": "words", ...}` event before the audio
 frame that reaches those onsets. Measured on seed-tts voice clones against
-MMS forced alignment: EN median onset error 31 ms (71% within 50 ms, 91%
-within 100 ms), ZH median 66 ms (66% within 100 ms); ends run about 40-60 ms
+MMS forced alignment (word onsets regrouped from the token entries): EN
+median onset error 32 ms (70% within 50 ms, 91% within 100 ms), ZH median
+68 ms (63% within 100 ms, jieba words); ends run about 40-60 ms
 later than MMS's CTC ends (EN 77% within 100 ms raw, 86% with the median bias
 removed); the probe adds about 0.2 ms per decode step. Not available with `streaming_protocol`, and a
 `word_timestamps` request bypasses the radix prefix cache (its text-token
@@ -627,8 +632,7 @@ Pair each token with the matching onomatopoeia immediately after it.
 | `top_k` | int | `null` | Top-k sampling |
 | `seed` | int | `null` | Random seed for reproducibility |
 | `word_timestamps` | bool | `false` | Word onsets from the word-align probe (`--word-align-head`); see [Word timestamps](#word-timestamps) |
-| `word_timestamps_unit` | string | `"word"` | `"word"` or `"token"` (one unit per text token; for scripts without word boundaries) |
-| `word_timestamps_dwell` | int | probe default (2) | Minimum frames (40 ms) a unit is held in the online decoder; 1 or 2 measure the same on seed-tts |
+| `word_timestamps_dwell` | int | probe default (2) | Minimum frames (40 ms) a token unit is held in the online decoder; 1 or 2 measure the same on seed-tts |
 
 
 ### Performance

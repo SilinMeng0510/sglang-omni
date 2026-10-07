@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Word-align probe helpers: text segmentation, the online decoder against
+"""Word-align probe helpers: token units, the online decoder against
 the higgs-mm batch reference, and the folded head against the plain math."""
 
 from __future__ import annotations
@@ -16,8 +16,6 @@ from sglang_omni.models.higgs_tts.word_align import (
     WordAlignHead,
     WordAlignRequest,
     plan_word_align,
-    text_words,
-    word_token_ranges,
 )
 
 
@@ -47,24 +45,6 @@ def _reference_online_onsets(wlp: np.ndarray, dwell: int = 2, p_adv: float = 0.1
     return np.where(onset < 0, T - 1, onset)
 
 
-def test_text_words_en_punctuation_and_tags():
-    text = "<|emotion:anger|>Hello, world... <|prosody:pause|> ok?"
-    spans = text_words(text)
-    assert [text[s:e] for s, e in spans] == ["Hello,", "world...", "ok?"]
-
-
-def test_text_words_cjk_per_char_mixed():
-    text = "GPT模型, 你好。"
-    spans = text_words(text)
-    assert [text[s:e] for s, e in spans] == ["GPT", "模", "型,", "你", "好。"]
-
-
-def test_word_token_ranges_overlap():
-    offsets = [(0, 5), (5, 6), (6, 12)]  # "Hello" "," " world"
-    assert word_token_ranges(offsets, [(0, 6), (7, 12)]) == [(0, 2), (2, 3)]
-    assert word_token_ranges(offsets, [(20, 25)]) is None
-
-
 class _FakeTok:
     """Char-level tokenizer with one two-char token (``"ab"``)."""
 
@@ -78,32 +58,20 @@ class _FakeTok:
         return {"input_ids": ids, "offset_mapping": offs}
 
 
-def test_plan_word_align_merges_words_sharing_a_token():
-    plan = plan_word_align(_FakeTok(), "x ab y", text_cap=64)
-    assert plan["words"] == ["x", "ab", "y"]
-    assert plan["ranges"] == [[0, 1], [2, 3], [4, 5]]
-    # CJK chars inside one token collapse into one word
-    plan = plan_word_align(_FakeTok(), "ab你", text_cap=64)
-    assert plan["words"] == ["ab", "你"]
-    assert plan["chars"] == [[0, 2], [2, 3]]
+def test_plan_word_align_token_units():
+    # one unit per token; whitespace / punctuation tokens join the previous
+    # one; tag tokens are masked; char spans come from the offsets
+    plan = plan_word_align(_FakeTok(), "<|t|>ab c,d", text_cap=64, dwell=1)
+    assert plan["words"] == ["ab ", "c,", "d"]
+    assert plan["ranges"] == [[5, 7], [7, 9], [9, 10]]
+    assert plan["chars"] == [[5, 8], [8, 10], [10, 11]]
+    assert plan["n_text"] == 10 and plan["dwell"] == 1
+    req = WordAlignRequest(plan, dwell=2, p_adv=0.1)
+    assert req.dwell == 1 and req.lo == 5
     with pytest.raises(ValueError):
         plan_word_align(_FakeTok(), "x y", text_cap=2)
     with pytest.raises(ValueError):
         plan_word_align(_FakeTok(), "<|sfx:laughter|>", text_cap=64)
-
-
-def test_plan_word_align_token_units():
-    # every token a unit; whitespace / punctuation tokens join the previous
-    # one; tag tokens are masked; char spans come from the offsets
-    plan = plan_word_align(_FakeTok(), "<|t|>ab c,d", text_cap=64, unit="token", dwell=1)
-    assert plan["words"] == ["ab ", "c,", "d"]
-    assert plan["unit"] == "token" and plan["dwell"] == 1
-    assert plan["chars"][0] == [5, 8] and plan["ranges"][0] == [5, 7]
-    assert all(c[1] > c[0] for c in plan["chars"])
-    req = WordAlignRequest(plan, dwell=2, p_adv=0.1)
-    assert req.dwell == 1
-    with pytest.raises(ValueError):
-        plan_word_align(_FakeTok(), "ab", text_cap=64, unit="char")
 
 
 def test_online_decoder_matches_batch_reference():

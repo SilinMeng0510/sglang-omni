@@ -140,8 +140,9 @@ class GenerateChunk:
     modality: str = "text"
     audio_data: Any = None
     sample_rate: int | None = None
-    # TTS word timestamps ({index, text, start_ms}); a stream chunk carries the
-    # words its audio reaches, the final chunk the whole utterance
+    # TTS word timestamps, one entry per text token ({index, text, start_char,
+    # end_char, start_ms, end_ms?}); a stream chunk carries the entries its
+    # audio reaches, the final chunk the whole utterance
     words: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
