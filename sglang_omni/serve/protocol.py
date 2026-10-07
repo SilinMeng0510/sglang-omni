@@ -309,7 +309,10 @@ class CreateSpeechRequest(BaseModel):
     # the response becomes NDJSON audio.delta / audio.done events.
     word_timestamps: bool = False
     # minimum frames per token unit in the online decoder (default: the export's)
-    word_timestamps_dwell: int | None = Field(default=None, ge=1)
+    word_timestamps_dwell: int | None = Field(default=None, ge=1, le=8)
+    # non-stream delivery: "header" (X-Word-Timestamps on the audio response)
+    # or "json" ({audio: base64, format, sample_rate, words})
+    word_timestamps_format: str = "header"
 
     # Voice cloning parameters
     ref_audio: str | None = None  # path or URL to reference audio
@@ -441,7 +444,7 @@ class SpeechStreamSessionConfig(BaseModel):
     streaming_protocol: bool = False
     # Higgs word-align probe: ``words`` JSON events before the audio frames
     word_timestamps: bool = False
-    word_timestamps_dwell: int | None = None
+    word_timestamps_dwell: int | None = Field(default=None, ge=1, le=8)
     task_type: str | None = None
     language: str | None = None
     instructions: str | None = None

@@ -45,6 +45,7 @@ import numpy as np
 import torch
 
 FRAME_MS = 40
+MAX_DWELL = 8   # chain has n * (dwell + 1) + 1 states
 _TAG = re.compile(r"<\|[^|<>]*\|>")
 
 
@@ -96,7 +97,7 @@ def plan_word_align(
         raise ValueError("word_timestamps: no alignable token in the input text")
     plan = {"words": words, "ranges": ranges, "chars": chars, "n_text": n_text}
     if dwell is not None:
-        plan["dwell"] = int(dwell)
+        plan["dwell"] = min(max(int(dwell), 1), MAX_DWELL)
     return plan
 
 
@@ -157,6 +158,7 @@ class WordAlignHead:
         self.bank = torch.zeros(pool_size, text_cap + 1, self.rank + 1, device=device)
         self.bank[:, text_cap, self.rank] = 1.0
         self.bias = torch.full((pool_size, text_cap + 1), float("-inf"), device=device)
+        self.bias[:, text_cap] = 0.0   # rows never set still softmax over the null column
 
     @torch.no_grad()
     def set_text(self, row: int, h_text: torch.Tensor, lo: int) -> None:

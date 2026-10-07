@@ -61,6 +61,7 @@ from sglang_omni.client import (
 from sglang_omni.client.audio import (
     DEFAULT_SAMPLE_RATE,
     apply_speed,
+    scale_word_times,
     encode_pcm,
     select_audio_delta,
 )
@@ -1294,8 +1295,19 @@ def _register_speech(app: FastAPI) -> None:
                 headers["X-Completion-Tokens"] = str(result.usage.completion_tokens)
             if result.usage.engine_time_s is not None:
                 headers["X-Engine-Time"] = str(result.usage.engine_time_s)
-        if result.words is not None:
-            headers["X-Word-Timestamps"] = json.dumps(result.words, ensure_ascii=True)
+        words = scale_word_times(result.words, req.speed)
+        if words is not None and req.word_timestamps_format == "json":
+            return JSONResponse(
+                content={
+                    "audio": base64.b64encode(result.audio_bytes).decode("ascii"),
+                    "format": result.format,
+                    "sample_rate": result.sample_rate,
+                    "words": words,
+                },
+                headers=headers,
+            )
+        if words is not None:
+            headers["X-Word-Timestamps"] = json.dumps(words, ensure_ascii=True)
 
         return Response(
             content=result.audio_bytes,
@@ -1427,8 +1439,9 @@ def _speech_words_response(
                     audio_bytes, emitted_samples, sample_rate = _speech_pcm_chunk_bytes(
                         chunk, emitted_samples=emitted_samples, speed=speed
                     )
+                words = scale_word_times(chunk.words, speed) or []
                 if chunk.finish_reason is not None:
-                    event = {"type": "audio.done", "words": chunk.words or []}
+                    event = {"type": "audio.done", "words": words}
                 elif audio_bytes is None:
                     continue
                 else:
@@ -1436,7 +1449,7 @@ def _speech_words_response(
                         "type": "audio.delta",
                         "audio": base64.b64encode(audio_bytes).decode("ascii"),
                         "sample_rate": sample_rate,
-                        "words": chunk.words or [],
+                        "words": words,
                     }
                 yield json.dumps(event, ensure_ascii=False) + "\n"
             active_request = False

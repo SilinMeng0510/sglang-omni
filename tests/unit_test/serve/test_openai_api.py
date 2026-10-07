@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import json
+
 import asyncio
 import base64
 from typing import Any
@@ -1385,3 +1388,57 @@ def test_stub_endpoint_checks_auth_before_501() -> None:
 
     resp = client.post("/update_weights_from_tensor", json={})
     assert resp.status_code == 401
+
+
+class WordsSpeechClient(SuccessfulSpeechClient):
+    async def speech(self, request, *, request_id, response_format="wav", speed=1.0, allow_format_fallback=True):
+        from sglang_omni.client.types import SpeechResult
+
+        result = await super().speech(
+            request,
+            request_id=request_id,
+            response_format=response_format,
+            speed=speed,
+            allow_format_fallback=allow_format_fallback,
+        )
+        return SpeechResult(
+            audio_bytes=result.audio_bytes,
+            mime_type=result.mime_type,
+            format=result.format,
+            sample_rate=24000,
+            words=[{"index": 0, "text": "hello", "start_char": 0, "end_char": 5, "start_ms": 120, "end_ms": 480}],
+        )
+
+
+def test_speech_word_timestamps_header_and_json_formats_scale_with_speed() -> None:
+    client = TestClient(create_app(WordsSpeechClient(), model_name="tts"))
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={"input": "hello", "word_timestamps": True, "speed": 2.0},
+    )
+    assert response.status_code == 200 and response.content == b"RIFF"
+    assert json.loads(response.headers["X-Word-Timestamps"]) == [
+        {"index": 0, "text": "hello", "start_char": 0, "end_char": 5, "start_ms": 60, "end_ms": 240}
+    ]
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={"input": "hello", "word_timestamps": True, "word_timestamps_format": "json"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert base64.b64decode(body["audio"]) == b"RIFF"
+    assert body["format"] == "wav" and body["sample_rate"] == 24000
+    assert body["words"][0]["start_ms"] == 120 and body["words"][0]["end_ms"] == 480
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={"input": "hello", "word_timestamps": True, "word_timestamps_format": "yaml"},
+    )
+    assert response.status_code == 400
+    response = client.post(
+        "/v1/audio/speech",
+        json={"input": "hello", "word_timestamps": True, "word_timestamps_dwell": 9},
+    )
+    assert response.status_code == 400

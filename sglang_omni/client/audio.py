@@ -159,6 +159,23 @@ def apply_speed(
     return resampled, sample_rate
 
 
+def scale_word_times(
+    words: list[dict[str, Any]] | None, speed: float
+) -> list[dict[str, Any]] | None:
+    """Word-timestamp entries rescaled to audio stretched by :func:`apply_speed`
+    (``speed`` x faster -> times / speed). Identity at speed 1."""
+    if not words or speed == 1.0:
+        return words
+    out = []
+    for w in words:
+        w = dict(w)
+        for key in ("start_ms", "end_ms"):
+            if key in w:
+                w[key] = int(round(w[key] / speed))
+        out.append(w)
+    return out
+
+
 def encode_wav(audio: np.ndarray, sample_rate: int) -> bytes:
     """Encode audio as a WAV file (16-bit PCM)."""
     # Clamp to [-1, 1]

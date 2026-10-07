@@ -22,6 +22,7 @@ from sglang_omni.client.audio import (
     DEFAULT_SAMPLE_RATE,
     apply_speed,
     encode_pcm,
+    scale_word_times,
     select_audio_delta,
 )
 from sglang_omni.serve.incremental_text import StablePrefixTokenizer
@@ -564,24 +565,27 @@ class SpeechWebSocketSession:
         chunk_count = 0
         started = False
         async for chunk in self.client.generate(gen_req, request_id=request_id):
-            if chunk.audio_data is None:
-                continue
-            sample_rate = chunk.sample_rate or DEFAULT_SAMPLE_RATE
-            audio_data, emitted_samples = select_audio_delta(
-                chunk.audio_data,
-                emitted_samples=emitted_samples,
-                is_terminal=chunk.finish_reason is not None,
-            )
-            if audio_data is None:
-                continue
-            if self.config.speed != 1.0:
-                audio_data, sample_rate = apply_speed(
-                    audio_data, self.config.speed, sample_rate
+            # word entries ride before the audio frame that reaches them; the
+            # terminal chunk (no audio) carries the complete list, so it is
+            # sent even though no frame follows
+            words = scale_word_times(chunk.words, self.config.speed)
+            audio_bytes = None
+            if chunk.audio_data is not None:
+                sample_rate = chunk.sample_rate or DEFAULT_SAMPLE_RATE
+                audio_data, emitted_samples = select_audio_delta(
+                    chunk.audio_data,
+                    emitted_samples=emitted_samples,
+                    is_terminal=chunk.finish_reason is not None,
                 )
-            audio_bytes = encode_pcm(audio_data, sample_rate)
-            if not audio_bytes:
+                if audio_data is not None:
+                    if self.config.speed != 1.0:
+                        audio_data, sample_rate = apply_speed(
+                            audio_data, self.config.speed, sample_rate
+                        )
+                    audio_bytes = encode_pcm(audio_data, sample_rate) or None
+            if audio_bytes is None and not (words and chunk.finish_reason is not None):
                 continue
-            if not started:
+            if not started and audio_bytes is not None:
                 await self._send_audio_start(
                     request_id=request_id,
                     sentence_index=sentence_index,
@@ -589,17 +593,18 @@ class SpeechWebSocketSession:
                     sample_rate=sample_rate,
                 )
                 started = True
-            if chunk.words:
-                # word onsets (ms from this sentence's audio start) reached by
-                # the audio frame that follows
+            if words:
                 await self._send_json(
                     {
                         "type": "words",
                         "id": request_id,
                         "sentence_index": sentence_index,
-                        "words": chunk.words,
+                        "final": chunk.finish_reason is not None,
+                        "words": words,
                     }
                 )
+            if audio_bytes is None:
+                continue
             await self._send_audio_frame(audio_bytes, active_request_id=request_id)
             total_bytes += len(audio_bytes)
             chunk_count += 1
@@ -643,7 +648,8 @@ class SpeechWebSocketSession:
                     "type": "words",
                     "id": request_id,
                     "sentence_index": sentence_index,
-                    "words": result.words,
+                    "final": True,
+                    "words": scale_word_times(result.words, request.speed),
                 }
             )
         await self._send_audio_frame(result.audio_bytes)

@@ -822,6 +822,11 @@ def _build_extra_params(request: CreateSpeechRequest) -> dict[str, Any]:
         extra_params["streaming_protocol"] = True
     if request.word_timestamps:
         extra_params["word_timestamps"] = True
+        if request.word_timestamps_format not in ("header", "json"):
+            raise bad_request(
+                "word_timestamps_format must be 'header' or 'json'",
+                param="word_timestamps_format",
+            )
         if request.word_timestamps_dwell is not None:
             extra_params["word_timestamps_dwell"] = request.word_timestamps_dwell
     return extra_params

@@ -63,6 +63,8 @@ def test_plan_word_align_token_units():
     # one unit per token; whitespace / punctuation tokens join the previous
     # one; tag tokens are masked; char spans come from the offsets
     plan = plan_word_align(_FakeTok(), "<|t|>ab c,d", text_cap=64, dwell=1)
+    assert plan_word_align(_FakeTok(), "ab", text_cap=64, dwell=50)["dwell"] == 8
+    assert plan_word_align(_FakeTok(), "ab", text_cap=64, dwell=0)["dwell"] == 1
     assert plan["words"] == ["ab ", "c,", "d"]
     assert plan["ranges"] == [[5, 7], [7, 9], [9, 10]]
     assert plan["chars"] == [[5, 8], [8, 10], [10, 11]]
@@ -141,6 +143,8 @@ def test_head_folds_batchnorm_exactly(tmp_path):
     ref = torch.log_softmax(s, -1)
     assert torch.allclose(torch.cat([logp[lo:J], logp[-1:]]), ref, atol=1e-5)
     assert torch.isinf(logp[:lo]).all() and torch.isinf(logp[J:cap]).all()
+    # a row that never saw set_text still yields finite log-probs (null column)
+    assert torch.isfinite(head.score(h_audio, torch.tensor([0]))[0, cap])
 
 
 def test_release_words_one_entry_per_index_per_event():

@@ -305,9 +305,16 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
 # {"type": "audio.done", "words": [{"index": 0, "text": "Get", ..., "start_ms": 120, "end_ms": 320}, ..., {"index": 7, "text": " early.", "start_char": 29, "end_char": 36, "start_ms": 1600, "end_ms": 2080}]}
 ```
 
-Non-stream requests return the list in the `X-Word-Timestamps` header; the
-WebSocket endpoint sends a `{"type": "words", ...}` event before the audio
-frame that reaches those onsets. Measured on seed-tts voice clones against
+Non-stream requests return the list in the `X-Word-Timestamps` header
+(about 80 bytes per token, so up to ~80 KB at the 1024-token cap — set
+`"word_timestamps_format": "json"` instead to get `{"audio": <base64>,
+"format", "sample_rate", "words"}`); the WebSocket endpoint sends a
+`{"type": "words", "final": false, ...}` event before the audio frame that
+reaches those entries and a `"final": true` event with the complete list
+after the last frame. With `speed != 1` the times are scaled with the
+audio. A `word_timestamps` request bypasses the radix prefix cache (its
+text-token hiddens must be computed): measured +1-3 ms time-to-first-audio
+and about +3% total wall at batch size 1. Measured on seed-tts voice clones against
 MMS forced alignment (word onsets regrouped from the token entries): EN
 median onset error 32 ms (70% within 50 ms, 91% within 100 ms), ZH median
 68 ms (63% within 100 ms, jieba words); ends run about 40-60 ms
@@ -635,7 +642,8 @@ Pair each token with the matching onomatopoeia immediately after it.
 | `top_k` | int | `null` | Top-k sampling |
 | `seed` | int | `null` | Random seed for reproducibility |
 | `word_timestamps` | bool | `false` | Word onsets from the word-align probe (`--word-align-head`); see [Word timestamps](#word-timestamps) |
-| `word_timestamps_dwell` | int | probe default (2) | Minimum frames (40 ms) a token unit is held in the online decoder; 1 or 2 measure the same on seed-tts |
+| `word_timestamps_dwell` | int (1-8) | probe default (2) | Minimum frames (40 ms) a token unit is held in the online decoder; 1 or 2 measure the same on seed-tts |
+| `word_timestamps_format` | string | `"header"` | Non-stream delivery: `"header"` (`X-Word-Timestamps`) or `"json"` envelope |
 
 
 ### Performance

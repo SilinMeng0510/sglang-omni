@@ -1048,3 +1048,59 @@ def test_speech_websocket_disconnect_watch_aborts_on_buffered_byte_cap(
 async def _wait_for_buffered_receive(session: SpeechWebSocketSession) -> None:
     while not session.buffered_receive_messages:
         await asyncio.sleep(0)
+
+
+class WordsStreamingSpeechClient(StreamingSpeechClient):
+    """Audio chunk with onsets, then a terminal audio-less chunk with the
+    complete list (the shape the Higgs vocoder emits)."""
+
+    async def generate(self, request: Any, request_id: str | None = None):
+        self.generated_prompts.append(_prompt_text(request.prompt))
+        rid = request_id or "speech-ws"
+        yield GenerateChunk(
+            request_id=rid,
+            modality="audio",
+            audio_data=[0.0, 0.1, -0.1, 0.0],
+            sample_rate=self.sample_rate,
+            words=[{"index": 0, "text": "Hi", "start_ms": 100}],
+        )
+        yield GenerateChunk(
+            request_id=rid,
+            modality="audio",
+            finish_reason="stop",
+            words=[{"index": 0, "text": "Hi", "start_ms": 100, "end_ms": 300}],
+        )
+
+
+def test_speech_websocket_sends_final_words_event_scaled_by_speed() -> None:
+    client_impl = WordsStreamingSpeechClient()
+    client = TestClient(create_app(client_impl, model_name="tts"))
+
+    with client.websocket_connect("/v1/audio/speech/stream") as websocket:
+        websocket.send_json(
+            {
+                "type": "session.config",
+                "session": {
+                    "response_format": "pcm",
+                    "stream_audio": True,
+                    "word_timestamps": True,
+                    "speed": 2.0,
+                },
+            }
+        )
+        assert websocket.receive_json()["type"] == "session.configured"
+        websocket.send_json({"type": "input.text", "text": "Hi."})
+        start = websocket.receive_json()
+        first_words = websocket.receive_json()
+        audio = websocket.receive_bytes()
+        final_words = websocket.receive_json()
+        done = websocket.receive_json()
+
+    assert start["type"] == "audio.start"
+    assert first_words["type"] == "words" and first_words["final"] is False
+    assert first_words["words"] == [{"index": 0, "text": "Hi", "start_ms": 50}]
+    assert audio
+    # the terminal chunk has no audio but its words (end_ms) still go out
+    assert final_words["type"] == "words" and final_words["final"] is True
+    assert final_words["words"] == [{"index": 0, "text": "Hi", "start_ms": 50, "end_ms": 150}]
+    assert done["type"] == "audio.done"

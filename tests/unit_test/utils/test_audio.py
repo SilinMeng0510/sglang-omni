@@ -228,3 +228,16 @@ def test_load_audio_falls_back_for_24bit_pcm() -> None:
 def test_load_audio_falls_back_for_non_wav_bytes() -> None:
     assert audio._try_fast_wav_decode(b"\xffnot a wav" * 10, 16000) is None
     assert not audio._is_riff_wav(b"ID3\x04" + b"\x00" * 20)
+
+
+def test_scale_word_times_matches_apply_speed_stretch():
+    from sglang_omni.client.audio import scale_word_times
+
+    words = [{"index": 0, "text": "a", "start_ms": 100}, {"index": 1, "text": "b", "start_ms": 300, "end_ms": 450}]
+    assert scale_word_times(words, 1.0) is words
+    assert scale_word_times(None, 2.0) is None
+    assert scale_word_times(words, 1.5) == [
+        {"index": 0, "text": "a", "start_ms": 67},
+        {"index": 1, "text": "b", "start_ms": 200, "end_ms": 300},
+    ]
+    assert words[1]["end_ms"] == 450   # input untouched
