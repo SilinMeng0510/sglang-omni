@@ -476,14 +476,14 @@ class HiggsStreamingVocoderScheduler(
         )
         state = self._stream_states.get(request_id)
         if state is not None and state.words_pending:
-            # a word rides with the first chunk whose audio reaches its onset
+            # an entry rides with the first chunk whose audio reaches its
+            # time: the onset, or the end for an end update
             end_ms = state.emitted_raw_frames * 1000 // 25
-            ready = [w for w in state.words_pending if w["start_ms"] < end_ms]
+            at = lambda w: w.get("end_ms", w["start_ms"])
+            ready = [w for w in state.words_pending if at(w) < end_ms]
             if ready:
                 payload["words"] = ready
-                state.words_pending = [
-                    w for w in state.words_pending if w["start_ms"] >= end_ms
-                ]
+                state.words_pending = [w for w in state.words_pending if at(w) >= end_ms]
         return payload
 
     def fallback_full_decode(

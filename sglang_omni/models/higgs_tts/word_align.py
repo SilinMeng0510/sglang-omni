@@ -13,7 +13,10 @@ the prompt's text-token hiddens of the same layer::
 The causal decoder (copied from ``higgs_mm/eval/word_align.py:online_onsets``)
 forward-filters the chain ``G0 W0 G1 .. W_{n-1} G_n`` (stay ``1 - p_adv``,
 every word held >= ``dwell`` frames) and commits word ``j``'s onset at the
-first frame where ``P(state >= W_j) > 0.5``.
+first frame where ``P(state >= W_j) > 0.5`` and -- a serving extension, the
+reference returns onsets only -- its end at the first frame where
+``P(state >= G_{j+1}) > 0.5`` (the mass has left the word's dwell states, into
+the gap or straight into word ``j + 1``; no gap means ``end == next onset``).
 
 Conventions (export ``config.json``): the hidden that PREDICTS frame ``t`` --
 the decode position fed frame ``t-1``'s codebook row; frame 0 <- the
@@ -190,7 +193,9 @@ class WordAlignHead:
 
 class WordAlignRequest:
     """Per-request decoder state: word log-probs from the token log-probs, the
-    causal forward filter, and the committed onsets."""
+    causal forward filter, and the committed onsets / ends. ``step`` returns
+    an entry when a word's onset commits (``start_ms``) and again, possibly
+    frames later, when its end commits (``start_ms`` + ``end_ms``)."""
 
     def __init__(self, plan: dict[str, Any], *, dwell: int, p_adv: float) -> None:
         self.words: list[str] = list(plan["words"])
@@ -206,6 +211,8 @@ class WordAlignRequest:
         self.first = np.array([1 + j * (dwell + 1) for j in range(n)])
         self.la = np.full(len(self.col), -np.inf)
         self.onset = np.full(n, -1)
+        self.end = np.full(n, -1)
+        self.dwell = dwell
         self.log_stay, self.log_adv = math.log1p(-p_adv), math.log(p_adv)
         self.t = 0
         self.finished = False
@@ -226,26 +233,34 @@ class WordAlignRequest:
                 np.stack([self.la + self.log_stay, a1 + self.log_adv, a2 + self.log_adv]), 0
             ) + wlp[self.col]
         p = np.exp(self.la - np.logaddexp.reduce(self.la))
-        tail = np.cumsum(p[::-1])[::-1][self.first]
-        new = np.flatnonzero((self.onset < 0) & (tail > 0.5))
+        tail = np.cumsum(p[::-1])[::-1]
+        new = np.flatnonzero((self.onset < 0) & (tail[self.first] > 0.5))
         self.onset[new] = self.t
+        done = np.flatnonzero((self.end < 0) & (tail[self.first + self.dwell] > 0.5))
+        self.end[done] = self.t
         self.t += 1
-        return [self._word(j) for j in new]
+        return [self._word(j) for j in sorted(set(new) | set(done))]
 
     def finish(self) -> list[dict[str, Any]]:
-        """End of the audio: the words still open take the last frame."""
+        """End of the audio: open onsets take the last frame, open ends the
+        audio end."""
         if self.finished:
             return []
         self.finished = True
         left = np.flatnonzero(self.onset < 0)
         self.onset[left] = max(self.t - 1, 0)
-        return [self._word(j) for j in left]
+        open_end = np.flatnonzero(self.end < 0)
+        self.end[open_end] = self.t
+        return [self._word(j) for j in sorted(set(left) | set(open_end))]
 
     def all_words(self) -> list[dict[str, Any]]:
         return [self._word(j) for j in range(len(self.words))]
 
     def _word(self, j: int) -> dict[str, Any]:
-        return {"index": int(j), "text": self.words[j], "start_ms": int(self.onset[j]) * FRAME_MS}
+        w = {"index": int(j), "text": self.words[j], "start_ms": int(self.onset[j]) * FRAME_MS}
+        if self.end[j] >= 0:
+            w["end_ms"] = int(self.end[j]) * FRAME_MS
+        return w
 
 
 __all__ = [

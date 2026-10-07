@@ -100,11 +100,20 @@ def test_online_decoder_matches_batch_reference():
     logits[:, :lo] = -np.inf
     logp = logits - np.logaddexp.reduce(logits, -1, keepdims=True)
     req = WordAlignRequest(plan, dwell=2, p_adv=0.1)
-    seen = {}
+    seen, ends = {}, {}
     for t in range(T):
         for w in req.step(logp[t]):
-            seen[w["index"]] = w["start_ms"]
-    seen.update({w["index"]: w["start_ms"] for w in req.finish()})
+            seen.setdefault(w["index"], w["start_ms"])
+            if "end_ms" in w:
+                ends[w["index"]] = w["end_ms"]
+                assert w["end_ms"] >= seen[w["index"]]
+    for w in req.finish():
+        seen.setdefault(w["index"], w["start_ms"])
+        ends.setdefault(w["index"], w["end_ms"])
+    assert sorted(ends) == [0, 1, 2, 3]
+    assert all("end_ms" in w for w in req.all_words())
+    # an end never precedes the next onset (the chain is monotone)
+    assert all(ends[j] <= seen[j + 1] for j in range(3))
     # reference word log-probs over the span tokens
     cover = np.zeros((n_text - lo + 1, 5))
     for j, (a, b) in enumerate(ranges):

@@ -268,12 +268,14 @@ sgl-omni serve \
 ```
 
 Opt in per request with `"word_timestamps": true` (off = byte-identical to a
-server without the probe). Words are `{"index", "text", "start_ms"}` with
-`start_ms` measured from the start of the generated audio; English words are
+server without the probe). Words are `{"index", "text", "start_ms", "end_ms"}`
+measured from the start of the generated audio; English words are
 whitespace-delimited, CJK text is split per character (characters sharing one
 token are merged). With `"stream": true` the response is NDJSON instead of raw
 PCM: one `audio.delta` event per chunk (`audio` = base64 PCM16, `words` = the
-onsets that chunk's audio reaches) and a final `audio.done` with every word:
+entries that chunk's audio reaches: a word first appears with its `start_ms`,
+and again with `end_ms` once its end is known) and a final `audio.done` with
+every word complete:
 
 ```bash
 curl -N -X POST http://localhost:8000/v1/audio/speech \
@@ -286,16 +288,18 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
   }'
 # {"type": "audio.delta", "audio": "...", "sample_rate": 24000, "words": []}
 # {"type": "audio.delta", "audio": "...", "sample_rate": 24000, "words": [{"index": 0, "text": "Get", "start_ms": 120}]}
+# {"type": "audio.delta", "audio": "...", "sample_rate": 24000, "words": [{"index": 0, "text": "Get", "start_ms": 120, "end_ms": 320}, {"index": 1, "text": "the", "start_ms": 320}]}
 # ...
-# {"type": "audio.done", "words": [{"index": 0, "text": "Get", "start_ms": 120}, ..., {"index": 7, "text": "early.", "start_ms": 1600}]}
+# {"type": "audio.done", "words": [{"index": 0, "text": "Get", "start_ms": 120, "end_ms": 320}, ..., {"index": 7, "text": "early.", "start_ms": 1600, "end_ms": 2080}]}
 ```
 
 Non-stream requests return the list in the `X-Word-Timestamps` header; the
 WebSocket endpoint sends a `{"type": "words", ...}` event before the audio
 frame that reaches those onsets. Measured on seed-tts voice clones against
 MMS forced alignment: EN median onset error 31 ms (71% within 50 ms, 91%
-within 100 ms), ZH median 66 ms (66% within 100 ms); the probe adds about
-0.2 ms per decode step. Not available with `streaming_protocol`, and a
+within 100 ms), ZH median 66 ms (66% within 100 ms); ends run about 40-60 ms
+later than MMS's CTC ends (EN 77% within 100 ms raw, 86% with the median bias
+removed); the probe adds about 0.2 ms per decode step. Not available with `streaming_protocol`, and a
 `word_timestamps` request bypasses the radix prefix cache (its text-token
 hiddens must be recomputed).
 
