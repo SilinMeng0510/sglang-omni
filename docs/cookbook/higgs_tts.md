@@ -289,10 +289,10 @@ chunk's audio reaches: a unit first appears with its `start_ms`, and again
 with `end_ms` once its end is known; within one event each `index` appears
 at most once — if both become releasable in the same chunk the event carries
 one merged entry — and a later event's entry supersedes an earlier one).
-The last audio-carrying event also has `words_final`, the complete list, so
-a reader that skips audio-less events still gets it; a trailing audio-less
-event repeats `words_final`. (`stream_options: {"include_usage": true}`
-alone selects the same SSE shape without `words`.)
+The last audio-carrying event (the vocoder's final flush) also has
+`words_final`, the complete list, so a reader that skips audio-less events
+still gets it. (`stream_options: {"include_usage": true}` alone selects the
+same SSE shape without `words`.)
 
 ```bash
 curl -N -X POST http://localhost:8000/v1/audio/speech \
@@ -308,7 +308,6 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
 # data: {"audio": {...}, "usage": {...}, "words": [{"index": 0, "text": "Get", "start_char": 0, "end_char": 3, "start_ms": 120, "end_ms": 320}, {"index": 1, "text": " the", "start_char": 3, "end_char": 7, "start_ms": 320}]}
 # ...
 # data: {"audio": {...}, "usage": {...}, "words": [...], "words_final": [{"index": 0, ..., "end_ms": 320}, ..., {"index": 7, "text": " early.", "start_char": 29, "end_char": 36, "start_ms": 1600, "end_ms": 2080}]}
-# data: {"words_final": [...same...], "usage": {...}}
 # data: [DONE]
 ```
 

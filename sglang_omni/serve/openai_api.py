@@ -1432,9 +1432,8 @@ def _speech_sse_response(
     pcm16>, "sample_rate"}, "usage": {...cumulative}}`` event per chunk, then
     ``data: [DONE]``. With ``word_timestamps`` every event also carries
     ``words`` (the entries that chunk's audio reaches) and the last
-    audio-carrying event ``words_final`` (the complete list), so a reader that
-    skips audio-less events still gets it; a trailing audio-less event repeats
-    ``words_final`` for direct clients."""
+    audio-carrying event (the vocoder's final flush) ``words_final``, the
+    complete list, so a reader that skips audio-less events still gets it."""
     chunk_stream = client.generate(gen_req, request_id=request_id)
     input_chars = len(input_text)
 

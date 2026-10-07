@@ -1457,8 +1457,7 @@ class WordsStreamingSpeechClient(SuccessfulSpeechClient):
                             words=[{"index": 0, "text": "hi", "start_ms": 100, "end_ms": 300}],
                             words_final=[{"index": 0, "text": "hi", "start_ms": 100, "end_ms": 300}])
         yield GenerateChunk(request_id=rid, modality="audio", finish_reason="stop",
-                            words=[{"index": 0, "text": "hi", "start_ms": 100, "end_ms": 300}],
-                            words_final=[{"index": 0, "text": "hi", "start_ms": 100, "end_ms": 300}])
+                            words=[{"index": 0, "text": "hi", "start_ms": 100, "end_ms": 300}])
 
 
 def _sse_events(text: str) -> list[Any]:
@@ -1482,16 +1481,15 @@ def test_speech_stream_word_timestamps_is_gateway_shaped_sse() -> None:
         assert response.headers["content-type"].startswith("text/event-stream")
         events = _sse_events(response.read().decode())
 
-    assert events[-1] == "[DONE]"
-    first, last_audio, terminal = events[0], events[1], events[2]
+    assert events[-1] == "[DONE]" and len(events) == 3   # the audio-less terminal chunk yields no event
+    first, last_audio = events[0], events[1]
     assert set(first) == {"audio", "usage", "words"}
     assert first["audio"]["sample_rate"] == 24000 and base64.b64decode(first["audio"]["data"])
     assert first["usage"]["input_chars"] == 2 and first["usage"]["audio_bytes"] == 2  # 1 sample after 2x speed
     assert first["words"] == [{"index": 0, "text": "hi", "start_ms": 50}]
     # the last audio-carrying event has the full list (speed-scaled) for readers that skip audio-less events
     assert last_audio["words_final"] == [{"index": 0, "text": "hi", "start_ms": 50, "end_ms": 150}]
-    assert "audio" not in terminal and terminal["words_final"] == last_audio["words_final"]
-    assert terminal["usage"]["audio_bytes"] == 4 and terminal["usage"]["output_duration_s"] == round(4 / 2 / 24000, 3)
+    assert last_audio["usage"]["audio_bytes"] == 4 and last_audio["usage"]["output_duration_s"] == round(4 / 2 / 24000, 3)
 
 
 def test_speech_stream_include_usage_selects_sse_without_words() -> None:
