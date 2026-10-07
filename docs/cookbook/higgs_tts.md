@@ -269,9 +269,14 @@ sgl-omni serve \
 
 Opt in per request with `"word_timestamps": true` (off = byte-identical to a
 server without the probe). Words are `{"index", "text", "start_ms", "end_ms"}`
-measured from the start of the generated audio; English words are
-whitespace-delimited, CJK text is split per character (characters sharing one
-token are merged). With `"stream": true` the response is NDJSON instead of raw
+measured from the start of the generated audio, plus the unit's
+`start_char` / `end_char` in the input text. Units follow
+`word_timestamps_unit`: `"word"` (default; whitespace-delimited words, CJK text
+per character, characters sharing one token merged) or `"token"` (every text
+token outside control tags is a unit, for scripts without word boundaries such
+as Thai; regroup by the char spans — Qwen's Thai tokens are sub-syllable pieces
+and combining marks come out as zero-length units). With `"stream": true` the
+response is NDJSON instead of raw
 PCM: one `audio.delta` event per chunk (`audio` = base64 PCM16, `words` = the
 entries that chunk's audio reaches: a word first appears with its `start_ms`,
 and again with `end_ms` once its end is known) and a final `audio.done` with
@@ -622,6 +627,8 @@ Pair each token with the matching onomatopoeia immediately after it.
 | `top_k` | int | `null` | Top-k sampling |
 | `seed` | int | `null` | Random seed for reproducibility |
 | `word_timestamps` | bool | `false` | Word onsets from the word-align probe (`--word-align-head`); see [Word timestamps](#word-timestamps) |
+| `word_timestamps_unit` | string | `"word"` | `"word"` or `"token"` (one unit per text token; for scripts without word boundaries) |
+| `word_timestamps_dwell` | int | probe default (2) | Minimum frames (40 ms) a unit is held in the online decoder; 1 or 2 measure the same on seed-tts |
 
 
 ### Performance

@@ -102,30 +102,60 @@ def word_token_ranges(
     return out
 
 
-def plan_word_align(tokenizer: Any, text: str, text_cap: int) -> dict[str, Any]:
-    """Preprocessing-stage plan: the words of ``text`` with their token ranges
-    in ``tokenizer.encode(text, add_special_tokens=False)``. Consecutive words
-    that add no token of their own (CJK characters sharing one token) are
-    merged, since the probe cannot tell them apart."""
+def plan_word_align(
+    tokenizer: Any, text: str, text_cap: int, unit: str = "word", dwell: int | None = None
+) -> dict[str, Any]:
+    """Preprocessing-stage plan: the units of ``text`` with their token ranges
+    in ``tokenizer.encode(text, add_special_tokens=False)`` and char spans.
+    ``unit="word"``: words per ``text_words``, consecutive words that add no
+    token of their own (CJK characters sharing one token) merged, since the
+    probe cannot tell them apart. ``unit="token"``: every text token outside
+    ``<|...|>`` tags is a unit (scripts without word boundaries, th/km/lo/my;
+    clients regroup by the char spans); tokens with no content char
+    (whitespace, punctuation) join the previous unit."""
     enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
     n_text = len(enc["input_ids"])
     if n_text > text_cap:
         raise ValueError(
             f"word_timestamps supports at most {text_cap} text tokens, got {n_text}"
         )
-    spans = text_words(text)
-    ranges = word_token_ranges(enc["offset_mapping"], spans) if spans else None
+    if unit == "token":
+        tagged = [False] * len(text)
+        for m in _TAG.finditer(text):
+            tagged[m.start() : m.end()] = [True] * (m.end() - m.start())
+        spans = [
+            (s, e) for s, e in enc["offset_mapping"]
+            if e > s and not any(tagged[s:e])
+        ]
+        ranges = word_token_ranges(enc["offset_mapping"], spans) if spans else None
+    elif unit == "word":
+        spans = text_words(text)
+        ranges = word_token_ranges(enc["offset_mapping"], spans) if spans else None
+    else:
+        raise ValueError(f"word_timestamps_unit must be 'word' or 'token', got {unit!r}")
     if not ranges:
         raise ValueError("word_timestamps: no alignable word in the input text")
     words: list[str] = []
     merged: list[list[int]] = []
+    chars: list[list[int]] = []
     for (s, e), (lo, hi) in zip(spans, ranges):
-        if merged and hi <= merged[-1][1]:
+        content = any(_content(c) for c in text[s:e])
+        if merged and (hi <= merged[-1][1] or not content):
             words[-1] += text[s:e]
+            merged[-1][1] = max(merged[-1][1], hi)
+            chars[-1][1] = e
+            continue
+        if not content:
             continue
         words.append(text[s:e])
         merged.append([lo, hi])
-    return {"words": words, "ranges": merged, "n_text": n_text}
+        chars.append([s, e])
+    if not words:
+        raise ValueError("word_timestamps: no alignable word in the input text")
+    plan = {"words": words, "ranges": merged, "chars": chars, "n_text": n_text, "unit": unit}
+    if dwell is not None:
+        plan["dwell"] = int(dwell)
+    return plan
 
 
 class WordAlignHead:
@@ -199,6 +229,8 @@ class WordAlignRequest:
 
     def __init__(self, plan: dict[str, Any], *, dwell: int, p_adv: float) -> None:
         self.words: list[str] = list(plan["words"])
+        self.chars = [tuple(c) for c in plan.get("chars", [])]
+        dwell = max(1, int(plan.get("dwell", dwell)))
         ranges = [tuple(r) for r in plan["ranges"]]
         self.n_text = int(plan["n_text"])
         self.lo = int(ranges[0][0])
@@ -258,6 +290,8 @@ class WordAlignRequest:
 
     def _word(self, j: int) -> dict[str, Any]:
         w = {"index": int(j), "text": self.words[j], "start_ms": int(self.onset[j]) * FRAME_MS}
+        if self.chars:
+            w["start_char"], w["end_char"] = self.chars[j]
         if self.end[j] >= 0:
             w["end_ms"] = int(self.end[j]) * FRAME_MS
         return w

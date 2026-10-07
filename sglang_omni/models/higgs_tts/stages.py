@@ -231,7 +231,14 @@ def create_preprocessing_executor(
                 raise ValueError(
                     "word_timestamps is not supported with streaming_protocol"
                 )
-            word_align = plan_word_align(tokenizer, text, word_align_text_cap)
+            dwell = params.get("word_timestamps_dwell")
+            word_align = plan_word_align(
+                tokenizer,
+                text,
+                word_align_text_cap,
+                unit=str(params.get("word_timestamps_unit", "word")),
+                dwell=int(dwell) if dwell is not None else None,
+            )
         ref_codes_TN = to_codes_TN(inputs.get("reference_codes"), num_codebooks)
         if ref_codes_TN is not None and ref_codes_TN.shape[0] > _MAX_REF_AUDIO_SEC * 75:
             raise ValueError(

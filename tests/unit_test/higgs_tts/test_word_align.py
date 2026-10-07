@@ -85,10 +85,25 @@ def test_plan_word_align_merges_words_sharing_a_token():
     # CJK chars inside one token collapse into one word
     plan = plan_word_align(_FakeTok(), "ab你", text_cap=64)
     assert plan["words"] == ["ab", "你"]
+    assert plan["chars"] == [[0, 2], [2, 3]]
     with pytest.raises(ValueError):
         plan_word_align(_FakeTok(), "x y", text_cap=2)
     with pytest.raises(ValueError):
         plan_word_align(_FakeTok(), "<|sfx:laughter|>", text_cap=64)
+
+
+def test_plan_word_align_token_units():
+    # every token a unit; whitespace / punctuation tokens join the previous
+    # one; tag tokens are masked; char spans come from the offsets
+    plan = plan_word_align(_FakeTok(), "<|t|>ab c,d", text_cap=64, unit="token", dwell=1)
+    assert plan["words"] == ["ab ", "c,", "d"]
+    assert plan["unit"] == "token" and plan["dwell"] == 1
+    assert plan["chars"][0] == [5, 8] and plan["ranges"][0] == [5, 7]
+    assert all(c[1] > c[0] for c in plan["chars"])
+    req = WordAlignRequest(plan, dwell=2, p_adv=0.1)
+    assert req.dwell == 1
+    with pytest.raises(ValueError):
+        plan_word_align(_FakeTok(), "ab", text_cap=64, unit="char")
 
 
 def test_online_decoder_matches_batch_reference():
