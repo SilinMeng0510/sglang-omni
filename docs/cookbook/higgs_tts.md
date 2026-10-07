@@ -272,8 +272,9 @@ server without the probe). The server emits one entry per **text token**
 outside control tags, `{"index", "text", "start_char", "end_char", "start_ms",
 "end_ms"}`: times from the start of the generated audio, char offsets into the
 `input` string (tokens with no content char — whitespace, punctuation,
-combining marks such as Thai vowel signs or Indic matras — are folded into
-the preceding entry, whose `end_char` then covers them).
+combining marks such as Thai vowel signs or Indic matras — and tokens that
+start with a combining mark are folded into the preceding entry, whose
+`end_char` then covers them, so Thai entries are syllables).
 Regrouping tokens into words is the client's or gateway's job using the char
 offsets: whitespace scripts split at spaces, CJK per character or with a
 segmenter, th/km/lo/my with an ICU word iterator; a token straddling a word

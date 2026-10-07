@@ -182,12 +182,26 @@ def test_plan_word_align_folds_combining_marks():
     text = "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35\u0e04\u0e23\u0e31\u0e1a"  # สวัสดีครับ
     pieces = ["\u0e2a\u0e27", "\u0e31", "\u0e2a\u0e14", "\u0e35", "\u0e04\u0e23", "\u0e31\u0e1a"]
     plan = plan_word_align(_PieceTok(pieces), text, text_cap=64)
-    assert plan["words"] == ["\u0e2a\u0e27\u0e31", "\u0e2a\u0e14\u0e35", "\u0e04\u0e23", "\u0e31\u0e1a"]
-    assert plan["ranges"] == [[0, 2], [2, 4], [4, 5], [5, 6]]
-    assert plan["chars"] == [[0, 3], [3, 6], [6, 8], [8, 10]]
+    assert plan["words"] == ["\u0e2a\u0e27\u0e31", "\u0e2a\u0e14\u0e35", "\u0e04\u0e23\u0e31\u0e1a"]
+    assert plan["ranges"] == [[0, 2], [2, 4], [4, 6]]
+    assert plan["chars"] == [[0, 3], [3, 6], [6, 10]]
     # Devanagari: a matra-only token (Mc) folds too; a leading mark is dropped
     text = "\u093f\u0928\u092e\u0938\u094d\u0924\u0947"  # िनमस्ते
     pieces = ["\u093f", "\u0928\u092e", "\u0938", "\u094d", "\u0924", "\u0947"]
     plan = plan_word_align(_PieceTok(pieces), text, text_cap=64)
     assert plan["words"] == ["\u0928\u092e", "\u0938\u094d", "\u0924\u0947"]
     assert plan["chars"] == [[1, 3], [3, 5], [5, 7]]
+
+
+def test_plan_word_align_folds_tokens_starting_with_a_mark():
+    # Thai กร|ุง|เทพ: a token beginning with a vowel sign continues the syllable
+    text = "\u0e01\u0e23\u0e38\u0e07\u0e40\u0e17\u0e1e"  # กรุงเทพ
+    plan = plan_word_align(_PieceTok(["\u0e01\u0e23", "\u0e38\u0e07", "\u0e40\u0e17\u0e1e"]), text, text_cap=64)
+    assert plan["words"] == ["\u0e01\u0e23\u0e38\u0e07", "\u0e40\u0e17\u0e1e"]
+    assert plan["ranges"] == [[0, 2], [2, 3]] and plan["chars"] == [[0, 4], [4, 7]]
+    # Devanagari: "ि" + consonant token folds; a leading mark token is still dropped
+    text = "\u0928\u092e\u0938\u094d\u0924\u0947"  # नमस्ते
+    plan = plan_word_align(_PieceTok(["\u0928", "\u092e\u0938", "\u094d\u0924", "\u0947"]), text, text_cap=64)
+    assert plan["words"] == ["\u0928", "\u092e\u0938\u094d\u0924\u0947"]
+    plan = plan_word_align(_PieceTok(["\u094d", "\u0924"]), "\u094d\u0924", text_cap=64)
+    assert plan["words"] == ["\u0924"] and plan["chars"] == [[1, 2]]

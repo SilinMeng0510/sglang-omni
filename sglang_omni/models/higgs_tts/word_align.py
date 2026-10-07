@@ -60,8 +60,9 @@ def plan_word_align(
     """Preprocessing-stage plan: one unit per token of
     ``tokenizer.encode(text, add_special_tokens=False)`` outside ``<|...|>``
     tags, as token ranges ``[lo, hi)`` and char spans ``[s, e)``; tokens with
-    no content char (whitespace, punctuation, combining marks only) join the
-    preceding unit (their chars extend its span)."""
+    no content char (whitespace, punctuation, combining marks only) and tokens
+    that start with a combining mark join the preceding unit (their chars
+    extend its span)."""
     enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
     n_text = len(enc["input_ids"])
     if n_text > text_cap:
@@ -77,7 +78,13 @@ def plan_word_align(
     for j, (s, e) in enumerate(enc["offset_mapping"]):
         if e <= s or any(tagged[s:e]):
             continue
-        if any(_content(c) for c in text[s:e]):
+        piece = text[s:e].lstrip()
+        # a token that starts with a combining mark continues the previous
+        # syllable (Thai กร|ุง|เทพ -> กรุง|เทพ), like a mark-only token
+        own = any(_content(c) for c in piece) and not (
+            piece and unicodedata.category(piece[0])[0] == "M"
+        )
+        if own:
             words.append(text[s:e])
             ranges.append([j, j + 1])
             chars.append([s, e])
