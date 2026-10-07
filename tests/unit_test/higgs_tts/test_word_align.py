@@ -16,6 +16,7 @@ from sglang_omni.models.higgs_tts.word_align import (
     WordAlignHead,
     WordAlignRequest,
     plan_word_align,
+    release_words,
 )
 
 
@@ -140,3 +141,21 @@ def test_head_folds_batchnorm_exactly(tmp_path):
     ref = torch.log_softmax(s, -1)
     assert torch.allclose(torch.cat([logp[lo:J], logp[-1:]]), ref, atol=1e-5)
     assert torch.isinf(logp[:lo]).all() and torch.isinf(logp[J:cap]).all()
+
+
+def test_release_words_one_entry_per_index_per_event():
+    pending = [
+        {"index": 0, "text": "a", "start_ms": 120},
+        {"index": 0, "text": "a", "start_ms": 120, "end_ms": 320},
+        {"index": 1, "text": "b", "start_ms": 320},
+        {"index": 1, "text": "b", "start_ms": 320, "end_ms": 640},
+        {"index": 2, "text": "c", "start_ms": 700},
+    ]
+    ready, left = release_words(pending, 400)
+    # onset + end of index 0 merge into one entry; index 1's end (640) waits
+    assert ready == [{"index": 0, "text": "a", "start_ms": 120, "end_ms": 320},
+                     {"index": 1, "text": "b", "start_ms": 320}]
+    assert left == pending[3:]
+    ready, left = release_words(left, 800)
+    assert ready == [{"index": 1, "text": "b", "start_ms": 320, "end_ms": 640},
+                     {"index": 2, "text": "c", "start_ms": 700}] and left == []

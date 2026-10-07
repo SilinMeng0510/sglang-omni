@@ -89,6 +89,22 @@ def plan_word_align(
     return plan
 
 
+def release_words(
+    pending: list[dict[str, Any]], end_ms: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split the engine's pending entries into (ready, still pending) for an
+    audio chunk that ends at ``end_ms``: an entry is ready once the audio
+    reaches its time (the onset, or the end for an end update). Ready entries
+    are merged per ``index`` -- one entry per index per event, a later entry
+    superseding (adding ``end_ms`` to) an earlier one -- in first-seen order."""
+    at = lambda w: w.get("end_ms", w["start_ms"])
+    merged: dict[int, dict[str, Any]] = {}
+    for w in pending:
+        if at(w) < end_ms:
+            merged[w["index"]] = {**merged.get(w["index"], {}), **w}
+    return list(merged.values()), [w for w in pending if at(w) >= end_ms]
+
+
 class WordAlignHead:
     """The exported PointerHead on the GPU, BatchNorm folded into the linears,
     plus a per-sampler-row bank of projected text-token hiddens.
@@ -228,4 +244,4 @@ class WordAlignRequest:
         return w
 
 
-__all__ = ["FRAME_MS", "WordAlignHead", "WordAlignRequest", "plan_word_align"]
+__all__ = ["FRAME_MS", "WordAlignHead", "WordAlignRequest", "plan_word_align", "release_words"]

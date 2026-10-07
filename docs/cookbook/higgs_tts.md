@@ -283,8 +283,10 @@ units at the frame the mass passes through.) With `"stream": true` the
 response is NDJSON instead of raw
 PCM: one `audio.delta` event per chunk (`audio` = base64 PCM16, `words` = the
 entries that chunk's audio reaches: a unit first appears with its `start_ms`,
-and again with `end_ms` once its end is known) and a final `audio.done` with
-every entry complete:
+and again with `end_ms` once its end is known; within one event each `index`
+appears at most once — if both become releasable in the same chunk the event
+carries one merged entry — and a later event's entry supersedes an earlier
+one) and a final `audio.done` with every entry complete:
 
 ```bash
 curl -N -X POST http://localhost:8000/v1/audio/speech \
