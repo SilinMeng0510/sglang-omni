@@ -137,10 +137,8 @@ def test_head_folds_batchnorm_exactly(tmp_path):
     assert head.layer == 3
     J, lo = 6, 1
     h_text, h_audio = torch.randn(J, dim), torch.randn(1, dim)
-    head.set_text(2, h_text)
-    logp = head.score(
-        h_audio, torch.tensor([2]), torch.tensor([lo]), torch.tensor([J])
-    )[0]
+    head.set_text(2, h_text, lo)
+    logp = head.score(h_audio, torch.tensor([2]))[0]
     # plain PointerHead math (higgs_mm.nn.word_align) in eval mode
     bn = lambda x: (x - sd["norm.running_mean"]) / torch.sqrt(sd["norm.running_var"] + 1e-5)
     a = bn(h_audio) @ sd["audio.weight"].T + sd["audio.bias"]

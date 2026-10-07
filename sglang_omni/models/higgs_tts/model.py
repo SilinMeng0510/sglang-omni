@@ -226,14 +226,14 @@ class HiggsTTSModel(nn.Module):
         # Word-timestamp probe (see word_align.py), loaded by
         # ``load_word_align_probe`` before CUDA-graph capture; None = off.
         self.word_align: Any = None
-        self._cg_probe_hidden: torch.Tensor | None = None
+        self._cg_probe_logp: torch.Tensor | None = None
         self._probe_prefill_hidden: torch.Tensor | None = None
 
     def load_word_align_probe(self, export_dir: str, *, text_cap: int = 1024) -> None:
         """Enable the word-timestamp probe: the backbone also returns the
         probe layer's hidden (sglang's aux ``layers_to_capture`` add, which
-        is captured inside the CUDA graph) and ``forward`` copies it into
-        the static ``_cg_probe_hidden[:bs]`` buffer (decode) or keeps the
+        is captured inside the CUDA graph); ``forward`` scores it in-graph
+        into the static ``_cg_probe_logp[:bs]`` buffer (decode) or keeps the
         fresh tensor (prefill) for the runner to read after the step."""
         from sglang_omni.models.higgs_tts.word_align import WordAlignHead
 
@@ -250,12 +250,7 @@ class HiggsTTSModel(nn.Module):
             )
         # aux index k = the input of decoder layer k = the output of k layers
         self.backbone.model.layers_to_capture = [head.layer]
-        self._cg_probe_hidden = torch.zeros(
-            pool_size,
-            hidden_size,
-            dtype=self.backbone.model.embed_tokens.weight.dtype,
-            device=device,
-        )
+        self._cg_probe_logp = torch.zeros(pool_size, text_cap + 1, device=device)
         self.word_align = head
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -518,7 +513,11 @@ class HiggsTTSModel(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
             probe_hidden = aux_hidden_states[0]
             if is_decode:
-                self._cg_probe_hidden[: probe_hidden.shape[0]].copy_(probe_hidden)
+                # scored in-graph against the rows' text banks (word_align.py)
+                bs = probe_hidden.shape[0]
+                self._cg_probe_logp[:bs] = self.word_align.score(
+                    probe_hidden, self._cg_row_indices[:bs]
+                )
             else:
                 self._probe_prefill_hidden = probe_hidden
 

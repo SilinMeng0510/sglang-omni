@@ -127,7 +127,14 @@ def plan_word_align(tokenizer: Any, text: str, text_cap: int) -> dict[str, Any]:
 
 class WordAlignHead:
     """The exported PointerHead on the GPU, BatchNorm folded into the linears,
-    plus a per-sampler-row bank of projected text-token hiddens."""
+    plus a per-sampler-row bank of projected text-token hiddens.
+
+    The null logit is folded into the bank so one ``bmm`` yields every column:
+    the audio projection is ``[audio(x); null(x)]`` (rank + 1), text column
+    ``j`` is ``[text(x_j) / sqrt(rank); 0]`` and the null column (index
+    ``text_cap``) is ``[0; 1]``; ``bias`` is 0 on the live columns and -inf
+    elsewhere. ``score`` is then 4 kernels that run inside the decode CUDA
+    graph (``HiggsTTSModel.forward``) indexed by the static row buffer."""
 
     def __init__(
         self, export_dir: str, *, pool_size: int, device: Any, text_cap: int = 1024
@@ -144,39 +151,41 @@ class WordAlignHead:
         self.dwell = int(cfg.get("dwell", 2))
         self.p_adv = float(cfg.get("p_adv", 0.1))
         self.text_cap = int(text_cap)
-        self.scale = 1.0 / math.sqrt(self.rank)
         inv_sd = torch.rsqrt(sd["norm.running_var"].float() + 1e-5)
         shift = sd["norm.running_mean"].float() * inv_sd
 
         def fold(name: str) -> tuple[torch.Tensor, torch.Tensor]:
             w, b = sd[f"{name}.weight"].float(), sd[f"{name}.bias"].float()
-            return (w * inv_sd).to(device), (b - w @ shift).to(device)
+            return w * inv_sd, b - w @ shift
 
-        self.w_audio, self.b_audio = fold("audio")
-        self.w_text, self.b_text = fold("text")
-        self.w_null, self.b_null = fold("null")
-        self.bank = torch.zeros(pool_size, text_cap, self.rank, device=device)
-        self._col = torch.arange(text_cap, device=device)[None]
-
-    @torch.no_grad()
-    def set_text(self, row: int, h_text: torch.Tensor) -> None:
-        """Project the prompt's ``[J, D]`` text-token hiddens into row ``row``."""
-        self.bank[row, : h_text.shape[0]] = h_text.float() @ self.w_text.T + self.b_text
+        w_audio, b_audio = fold("audio")
+        w_null, b_null = fold("null")
+        self.w_text, self.b_text = (t.to(device) for t in fold("text"))
+        self.w_proj = torch.cat([w_audio, w_null]).to(device)
+        self.b_proj = torch.cat([b_audio, b_null]).to(device)
+        self.bank = torch.zeros(pool_size, text_cap + 1, self.rank + 1, device=device)
+        self.bank[:, text_cap, self.rank] = 1.0
+        self.bias = torch.full((pool_size, text_cap + 1), float("-inf"), device=device)
 
     @torch.no_grad()
-    def score(
-        self, h: torch.Tensor, rows: torch.Tensor, lo: torch.Tensor, n_text: torch.Tensor
-    ) -> torch.Tensor:
+    def set_text(self, row: int, h_text: torch.Tensor, lo: int) -> None:
+        """Project the prompt's ``[J, D]`` text-token hiddens into row ``row``;
+        columns ``[lo, J)`` and the null column score, the rest is masked."""
+        n = h_text.shape[0]
+        t = (h_text.float() @ self.w_text.T + self.b_text) / math.sqrt(self.rank)
+        self.bank[row, : self.text_cap, : self.rank] = 0.0
+        self.bank[row, :n, : self.rank] = t
+        self.bias[row] = float("-inf")
+        self.bias[row, lo:n] = 0.0
+        self.bias[row, self.text_cap] = 0.0
+
+    @torch.no_grad()
+    def score(self, h: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
         """``[P, text_cap + 1]`` log-probs (last column = null) of ``P`` audio-step
-        hiddens against their rows' text banks, columns outside ``[lo, n_text)``
-        masked."""
-        x = h.float()
-        a = x @ self.w_audio.T + self.b_audio
-        z = x @ self.w_null.T + self.b_null
-        s = torch.bmm(self.bank[rows], a.unsqueeze(-1)).squeeze(-1) * self.scale
-        mask = (self._col < lo[:, None]) | (self._col >= n_text[:, None])
-        s = s.masked_fill(mask, float("-inf"))
-        return torch.log_softmax(torch.cat([s, z], -1), -1)
+        hiddens against their sampler rows' text banks."""
+        a = h.float() @ self.w_proj.T + self.b_proj
+        s = torch.bmm(self.bank[rows], a.unsqueeze(-1)).squeeze(-1) + self.bias[rows]
+        return torch.log_softmax(s, -1)
 
 
 class WordAlignRequest:

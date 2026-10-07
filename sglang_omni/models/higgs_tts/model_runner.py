@@ -63,7 +63,7 @@ class HiggsTTSModelRunner(ModelRunner):
 
     def _next_wa_host_staging(self, device_buf: torch.Tensor) -> torch.Tensor:
         if self._wa_host_buffers is None:
-            pool_size = self.model._cg_probe_hidden.shape[0]
+            pool_size = self.model._cg_probe_logp.shape[0]
             self._wa_host_buffers = [
                 torch.empty(
                     (pool_size, device_buf.shape[1]),
@@ -931,7 +931,7 @@ class HiggsTTSModelRunner(ModelRunner):
             if wa is not None and data.req.is_chunked == 0 and n >= wa.n_text + 2:
                 row = model.acquire_row(sched_req.request_id)
                 # prompt tail: <|text|> t_0 .. t_{J-1} <|audio|>
-                head.set_text(row, h_all[end - 1 - wa.n_text : end - 1])
+                head.set_text(row, h_all[end - 1 - wa.n_text : end - 1], wa.lo)
                 items.append((b, wa, row, end - 1))
             elif wa is not None:
                 logger.warning(
@@ -949,8 +949,6 @@ class HiggsTTSModelRunner(ModelRunner):
         logp = head.score(
             h_all[torch.tensor([last for _, _, _, last in items], device=device)],
             torch.tensor([row for _, _, row, _ in items], device=device),
-            torch.tensor([wa.lo for _, wa, _, _ in items], device=device),
-            torch.tensor([wa.n_text for _, wa, _, _ in items], device=device),
         ).cpu().numpy()
         out = {}
         for i, (b, wa, _, _) in enumerate(items):
@@ -961,12 +959,11 @@ class HiggsTTSModelRunner(ModelRunner):
     def _word_align_launch(
         self, requests: list
     ) -> tuple[torch.Tensor, dict[int, int]] | None:
-        """GPU half of a decode step: score the probe hidden of every live
-        word-align row against its text bank. Returns ``(logp [P, cap + 1],
-        {batch row: P index})``; the caller moves ``logp`` to the host."""
+        """GPU half of a decode step: the in-graph probe scores of the live
+        word-align rows. Returns ``(logp [P, cap + 1], {batch row: P index})``;
+        the caller moves ``logp`` to the host."""
         model = self.model
-        head = getattr(model, "word_align", None)
-        if head is None:
+        if getattr(model, "word_align", None) is None:
             return None
         rows, wa_index = [], {}
         for b, sched_req in enumerate(requests):
@@ -975,17 +972,14 @@ class HiggsTTSModelRunner(ModelRunner):
             if wa is None or wa.finished or data.req.finished():
                 continue
             wa_index[b] = len(rows)
-            rows.append((b, model.acquire_row(sched_req.request_id), wa))
+            rows.append(b)
         if not rows:
             return None
-        device = model._cg_probe_hidden.device
-        logp = head.score(
-            model._cg_probe_hidden[torch.tensor([b for b, _, _ in rows], device=device)],
-            torch.tensor([row for _, row, _ in rows], device=device),
-            torch.tensor([wa.lo for _, _, wa in rows], device=device),
-            torch.tensor([wa.n_text for _, _, wa in rows], device=device),
-        )
-        return logp, wa_index
+        logp = model._cg_probe_logp
+        if rows == list(range(len(rows))):
+            return logp[: len(rows)], wa_index
+        idx = torch.tensor(rows, dtype=torch.long).to(logp.device, non_blocking=True)
+        return logp[idx], wa_index
 
     @staticmethod
     def _word_align_step(data: Any, logp: Any, codes_N: torch.Tensor | None) -> list | None:

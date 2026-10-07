@@ -253,6 +253,52 @@ Reference output:
   <source src="../_static/audio/higgs-4.wav" type="audio/wav">
 </audio>
 
+### Word timestamps
+
+A small pointer probe on the frozen backbone (`sglang_omni/models/higgs_tts/word_align.py`)
+emits the onset of every word while the audio streams. Serve with the probe
+export (`head.pt` + `config.json`, trained with higgs-mm `experiments/tts/word_align.py`):
+
+```bash
+sgl-omni serve \
+  --model-path bosonai/higgs-audio-v3-tts-4b \
+  --allowed-local-media-path docs/_static/audio \
+  --port 8000 \
+  --word-align-head /path/to/word_align/higgs-tts-3-4b_L18_v0
+```
+
+Opt in per request with `"word_timestamps": true` (off = byte-identical to a
+server without the probe). Words are `{"index", "text", "start_ms"}` with
+`start_ms` measured from the start of the generated audio; English words are
+whitespace-delimited, CJK text is split per character (characters sharing one
+token are merged). With `"stream": true` the response is NDJSON instead of raw
+PCM: one `audio.delta` event per chunk (`audio` = base64 PCM16, `words` = the
+onsets that chunk's audio reaches) and a final `audio.done` with every word:
+
+```bash
+curl -N -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "Get the trust fund to the bank early.",
+    "references": [{"audio_path": "docs/_static/audio/male-voice.wav",
+                    "text": "Hey, Adam here. Let'\''s create something that feels real, sounds human, and connects every time."}],
+    "stream": true, "response_format": "pcm", "word_timestamps": true
+  }'
+# {"type": "audio.delta", "audio": "...", "sample_rate": 24000, "words": []}
+# {"type": "audio.delta", "audio": "...", "sample_rate": 24000, "words": [{"index": 0, "text": "Get", "start_ms": 120}]}
+# ...
+# {"type": "audio.done", "words": [{"index": 0, "text": "Get", "start_ms": 120}, ..., {"index": 7, "text": "early.", "start_ms": 1600}]}
+```
+
+Non-stream requests return the list in the `X-Word-Timestamps` header; the
+WebSocket endpoint sends a `{"type": "words", ...}` event before the audio
+frame that reaches those onsets. Measured on seed-tts voice clones against
+MMS forced alignment: EN median onset error 31 ms (71% within 50 ms, 91%
+within 100 ms), ZH median 66 ms (66% within 100 ms); the probe adds about
+0.2 ms per decode step. Not available with `streaming_protocol`, and a
+`word_timestamps` request bypasses the radix prefix cache (its text-token
+hiddens must be recomputed).
+
 ### Inline Control Tokens
 
 All tags follow `<|category:value|>` syntax and can be inserted mid-utterance.
@@ -571,6 +617,7 @@ Pair each token with the matching onomatopoeia immediately after it.
 | `top_p` | float | `null` | Top-p sampling |
 | `top_k` | int | `null` | Top-k sampling |
 | `seed` | int | `null` | Random seed for reproducibility |
+| `word_timestamps` | bool | `false` | Word onsets from the word-align probe (`--word-align-head`); see [Word timestamps](#word-timestamps) |
 
 
 ### Performance
