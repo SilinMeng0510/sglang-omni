@@ -12,6 +12,7 @@ from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.word_align import release_words
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import StreamingVocoderBase
 from sglang_omni.utils.audio_payload import audio_waveform_payload
@@ -484,6 +485,16 @@ class HiggsStreamingVocoderScheduler(
             if ready:
                 payload["words"] = ready
         return payload
+
+    def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
+        messages = super().on_stream_done(request_id)
+        # the final flush chunk (always present past the holdback) also carries
+        # the complete word list: SSE readers that drop audio-less events still
+        # see it (see openai_api._speech_sse_response)
+        words = HiggsTtsState.from_dict(self._stream_payloads[request_id].data).words
+        if words is not None and messages and messages[0].type == "stream":
+            messages[0].data["words_final"] = words
+        return messages
 
     def fallback_full_decode(
         self, request_id: str, payload: StagePayload, state: _HiggsStreamState

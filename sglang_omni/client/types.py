@@ -144,6 +144,8 @@ class GenerateChunk:
     # end_char, start_ms, end_ms?}); a stream chunk carries the entries its
     # audio reaches, the final chunk the whole utterance
     words: list[dict[str, Any]] | None = None
+    # the complete list, on the last audio chunk and the final chunk
+    words_final: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -163,6 +165,7 @@ class GenerateChunk:
             "audio_data": self.audio_data,
             "sample_rate": self.sample_rate,
             "words": self.words,
+            "words_final": self.words_final,
         }
 
 

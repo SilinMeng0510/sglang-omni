@@ -1442,3 +1442,66 @@ def test_speech_word_timestamps_header_and_json_formats_scale_with_speed() -> No
         json={"input": "hello", "word_timestamps": True, "word_timestamps_dwell": 9},
     )
     assert response.status_code == 400
+
+
+class WordsStreamingSpeechClient(SuccessfulSpeechClient):
+    """Two audio chunks (the second with the full list as words_final, like
+    the vocoder's final flush) and an audio-less terminal chunk."""
+
+    async def generate(self, request: Any, request_id: str | None = None):
+        self.generate_requests.append(request)
+        rid = request_id or "speech-1"
+        yield GenerateChunk(request_id=rid, modality="audio", audio_data=[0.0, 0.1], sample_rate=24000,
+                            words=[{"index": 0, "text": "hi", "start_ms": 100}])
+        yield GenerateChunk(request_id=rid, modality="audio", audio_data=[0.1, 0.0], sample_rate=24000,
+                            words=[{"index": 0, "text": "hi", "start_ms": 100, "end_ms": 300}],
+                            words_final=[{"index": 0, "text": "hi", "start_ms": 100, "end_ms": 300}])
+        yield GenerateChunk(request_id=rid, modality="audio", finish_reason="stop",
+                            words=[{"index": 0, "text": "hi", "start_ms": 100, "end_ms": 300}],
+                            words_final=[{"index": 0, "text": "hi", "start_ms": 100, "end_ms": 300}])
+
+
+def _sse_events(text: str) -> list[Any]:
+    out = []
+    for block in text.split("\n\n"):
+        block = block.strip()
+        if block.startswith("data:"):
+            payload = block[5:].strip()
+            out.append(payload if payload == "[DONE]" else json.loads(payload))
+    return out
+
+
+def test_speech_stream_word_timestamps_is_gateway_shaped_sse() -> None:
+    client = TestClient(create_app(WordsStreamingSpeechClient(), model_name="tts"))
+    with client.stream(
+        "POST",
+        "/v1/audio/speech",
+        json={"input": "hi", "stream": True, "response_format": "pcm", "word_timestamps": True, "speed": 2.0},
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = _sse_events(response.read().decode())
+
+    assert events[-1] == "[DONE]"
+    first, last_audio, terminal = events[0], events[1], events[2]
+    assert set(first) == {"audio", "usage", "words"}
+    assert first["audio"]["sample_rate"] == 24000 and base64.b64decode(first["audio"]["data"])
+    assert first["usage"]["input_chars"] == 2 and first["usage"]["audio_bytes"] == 2  # 1 sample after 2x speed
+    assert first["words"] == [{"index": 0, "text": "hi", "start_ms": 50}]
+    # the last audio-carrying event has the full list (speed-scaled) for readers that skip audio-less events
+    assert last_audio["words_final"] == [{"index": 0, "text": "hi", "start_ms": 50, "end_ms": 150}]
+    assert "audio" not in terminal and terminal["words_final"] == last_audio["words_final"]
+    assert terminal["usage"]["audio_bytes"] == 4 and terminal["usage"]["output_duration_s"] == round(4 / 2 / 24000, 3)
+
+
+def test_speech_stream_include_usage_selects_sse_without_words() -> None:
+    client = TestClient(create_app(SuccessfulSpeechClient(), model_name="tts"))
+    with client.stream(
+        "POST",
+        "/v1/audio/speech",
+        json={"input": "hi", "stream": True, "response_format": "pcm", "stream_options": {"include_usage": True}},
+    ) as response:
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = _sse_events(response.read().decode())
+    assert len(events) == 2 and events[1] == "[DONE]"
+    assert set(events[0]) == {"audio", "usage"} and events[0]["usage"]["audio_bytes"] == 8

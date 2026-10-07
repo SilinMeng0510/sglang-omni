@@ -276,6 +276,10 @@ class LoRAAdapterConfig(BaseModel):
     path: str = Field(min_length=1, max_length=4096)
 
 
+class SpeechStreamOptions(BaseModel):
+    include_usage: bool = False
+
+
 class CreateSpeechRequest(BaseModel):
     """OpenAI-compatible text-to-speech request.
 
@@ -295,6 +299,10 @@ class CreateSpeechRequest(BaseModel):
     response_format: str = "wav"
     speed: float = 1.0
     stream: bool = False
+    # ``{"include_usage": true}`` switches a stream from raw PCM to SSE events
+    # (``data: {"audio": {"data", "sample_rate"}, "usage", ...}``); the same
+    # SSE shape is used when ``word_timestamps`` is on
+    stream_options: SpeechStreamOptions | None = None
 
     # Advanced TTS extensions
     task_type: str | None = None  # e.g. "Base", "CustomVoice", "VoiceDesign"
@@ -306,7 +314,7 @@ class CreateSpeechRequest(BaseModel):
     streaming_protocol: bool = False
     # Word onsets from the Higgs word-align probe (server started with
     # --word-align-head). Non-stream: ``X-Word-Timestamps`` header; stream:
-    # the response becomes NDJSON audio.delta / audio.done events.
+    # the response becomes a gateway-shaped SSE stream with words per event.
     word_timestamps: bool = False
     # minimum frames per token unit in the online decoder (default: the export's)
     word_timestamps_dwell: int | None = Field(default=None, ge=1, le=8)

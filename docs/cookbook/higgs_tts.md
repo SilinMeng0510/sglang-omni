@@ -281,13 +281,18 @@ segmenter, th/km/lo/my with an ICU word iterator; a token straddling a word
 boundary goes to the word holding most of its chars; a word's onset is its
 first token's `start_ms`, its end the last token's `end_ms`. (Qwen's Thai
 tokens are sub-syllable pieces, so the entries are roughly syllables.) With `"stream": true` the
-response is NDJSON instead of raw
-PCM: one `audio.delta` event per chunk (`audio` = base64 PCM16, `words` = the
-entries that chunk's audio reaches: a unit first appears with its `start_ms`,
-and again with `end_ms` once its end is known; within one event each `index`
-appears at most once — if both become releasable in the same chunk the event
-carries one merged entry — and a later event's entry supersedes an earlier
-one) and a final `audio.done` with every entry complete:
+response is an SSE stream (`text/event-stream`) in the shape the boson-serve
+gateway emits for `stream_options.include_usage` — one `data: {"audio":
+{"data": <base64 pcm16>, "sample_rate"}, "usage": {...cumulative}}` event per
+chunk, then `data: [DONE]` — with `words` on every event (the entries that
+chunk's audio reaches: a unit first appears with its `start_ms`, and again
+with `end_ms` once its end is known; within one event each `index` appears
+at most once — if both become releasable in the same chunk the event carries
+one merged entry — and a later event's entry supersedes an earlier one).
+The last audio-carrying event also has `words_final`, the complete list, so
+a reader that skips audio-less events still gets it; a trailing audio-less
+event repeats `words_final`. (`stream_options: {"include_usage": true}`
+alone selects the same SSE shape without `words`.)
 
 ```bash
 curl -N -X POST http://localhost:8000/v1/audio/speech \
@@ -298,11 +303,13 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
                     "text": "Hey, Adam here. Let'\''s create something that feels real, sounds human, and connects every time."}],
     "stream": true, "response_format": "pcm", "word_timestamps": true
   }'
-# {"type": "audio.delta", "audio": "...", "sample_rate": 24000, "words": []}
-# {"type": "audio.delta", "audio": "...", "sample_rate": 24000, "words": [{"index": 0, "text": "Get", "start_char": 0, "end_char": 3, "start_ms": 120}]}
-# {"type": "audio.delta", "audio": "...", "sample_rate": 24000, "words": [{"index": 0, "text": "Get", "start_char": 0, "end_char": 3, "start_ms": 120, "end_ms": 320}, {"index": 1, "text": " the", "start_char": 3, "end_char": 7, "start_ms": 320}]}
+# data: {"audio": {"data": "...", "sample_rate": 24000}, "usage": {"input_chars": 37, "audio_bytes": 5760, "sample_rate": 24000, "output_duration_s": 0.12}, "words": []}
+# data: {"audio": {...}, "usage": {...}, "words": [{"index": 0, "text": "Get", "start_char": 0, "end_char": 3, "start_ms": 120}]}
+# data: {"audio": {...}, "usage": {...}, "words": [{"index": 0, "text": "Get", "start_char": 0, "end_char": 3, "start_ms": 120, "end_ms": 320}, {"index": 1, "text": " the", "start_char": 3, "end_char": 7, "start_ms": 320}]}
 # ...
-# {"type": "audio.done", "words": [{"index": 0, "text": "Get", ..., "start_ms": 120, "end_ms": 320}, ..., {"index": 7, "text": " early.", "start_char": 29, "end_char": 36, "start_ms": 1600, "end_ms": 2080}]}
+# data: {"audio": {...}, "usage": {...}, "words": [...], "words_final": [{"index": 0, ..., "end_ms": 320}, ..., {"index": 7, "text": " early.", "start_char": 29, "end_char": 36, "start_ms": 1600, "end_ms": 2080}]}
+# data: {"words_final": [...same...], "usage": {...}}
+# data: [DONE]
 ```
 
 Non-stream requests return the list in the `X-Word-Timestamps` header

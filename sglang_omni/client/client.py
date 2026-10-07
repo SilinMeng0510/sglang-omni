@@ -437,6 +437,9 @@ class Client:
         words = data.get("words")
         if words is not None:
             chunk.words = words
+        words_final = data.get("words_final")
+        if words_final is not None:
+            chunk.words_final = words_final
 
     @staticmethod
     def _build_usage_info(data: dict[str, Any]) -> UsageInfo | None:

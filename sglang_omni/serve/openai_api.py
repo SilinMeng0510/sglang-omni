@@ -1245,12 +1245,16 @@ def _register_speech(app: FastAPI) -> None:
         except SpeechAPIError as exc:
             return speech_error_response(exc)
 
-        if req.stream and req.word_timestamps:
-            return _speech_words_response(
+        if req.stream and (
+            req.word_timestamps
+            or (req.stream_options is not None and req.stream_options.include_usage)
+        ):
+            return _speech_sse_response(
                 client=client,
                 gen_req=gen_req,
                 request_id=request_id,
                 speed=req.speed,
+                input_text=req.input,
             )
         if req.stream:
             try:
@@ -1416,42 +1420,60 @@ def _speech_pcm_chunk_bytes(
     return audio_bytes, emitted_samples, sample_rate
 
 
-def _speech_words_response(
+def _speech_sse_response(
     client: Client,
     gen_req: GenerateRequest,
     request_id: str,
     speed: float,
+    input_text: str,
 ) -> StreamingResponse:
-    """``word_timestamps`` + ``stream``: NDJSON events instead of raw PCM, since
-    PCM has no in-band channel. ``{"type": "audio.delta", "audio": <base64
-    pcm16>, "sample_rate", "words": [...]}`` per chunk (``words`` = the onsets
-    this chunk's audio reaches) and a final ``{"type": "audio.done", "words":
-    [...]}`` with every word of the utterance."""
+    """SSE speech stream in the boson-serve gateway's shape (what it emits for
+    ``stream_options.include_usage``): one ``data: {"audio": {"data": <base64
+    pcm16>, "sample_rate"}, "usage": {...cumulative}}`` event per chunk, then
+    ``data: [DONE]``. With ``word_timestamps`` every event also carries
+    ``words`` (the entries that chunk's audio reaches) and the last
+    audio-carrying event ``words_final`` (the complete list), so a reader that
+    skips audio-less events still gets it; a trailing audio-less event repeats
+    ``words_final`` for direct clients."""
     chunk_stream = client.generate(gen_req, request_id=request_id)
+    input_chars = len(input_text)
+
+    def usage(total_bytes: int, sample_rate: int) -> dict[str, Any]:
+        return {
+            "input_chars": input_chars,
+            "audio_bytes": total_bytes,
+            "sample_rate": sample_rate,
+            "output_duration_s": round(total_bytes / 2 / sample_rate, 3),
+        }
 
     async def _body():
-        emitted_samples = 0
+        emitted_samples = total_bytes = 0
+        sample_rate = DEFAULT_SAMPLE_RATE
         active_request = True
         try:
             async for chunk in chunk_stream:
-                audio_bytes = None
+                event: dict[str, Any] = {}
                 if chunk.audio_data is not None:
                     audio_bytes, emitted_samples, sample_rate = _speech_pcm_chunk_bytes(
                         chunk, emitted_samples=emitted_samples, speed=speed
                     )
-                words = scale_word_times(chunk.words, speed) or []
-                if chunk.finish_reason is not None:
-                    event = {"type": "audio.done", "words": words}
-                elif audio_bytes is None:
+                    if audio_bytes is not None:
+                        total_bytes += len(audio_bytes)
+                        event["audio"] = {
+                            "data": base64.b64encode(audio_bytes).decode("ascii"),
+                            "sample_rate": sample_rate,
+                        }
+                words = scale_word_times(chunk.words, speed)
+                words_final = scale_word_times(chunk.words_final, speed)
+                if words is not None:
+                    event["words"] = words
+                if words_final is not None:
+                    event["words_final"] = words_final
+                if "audio" not in event and words_final is None:
                     continue
-                else:
-                    event = {
-                        "type": "audio.delta",
-                        "audio": base64.b64encode(audio_bytes).decode("ascii"),
-                        "sample_rate": sample_rate,
-                        "words": words,
-                    }
-                yield json.dumps(event, ensure_ascii=False) + "\n"
+                event["usage"] = usage(total_bytes, sample_rate)
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
             active_request = False
         finally:
             if active_request:
@@ -1459,7 +1481,7 @@ def _speech_words_response(
             else:
                 await _close_async_iterator_if_supported(chunk_stream)
 
-    return StreamingResponse(_body(), media_type="application/x-ndjson")
+    return StreamingResponse(_body(), media_type="text/event-stream")
 
 
 async def _speech_audio_response(
