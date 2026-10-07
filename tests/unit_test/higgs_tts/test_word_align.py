@@ -159,3 +159,35 @@ def test_release_words_one_entry_per_index_per_event():
     ready, left = release_words(left, 800)
     assert ready == [{"index": 1, "text": "b", "start_ms": 320, "end_ms": 640},
                      {"index": 2, "text": "c", "start_ms": 700}] and left == []
+
+
+class _PieceTok:
+    """Tokenizer with a fixed list of pieces (offsets by concatenation)."""
+
+    def __init__(self, pieces):
+        self.pieces = pieces
+
+    def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+        offs, i = [], 0
+        for p in self.pieces:
+            assert text[i : i + len(p)] == p, (text, p, i)
+            offs.append((i, i + len(p)))
+            i += len(p)
+        assert i == len(text)
+        return {"input_ids": list(range(len(offs))), "offset_mapping": offs}
+
+
+def test_plan_word_align_folds_combining_marks():
+    # Thai: vowel signs / tone marks (Mn) alone fold into the previous token
+    text = "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35\u0e04\u0e23\u0e31\u0e1a"  # สวัสดีครับ
+    pieces = ["\u0e2a\u0e27", "\u0e31", "\u0e2a\u0e14", "\u0e35", "\u0e04\u0e23", "\u0e31\u0e1a"]
+    plan = plan_word_align(_PieceTok(pieces), text, text_cap=64)
+    assert plan["words"] == ["\u0e2a\u0e27\u0e31", "\u0e2a\u0e14\u0e35", "\u0e04\u0e23", "\u0e31\u0e1a"]
+    assert plan["ranges"] == [[0, 2], [2, 4], [4, 5], [5, 6]]
+    assert plan["chars"] == [[0, 3], [3, 6], [6, 8], [8, 10]]
+    # Devanagari: a matra-only token (Mc) folds too; a leading mark is dropped
+    text = "\u093f\u0928\u092e\u0938\u094d\u0924\u0947"  # िनमस्ते
+    pieces = ["\u093f", "\u0928\u092e", "\u0938", "\u094d", "\u0924", "\u0947"]
+    plan = plan_word_align(_PieceTok(pieces), text, text_cap=64)
+    assert plan["words"] == ["\u0928\u092e", "\u0938\u094d", "\u0924\u0947"]
+    assert plan["chars"] == [[1, 3], [3, 5], [5, 7]]

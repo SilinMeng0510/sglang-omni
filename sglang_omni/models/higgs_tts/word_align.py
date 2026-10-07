@@ -20,7 +20,8 @@ the gap or straight into word ``j + 1``; no gap means ``end == next onset``).
 
 Units are the text tokens themselves (one entry per token outside ``<|...|>``
 tags, with its char span; tokens without a content char -- whitespace,
-punctuation -- are folded into the preceding entry): regrouping into words is
+punctuation, combining marks -- are folded into the preceding entry):
+regrouping into words is
 the client's job from ``start_char`` / ``end_char``.
 
 Conventions (export ``config.json``): the hidden that PREDICTS frame ``t`` --
@@ -48,7 +49,9 @@ _TAG = re.compile(r"<\|[^|<>]*\|>")
 
 
 def _content(ch: str) -> bool:
-    return not ch.isspace() and unicodedata.category(ch)[0] not in "PSZ"
+    # punctuation, symbols, separators and combining marks (Thai / Lao vowel
+    # signs and tone marks, Indic matras, diacritics) carry no unit of their own
+    return not ch.isspace() and unicodedata.category(ch)[0] not in "PSZM"
 
 
 def plan_word_align(
@@ -57,7 +60,8 @@ def plan_word_align(
     """Preprocessing-stage plan: one unit per token of
     ``tokenizer.encode(text, add_special_tokens=False)`` outside ``<|...|>``
     tags, as token ranges ``[lo, hi)`` and char spans ``[s, e)``; tokens with
-    no content char join the preceding unit (their chars extend its span)."""
+    no content char (whitespace, punctuation, combining marks only) join the
+    preceding unit (their chars extend its span)."""
     enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
     n_text = len(enc["input_ids"])
     if n_text > text_cap:

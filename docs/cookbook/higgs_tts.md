@@ -271,15 +271,15 @@ Opt in per request with `"word_timestamps": true` (off = byte-identical to a
 server without the probe). The server emits one entry per **text token**
 outside control tags, `{"index", "text", "start_char", "end_char", "start_ms",
 "end_ms"}`: times from the start of the generated audio, char offsets into the
-`input` string (tokens with no content char — whitespace, punctuation — are
-folded into the preceding entry, whose `end_char` then covers them).
+`input` string (tokens with no content char — whitespace, punctuation,
+combining marks such as Thai vowel signs or Indic matras — are folded into
+the preceding entry, whose `end_char` then covers them).
 Regrouping tokens into words is the client's or gateway's job using the char
 offsets: whitespace scripts split at spaces, CJK per character or with a
 segmenter, th/km/lo/my with an ICU word iterator; a token straddling a word
 boundary goes to the word holding most of its chars; a word's onset is its
 first token's `start_ms`, its end the last token's `end_ms`. (Qwen's Thai
-tokens are sub-syllable pieces; combining-mark tokens come out as zero-length
-units at the frame the mass passes through.) With `"stream": true` the
+tokens are sub-syllable pieces, so the entries are roughly syllables.) With `"stream": true` the
 response is NDJSON instead of raw
 PCM: one `audio.delta` event per chunk (`audio` = base64 PCM16, `words` = the
 entries that chunk's audio reaches: a unit first appears with its `start_ms`,
