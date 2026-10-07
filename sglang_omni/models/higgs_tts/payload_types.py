@@ -57,6 +57,11 @@ class HiggsTtsState(PipelineStateBase):
     return_omni_rollout: bool = False
     output_audio: bool = True
 
+    # word timestamps (word_align.py): the preprocessing plan in, the
+    # committed onsets out
+    word_align: dict[str, Any] | None = None
+    words: list[dict[str, Any]] | None = None
+
     # tts_engine
     output_codes_delayed: list[list[int]] | None = None
     omni_rollout: dict[str, Any] | None = None
@@ -107,6 +112,10 @@ class HiggsTtsState(PipelineStateBase):
                 data[key] = True
         if not self.output_audio:
             data["output_audio"] = False
+        if self.word_align is not None:
+            data["word_align"] = self.word_align
+        if self.words is not None:
+            data["words"] = self.words
         if self.output_codes_delayed is not None:
             data["output_codes_delayed"] = self.output_codes_delayed
         if self.omni_rollout is not None:
@@ -146,6 +155,8 @@ class HiggsTtsState(PipelineStateBase):
             return_logprob=data.get("return_logprob", False),
             return_omni_rollout=data.get("return_omni_rollout", False),
             output_audio=data.get("output_audio", True),
+            word_align=data.get("word_align"),
+            words=data.get("words"),
             output_codes_delayed=data.get("output_codes_delayed"),
             omni_rollout=data.get("omni_rollout"),
             prompt_tokens=data.get("prompt_tokens", 0),

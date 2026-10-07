@@ -223,6 +223,40 @@ class HiggsTTSModel(nn.Module):
         # rids whose PREFILL must not run the audio sampler (streaming
         # protocol: the prompt's last position outputs a text-head decision).
         self._streaming_rids: set[str] = set()
+        # Word-timestamp probe (see word_align.py), loaded by
+        # ``load_word_align_probe`` before CUDA-graph capture; None = off.
+        self.word_align: Any = None
+        self._cg_probe_hidden: torch.Tensor | None = None
+        self._probe_prefill_hidden: torch.Tensor | None = None
+
+    def load_word_align_probe(self, export_dir: str, *, text_cap: int = 1024) -> None:
+        """Enable the word-timestamp probe: the backbone also returns the
+        probe layer's hidden (sglang's aux ``layers_to_capture`` add, which
+        is captured inside the CUDA graph) and ``forward`` copies it into
+        the static ``_cg_probe_hidden[:bs]`` buffer (decode) or keeps the
+        fresh tensor (prefill) for the runner to read after the step."""
+        from sglang_omni.models.higgs_tts.word_align import WordAlignHead
+
+        device = self.backbone.model.embed_tokens.weight.device
+        pool_size = self._sampler_pool_max_running_requests + 1
+        head = WordAlignHead(
+            export_dir, pool_size=pool_size, device=device, text_cap=text_cap
+        )
+        hidden_size = int(self.backbone.config.hidden_size)
+        if head.hidden_size != hidden_size:
+            raise ValueError(
+                f"word-align head expects hidden size {head.hidden_size}, "
+                f"backbone has {hidden_size}"
+            )
+        # aux index k = the input of decoder layer k = the output of k layers
+        self.backbone.model.layers_to_capture = [head.layer]
+        self._cg_probe_hidden = torch.zeros(
+            pool_size,
+            hidden_size,
+            dtype=self.backbone.model.embed_tokens.weight.dtype,
+            device=device,
+        )
+        self.word_align = head
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.backbone.get_input_embeddings()
@@ -479,6 +513,14 @@ class HiggsTTSModel(nn.Module):
             forward_batch,
             input_embeds,
         )
+        if isinstance(hidden_states, tuple):
+            # (final hidden, [probe-layer hidden]) with the word-align probe on
+            hidden_states, aux_hidden_states = hidden_states
+            probe_hidden = aux_hidden_states[0]
+            if is_decode:
+                self._cg_probe_hidden[: probe_hidden.shape[0]].copy_(probe_hidden)
+            else:
+                self._probe_prefill_hidden = probe_hidden
 
         if (
             not is_decode

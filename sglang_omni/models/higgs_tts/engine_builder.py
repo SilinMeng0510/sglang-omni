@@ -33,6 +33,8 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         lora_max_rank: int = 32,
         lora_max_cached_adapters: int = 8,
         serve_model_name: str = "",
+        word_align_head: str | None = None,
+        word_align_text_cap: int = 1024,
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.max_running_requests = max_running_requests
@@ -45,6 +47,8 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         self.lora_max_rank = lora_max_rank
         self.lora_max_cached_adapters = lora_max_cached_adapters
         self.serve_model_name = serve_model_name
+        self.word_align_head = word_align_head
+        self.word_align_text_cap = word_align_text_cap
         self.model: Any | None = None
         self.model_worker: Any | None = None
 
@@ -104,6 +108,16 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         self.model_worker = model_worker
         self.model = model_worker.model_runner.model
         higgs_utils.truncate_rope_to_bf16(self.model)
+        if self.word_align_head is not None:
+            # before CUDA-graph capture: the probe-layer add is part of the graph
+            self.model.load_word_align_probe(
+                self.word_align_head, text_cap=self.word_align_text_cap
+            )
+            logger.info(
+                "Higgs word-align probe loaded from %s (layer %d)",
+                self.word_align_head,
+                self.model.word_align.layer,
+            )
 
     def get_model_buffer_bs(self, model: Any) -> int | None:
         return model.sampler_pool_max_running_requests

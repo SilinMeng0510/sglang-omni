@@ -255,6 +255,7 @@ class Client:
             format=actual_format,
             sample_rate=sample_rate,
             usage=last_chunk.usage if last_chunk else None,
+            words=last_chunk.words if last_chunk else None,
         )
 
     # ------------------------------------------------------------------
@@ -433,6 +434,9 @@ class Client:
         sample_rate = data.get("sample_rate")
         if sample_rate is not None:
             chunk.sample_rate = sample_rate
+        words = data.get("words")
+        if words is not None:
+            chunk.words = words
 
     @staticmethod
     def _build_usage_info(data: dict[str, Any]) -> UsageInfo | None:

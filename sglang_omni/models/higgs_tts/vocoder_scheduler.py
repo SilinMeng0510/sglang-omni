@@ -26,6 +26,8 @@ class _HiggsStreamState:
     codebook_size: int | None = None
     next_emit_frame: int = 0
     startup_full_chunks_emitted: int = 0
+    # word onsets from the engine (word_align.py) not yet sent to the client
+    words_pending: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -204,6 +206,12 @@ class HiggsStreamingVocoderScheduler(
     ) -> None:
         del request_id
         state.delayed_rows.append(codes)
+
+    def _ingest_stream_item(self, request_id: str, item: Any) -> _HiggsStreamState | None:
+        state = super()._ingest_stream_item(request_id, item)
+        if state is not None and isinstance(item.metadata, dict):
+            state.words_pending.extend(item.metadata.get("words") or ())
+        return state
 
     def decode_delta(
         self, request_id: str, state: _HiggsStreamState, *, is_final: bool
@@ -460,13 +468,23 @@ class HiggsStreamingVocoderScheduler(
         return codes, counts
 
     def stream_payload(self, request_id: str, waveform: torch.Tensor) -> dict[str, Any]:
-        del request_id
-        return audio_waveform_payload(
+        payload = audio_waveform_payload(
             waveform,
             sample_rate=self._sample_rate,
             modality="audio",
             source_hint="Higgs TTS streaming",
         )
+        state = self._stream_states.get(request_id)
+        if state is not None and state.words_pending:
+            # a word rides with the first chunk whose audio reaches its onset
+            end_ms = state.emitted_raw_frames * 1000 // 25
+            ready = [w for w in state.words_pending if w["start_ms"] < end_ms]
+            if ready:
+                payload["words"] = ready
+                state.words_pending = [
+                    w for w in state.words_pending if w["start_ms"] >= end_ms
+                ]
+        return payload
 
     def fallback_full_decode(
         self, request_id: str, payload: StagePayload, state: _HiggsStreamState
@@ -488,6 +506,8 @@ class HiggsStreamingVocoderScheduler(
             final_data["usage"] = usage
         if final_state.omni_rollout is not None:
             final_data["omni_rollout"] = final_state.omni_rollout
+        if final_state.words is not None:
+            final_data["words"] = final_state.words
         return final_data
 
     @staticmethod
@@ -601,6 +621,8 @@ class HiggsStreamingVocoderScheduler(
             data["usage"] = usage
         if state.omni_rollout is not None:
             data["omni_rollout"] = state.omni_rollout
+        if state.words is not None:
+            data["words"] = state.words
         payload.data = data
         return payload
 

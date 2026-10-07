@@ -589,6 +589,17 @@ class SpeechWebSocketSession:
                     sample_rate=sample_rate,
                 )
                 started = True
+            if chunk.words:
+                # word onsets (ms from this sentence's audio start) reached by
+                # the audio frame that follows
+                await self._send_json(
+                    {
+                        "type": "words",
+                        "id": request_id,
+                        "sentence_index": sentence_index,
+                        "words": chunk.words,
+                    }
+                )
             await self._send_audio_frame(audio_bytes, active_request_id=request_id)
             total_bytes += len(audio_bytes)
             chunk_count += 1
@@ -626,6 +637,15 @@ class SpeechWebSocketSession:
             sentence=sentence,
             sample_rate=result.sample_rate or DEFAULT_SAMPLE_RATE,
         )
+        if result.words:
+            await self._send_json(
+                {
+                    "type": "words",
+                    "id": request_id,
+                    "sentence_index": sentence_index,
+                    "words": result.words,
+                }
+            )
         await self._send_audio_frame(result.audio_bytes)
         return len(result.audio_bytes)
 

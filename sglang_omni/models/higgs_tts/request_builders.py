@@ -23,6 +23,7 @@ from sglang_omni.models.higgs_tts.streaming_protocol import (
     StreamingProtocolConfig,
     StreamingProtocolState,
 )
+from sglang_omni.models.higgs_tts.word_align import WordAlignRequest
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
@@ -50,6 +51,8 @@ class HiggsSGLangRequestData(SGLangARRequestData):
     input_starved: bool = False
     watchdog_recent_rows: list[tuple[int, ...]] = field(default_factory=list)
     watchdog_repeat_rows: int = 0
+    # word-timestamp decoder (word_align.py); None = not requested
+    word_align: WordAlignRequest | None = None
 
 
 class _ResettableHiggsModel(Protocol):
@@ -108,7 +111,7 @@ def _build_protocol_state(state: HiggsTtsState) -> StreamingProtocolState:
 
 
 def build_sglang_higgs_request(
-    state: HiggsTtsState, *, request_id: str = ""
+    state: HiggsTtsState, *, request_id: str = "", word_align_head: Any = None
 ) -> HiggsSGLangRequestData:
     if (
         state.streaming_protocol
@@ -118,6 +121,17 @@ def build_sglang_higgs_request(
         raise ValueError(
             "incremental (WebSocket) streaming input does not support "
             "return_omni_rollout/logprob capture"
+        )
+    word_align = None
+    if state.word_align is not None:
+        if word_align_head is None:
+            raise ValueError(
+                "word_timestamps requested but the engine has no word-align probe"
+            )
+        if state.streaming_protocol:
+            raise ValueError("word_timestamps is not supported with streaming_protocol")
+        word_align = WordAlignRequest(
+            state.word_align, dwell=word_align_head.dwell, p_adv=word_align_head.p_adv
         )
     input_ids_list = list(state.prompt_token_ids)
     input_ids = torch.tensor(input_ids_list, dtype=torch.long)
@@ -144,6 +158,10 @@ def build_sglang_higgs_request(
     extra_key = _ref_audio_fingerprint(state.reference_codes_delayed)
     if state.streaming_incremental:
         extra_key = f"{extra_key or 'zero-shot'}:{request_id}"
+    elif word_align is not None:
+        # the probe needs the text tokens' hiddens, so the prompt must not
+        # be served from the radix cache: a private namespace per request
+        extra_key = f"{extra_key or 'zero-shot'}:wa:{request_id}"
     req = Req(
         rid=request_id,
         origin_input_text="",
@@ -172,6 +190,7 @@ def build_sglang_higgs_request(
         protocol_state=(
             _build_protocol_state(state) if state.streaming_protocol else None
         ),
+        word_align=word_align,
     )
 
 
@@ -237,6 +256,10 @@ def apply_higgs_result(state: HiggsTtsState, data: HiggsSGLangRequestData) -> No
                 audio_token_id=proto.cfg.audio_token_id,
                 frames_per_block=proto.cfg.frames_per_block,
             )
+    word_align = getattr(data, "word_align", None)
+    if word_align is not None:
+        word_align.finish()
+        state.words = word_align.all_words()
     state.prompt_tokens = len(data.input_ids)
 
 
@@ -260,7 +283,11 @@ def make_higgs_scheduler_adapters(
                 int(state.max_new_tokens),
                 int(max_new_tokens_cap),
             )
-        data = build_sglang_higgs_request(state, request_id=payload.request_id)
+        data = build_sglang_higgs_request(
+            state,
+            request_id=payload.request_id,
+            word_align_head=getattr(model, "word_align", None),
+        )
         data.engine_start_s = _perf_counter()
         data.stage_payload = payload
         data.stream_metadata = build_higgs_stream_metadata(payload, data)

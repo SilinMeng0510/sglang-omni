@@ -45,6 +45,7 @@ from sglang_omni.models.higgs_tts.utils import (
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (
     HiggsStreamingVocoderScheduler,
 )
+from sglang_omni.models.higgs_tts.word_align import plan_word_align
 
 # _REF_PATH_HASH_MEMO is the shared memo object, re-exported so tests can
 # reset it; the underscored alias keeps this module's historical API.
@@ -148,13 +149,17 @@ def create_preprocessing_executor(
     num_codebooks: int = 8,
     codebook_size: int = 1026,
     max_concurrency: int = 16,
+    word_align_head: str | None = None,
+    word_align_text_cap: int = 1024,
 ):
     """CPU stage: text tokenize + optional ref-audio file IO.
 
     Builds the full prompt + delays the codes when the client supplied
     pre-encoded ``reference_codes``. When raw audio is supplied, defers
     codec encoding (and prompt assembly) to the audio_encoder stage —
-    only the loaded waveform is shipped forward.
+    only the loaded waveform is shipped forward. With ``word_align_head``
+    set (the engine serves the probe), ``params["word_timestamps"]`` adds
+    the word -> text-token plan the engine aligns against.
     """
     checkpoint_dir = resolve_checkpoint(model_path)
 
@@ -215,6 +220,18 @@ def create_preprocessing_executor(
                 "streaming_protocol requested but this checkpoint's tokenizer "
                 "has no <|streaming_tts|> token (not a streaming-trained model)"
             )
+        word_align = None
+        if bool(params.get("word_timestamps", False)):
+            if word_align_head is None:
+                raise ValueError(
+                    "word_timestamps requested but the server was started "
+                    "without --word-align-head"
+                )
+            if streaming_protocol:
+                raise ValueError(
+                    "word_timestamps is not supported with streaming_protocol"
+                )
+            word_align = plan_word_align(tokenizer, text, word_align_text_cap)
         ref_codes_TN = to_codes_TN(inputs.get("reference_codes"), num_codebooks)
         if ref_codes_TN is not None and ref_codes_TN.shape[0] > _MAX_REF_AUDIO_SEC * 75:
             raise ValueError(
@@ -339,6 +356,7 @@ def create_preprocessing_executor(
             return_logprob=bool(params.get("return_logprob", False)),
             return_omni_rollout=bool(params.get("return_omni_rollout", False)),
             output_audio=output_audio,
+            word_align=word_align,
         )
         payload.data = state.to_dict()
         return payload
@@ -453,6 +471,8 @@ def create_sglang_tts_engine_executor(
     lora_max_rank: int = 32,
     lora_max_cached_adapters: int = 8,
     serve_model_name: str | None = None,
+    word_align_head: str | None = None,
+    word_align_text_cap: int = 1024,
 ):
     """sglang-backed AR engine for Higgs TTS."""
     from sglang_omni.models.higgs_tts.engine_builder import HiggsTtsEngineBuilder
@@ -469,6 +489,8 @@ def create_sglang_tts_engine_executor(
         lora_max_rank=lora_max_rank,
         lora_max_cached_adapters=lora_max_cached_adapters,
         serve_model_name=serve_model_name or model_path,
+        word_align_head=word_align_head,
+        word_align_text_cap=word_align_text_cap,
     ).build(
         model_path,
         device=device,

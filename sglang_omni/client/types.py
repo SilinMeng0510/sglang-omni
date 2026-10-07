@@ -140,6 +140,9 @@ class GenerateChunk:
     modality: str = "text"
     audio_data: Any = None
     sample_rate: int | None = None
+    # TTS word timestamps ({index, text, start_ms}); a stream chunk carries the
+    # words its audio reaches, the final chunk the whole utterance
+    words: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -158,6 +161,7 @@ class GenerateChunk:
             "modality": self.modality,
             "audio_data": self.audio_data,
             "sample_rate": self.sample_rate,
+            "words": self.words,
         }
 
 
@@ -227,6 +231,7 @@ class SpeechResult:
     format: str
     sample_rate: int | None = None
     usage: UsageInfo | None = None
+    words: list[dict[str, Any]] | None = None
 
 
 class ClientError(Exception):

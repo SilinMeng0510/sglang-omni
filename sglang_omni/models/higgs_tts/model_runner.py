@@ -42,6 +42,9 @@ class HiggsTTSModelRunner(ModelRunner):
         # Ping-pong pinned host buffers for the async-decode rollout-logprob D2H.
         self._logprob_host_buffers: list[torch.Tensor] | None = None
         self._logprob_slot = 0
+        # Same for the word-align probe scores (word_align.py).
+        self._wa_host_buffers: list[torch.Tensor] | None = None
+        self._wa_slot = 0
 
     def _next_logprob_host_staging(self, device_buf: torch.Tensor) -> torch.Tensor:
         if self._logprob_host_buffers is None:
@@ -56,6 +59,22 @@ class HiggsTTSModelRunner(ModelRunner):
             ]
         buf = self._logprob_host_buffers[self._logprob_slot]
         self._logprob_slot ^= 1
+        return buf
+
+    def _next_wa_host_staging(self, device_buf: torch.Tensor) -> torch.Tensor:
+        if self._wa_host_buffers is None:
+            pool_size = self.model._cg_probe_hidden.shape[0]
+            self._wa_host_buffers = [
+                torch.empty(
+                    (pool_size, device_buf.shape[1]),
+                    dtype=device_buf.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                for _ in range(2)
+            ]
+        buf = self._wa_host_buffers[self._wa_slot]
+        self._wa_slot ^= 1
         return buf
 
     def set_stream_outbox(self, outbox: Any) -> None:
@@ -120,6 +139,13 @@ class HiggsTTSModelRunner(ModelRunner):
             logprobs_BN = self._decode_step_logprobs(result, n_real)
             logprob_host = self._next_logprob_host_staging(logprobs_BN)
             logprob_host[:n_real].copy_(logprobs_BN[:n_real], non_blocking=True)
+        wa_host = None
+        wa = self._word_align_launch(requests)
+        if wa is not None:
+            logp, wa_index = wa
+            wa_buf = self._next_wa_host_staging(logp)
+            wa_buf[: logp.shape[0]].copy_(logp, non_blocking=True)
+            wa_host = (wa_buf, wa_index)
         # Set next_token_ids (cb0) from GPU state now, with NO host sync, so the
         # AR input chain (next step's input_ids = this step's output_ids) is
         # available at launch — the host collect (post_decode_resolve) lags by
@@ -147,7 +173,7 @@ class HiggsTTSModelRunner(ModelRunner):
                 device, non_blocking=True
             )
             result.next_token_ids[idx] = vals
-        return host_buf, logprob_host
+        return host_buf, logprob_host, wa_host
 
     def post_decode_resolve(
         self, host_buf, result, forward_batch, schedule_batch, requests
@@ -160,7 +186,7 @@ class HiggsTTSModelRunner(ModelRunner):
         if len(requests) == 0:
             return
         n_real = len(requests)
-        host_buf, logprob_host = host_buf
+        host_buf, logprob_host, wa_host = host_buf
         logprobs_cpu = None if logprob_host is None else logprob_host[:n_real]
         self._decode_collect_host(
             host_buf[:n_real],
@@ -168,6 +194,7 @@ class HiggsTTSModelRunner(ModelRunner):
             result,
             requests,
             next_token_device=None,
+            word_align=wa_host,
         )
 
     def _populate_cg_buffers(
@@ -565,12 +592,16 @@ class HiggsTTSModelRunner(ModelRunner):
         logprobs_cpu = None
         if self._should_capture_rollout_logprobs(requests):
             logprobs_cpu = self._decode_step_logprobs(result, n_real)[:n_real].cpu()
+        wa = self._word_align_launch(requests)
+        if wa is not None:
+            wa = (wa[0].cpu(), wa[1])
         self._decode_collect_host(
             combined_cpu,
             logprobs_cpu,
             result,
             requests,
             next_token_device=result.logits_output.next_token_logits.device,
+            word_align=wa,
         )
 
     def _decode_pack_gpu(self, n_real: int) -> torch.Tensor:
@@ -603,6 +634,7 @@ class HiggsTTSModelRunner(ModelRunner):
         requests: list,
         *,
         next_token_device: torch.device | None,
+        word_align: tuple[torch.Tensor, dict[int, int]] | None = None,
     ) -> None:
         """Host-side collect loop over an already-D2H'd staging snapshot:
         append per-request codes, mark finishes, build ``result.next_token_ids``.
@@ -681,7 +713,12 @@ class HiggsTTSModelRunner(ModelRunner):
             ):
                 data.output_logprobs.append(logprobs_cpu[b].to(torch.float32).clone())
             data.generation_done = bool(gen_done_after_cpu[b])
-            self._emit_code_chunk(sched_req, codes_N)
+            words = None
+            if word_align is not None and b in word_align[1]:
+                words = self._word_align_step(
+                    data, word_align[0][word_align[1][b]].numpy(), codes_N
+                )
+            self._emit_code_chunk(sched_req, codes_N, words)
             self._mark_sampler_finished(req, data.generation_done)
             cb0_per_row.append(int(codes_N[0].item()))
 
@@ -757,6 +794,7 @@ class HiggsTTSModelRunner(ModelRunner):
             )
             else {}
         )
+        wa_words = self._word_align_prefill(requests)
         cb0_per_row: list[int] = []
         for b, sched_req in enumerate(requests):
             data = sched_req.data
@@ -786,7 +824,7 @@ class HiggsTTSModelRunner(ModelRunner):
             ):
                 data.output_logprobs.append(logprobs_BN[b].detach().cpu().clone())
             data.generation_done = bool(model._sampler_pool.generation_done[row].item())
-            self._emit_code_chunk(sched_req, data.output_codes[-1])
+            self._emit_code_chunk(sched_req, data.output_codes[-1], wa_words.get(b))
             self._mark_sampler_finished(req, data.generation_done)
             cb0_per_row.append(int(codes_N[0].item()))
 
@@ -871,12 +909,110 @@ class HiggsTTSModelRunner(ModelRunner):
         if generation_done and req.finished_reason is None:
             req.finished_reason = FINISH_MATCHED_TOKEN(EOC_ID)
 
-    def _emit_code_chunk(self, sched_req: Any, codes_N: torch.Tensor) -> None:
+    # ---- word-timestamp probe (word_align.py) ----
+
+    def _word_align_prefill(self, requests: list) -> dict[int, list]:
+        """Project every word-align request's text-token hiddens (probe
+        layer, this prefill) into its bank row and score frame 0 from the
+        hidden at ``<|audio|>``. Returns {row index: words committed}."""
+        model = self.model
+        head = getattr(model, "word_align", None)
+        h_all = getattr(model, "_probe_prefill_hidden", None)
+        if head is None or h_all is None:
+            return {}
+        model._probe_prefill_hidden = None
+        items: list[tuple[int, Any, int, int]] = []
+        offset = 0
+        for b, sched_req in enumerate(requests):
+            data = sched_req.data
+            n = int(data.req.extend_input_len)
+            end = offset + n
+            wa = getattr(data, "word_align", None)
+            if wa is not None and data.req.is_chunked == 0 and n >= wa.n_text + 2:
+                row = model.acquire_row(sched_req.request_id)
+                # prompt tail: <|text|> t_0 .. t_{J-1} <|audio|>
+                head.set_text(row, h_all[end - 1 - wa.n_text : end - 1])
+                items.append((b, wa, row, end - 1))
+            elif wa is not None:
+                logger.warning(
+                    "word_timestamps %s: prompt not fully prefilled "
+                    "(extend=%d, text=%d); no timestamps",
+                    sched_req.request_id,
+                    n,
+                    wa.n_text,
+                )
+                data.word_align = None
+            offset = end
+        if not items:
+            return {}
+        device = h_all.device
+        logp = head.score(
+            h_all[torch.tensor([last for _, _, _, last in items], device=device)],
+            torch.tensor([row for _, _, row, _ in items], device=device),
+            torch.tensor([wa.lo for _, wa, _, _ in items], device=device),
+            torch.tensor([wa.n_text for _, wa, _, _ in items], device=device),
+        ).cpu().numpy()
+        out = {}
+        for i, (b, wa, _, _) in enumerate(items):
+            codes_N = model._output_codes.get(requests[b].request_id, [None])[-1]
+            out[b] = self._word_align_step(requests[b].data, logp[i], codes_N)
+        return out
+
+    def _word_align_launch(
+        self, requests: list
+    ) -> tuple[torch.Tensor, dict[int, int]] | None:
+        """GPU half of a decode step: score the probe hidden of every live
+        word-align row against its text bank. Returns ``(logp [P, cap + 1],
+        {batch row: P index})``; the caller moves ``logp`` to the host."""
+        model = self.model
+        head = getattr(model, "word_align", None)
+        if head is None:
+            return None
+        rows, wa_index = [], {}
+        for b, sched_req in enumerate(requests):
+            data = sched_req.data
+            wa = getattr(data, "word_align", None)
+            if wa is None or wa.finished or data.req.finished():
+                continue
+            wa_index[b] = len(rows)
+            rows.append((b, model.acquire_row(sched_req.request_id), wa))
+        if not rows:
+            return None
+        device = model._cg_probe_hidden.device
+        logp = head.score(
+            model._cg_probe_hidden[torch.tensor([b for b, _, _ in rows], device=device)],
+            torch.tensor([row for _, row, _ in rows], device=device),
+            torch.tensor([wa.lo for _, _, wa in rows], device=device),
+            torch.tensor([wa.n_text for _, _, wa in rows], device=device),
+        )
+        return logp, wa_index
+
+    @staticmethod
+    def _word_align_step(data: Any, logp: Any, codes_N: torch.Tensor | None) -> list | None:
+        """Feed one audio row's probe scores to the request's decoder; the
+        EOC row (one past the last frame) closes it instead."""
+        wa = getattr(data, "word_align", None)
+        if wa is None or wa.finished:
+            return None
+        if codes_N is None or int(codes_N[0]) == EOC_ID:
+            words = wa.finish()
+        else:
+            words = wa.step(logp)
+            if data.generation_done:
+                words = words + wa.finish()
+        return words or None
+
+    def _emit_code_chunk(
+        self, sched_req: Any, codes_N: torch.Tensor, words: list | None = None
+    ) -> None:
         if self._outbox is None:
             return
         metadata = sched_req.data.stream_metadata
         if metadata is None:
             return
+        if words:
+            # newly committed word onsets ride with the row they were decoded at
+            metadata = {**metadata, "words": words}
         self._outbox.put(
             OutgoingMessage(
                 request_id=sched_req.request_id,

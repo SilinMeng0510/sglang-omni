@@ -20,6 +20,7 @@ Provides the following endpoints:
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import logging
@@ -1243,6 +1244,13 @@ def _register_speech(app: FastAPI) -> None:
         except SpeechAPIError as exc:
             return speech_error_response(exc)
 
+        if req.stream and req.word_timestamps:
+            return _speech_words_response(
+                client=client,
+                gen_req=gen_req,
+                request_id=request_id,
+                speed=req.speed,
+            )
         if req.stream:
             try:
                 return await _speech_audio_response(
@@ -1286,6 +1294,8 @@ def _register_speech(app: FastAPI) -> None:
                 headers["X-Completion-Tokens"] = str(result.usage.completion_tokens)
             if result.usage.engine_time_s is not None:
                 headers["X-Engine-Time"] = str(result.usage.engine_time_s)
+        if result.words is not None:
+            headers["X-Word-Timestamps"] = json.dumps(result.words, ensure_ascii=True)
 
         return Response(
             content=result.audio_bytes,
@@ -1392,6 +1402,51 @@ def _speech_pcm_chunk_bytes(
     if not audio_bytes:
         return None, emitted_samples, sample_rate
     return audio_bytes, emitted_samples, sample_rate
+
+
+def _speech_words_response(
+    client: Client,
+    gen_req: GenerateRequest,
+    request_id: str,
+    speed: float,
+) -> StreamingResponse:
+    """``word_timestamps`` + ``stream``: NDJSON events instead of raw PCM, since
+    PCM has no in-band channel. ``{"type": "audio.delta", "audio": <base64
+    pcm16>, "sample_rate", "words": [...]}`` per chunk (``words`` = the onsets
+    this chunk's audio reaches) and a final ``{"type": "audio.done", "words":
+    [...]}`` with every word of the utterance."""
+    chunk_stream = client.generate(gen_req, request_id=request_id)
+
+    async def _body():
+        emitted_samples = 0
+        active_request = True
+        try:
+            async for chunk in chunk_stream:
+                audio_bytes = None
+                if chunk.audio_data is not None:
+                    audio_bytes, emitted_samples, sample_rate = _speech_pcm_chunk_bytes(
+                        chunk, emitted_samples=emitted_samples, speed=speed
+                    )
+                if chunk.finish_reason is not None:
+                    event = {"type": "audio.done", "words": chunk.words or []}
+                elif audio_bytes is None:
+                    continue
+                else:
+                    event = {
+                        "type": "audio.delta",
+                        "audio": base64.b64encode(audio_bytes).decode("ascii"),
+                        "sample_rate": sample_rate,
+                        "words": chunk.words or [],
+                    }
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+            active_request = False
+        finally:
+            if active_request:
+                await _abort_and_close_speech_stream(client, request_id, chunk_stream)
+            else:
+                await _close_async_iterator_if_supported(chunk_stream)
+
+    return StreamingResponse(_body(), media_type="application/x-ndjson")
 
 
 async def _speech_audio_response(

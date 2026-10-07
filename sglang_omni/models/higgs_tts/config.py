@@ -41,6 +41,10 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     lora_max_rank: int = Field(default=32, ge=1)
     lora_max_cached_adapters: int = Field(default=8, ge=1)
     separate_vocoder_process: bool = False
+    # Export dir of a word-align probe (head.pt + config.json, see
+    # word_align.py); enables ``word_timestamps`` requests.
+    word_align_head: str | None = None
+    word_align_text_cap: int = Field(default=1024, ge=1)
     vocoder_stream_stride: int = Field(default=32, ge=1)
     vocoder_startup_masked: bool = True
     vocoder_context_frames: int = Field(default=11, ge=0)
@@ -109,6 +113,11 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                     resources.total_gpu_memory_fraction = colocated_fractions[
                         stage.name
                     ]
+            if stage.name in ("preprocessing", "tts_engine"):
+                stage.factory_args.update(
+                    word_align_head=self.word_align_head,
+                    word_align_text_cap=self.word_align_text_cap,
+                )
             if stage.name == "tts_engine":
                 stage.factory_args.update(
                     enable_dynamic_lora=self.enable_dynamic_lora,

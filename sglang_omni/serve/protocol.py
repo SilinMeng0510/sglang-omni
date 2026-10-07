@@ -304,6 +304,10 @@ class CreateSpeechRequest(BaseModel):
     # Higgs streaming-trained checkpoints only). Independent from ``stream``,
     # which controls chunked audio in the HTTP response.
     streaming_protocol: bool = False
+    # Word onsets from the Higgs word-align probe (server started with
+    # --word-align-head). Non-stream: ``X-Word-Timestamps`` header; stream:
+    # the response becomes NDJSON audio.delta / audio.done events.
+    word_timestamps: bool = False
 
     # Voice cloning parameters
     ref_audio: str | None = None  # path or URL to reference audio
@@ -433,6 +437,8 @@ class SpeechStreamSessionConfig(BaseModel):
     # incremental text injected token-by-token as input.text arrives (no
     # sentence batching). Requires a streaming-trained checkpoint.
     streaming_protocol: bool = False
+    # Higgs word-align probe: ``words`` JSON events before the audio frames
+    word_timestamps: bool = False
     task_type: str | None = None
     language: str | None = None
     instructions: str | None = None

@@ -820,6 +820,8 @@ def _build_extra_params(request: CreateSpeechRequest) -> dict[str, Any]:
         extra_params[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = initial_codec_chunk_frames
     if request.streaming_protocol:
         extra_params["streaming_protocol"] = True
+    if request.word_timestamps:
+        extra_params["word_timestamps"] = True
     return extra_params
 
 
